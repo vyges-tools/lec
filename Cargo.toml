@@ -1,0 +1,22 @@
+[package]
+name = "vyges-lec"
+version = "0.1.0"
+edition = "2021"
+description = "Combinational logic equivalence check: two gate-level netlists in, an equivalence verdict (with counter-example) out."
+license = "Apache-2.0"
+authors = ["Vyges <https://vyges.com/contact>"]
+homepage = "https://vyges.com"
+repository = "https://github.com/vyges-tools/lec"
+
+# No third-party deps (builds/tests offline) — the ROBDD package is in-tree. The
+# netlist / Liberty parsers come from the shared vyges-loom foundation.
+[dependencies]
+vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main" }
+
+[[bin]]
+name = "vyges-lec"
+path = "src/main.rs"
+
+[lib]
+name = "vyges_lec"
+path = "src/lib.rs"
