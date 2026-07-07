@@ -79,6 +79,30 @@ fn render_json(r: &LecReport) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "--describe") {
+        // Machine-readable description of `check` for tooling that drives it.
+        const DESCRIBE: &str = r#"{
+  "name": "lec",
+  "summary": "combinational logic equivalence check (golden vs revised)",
+  "invocation": {
+    "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
+    "emits_json": true
+  },
+  "inputs": {
+    "type": "object",
+    "required": ["golden", "revised", "lib"],
+    "properties": {
+      "golden": { "type": "string", "description": "path to the golden (reference) gate-level netlist" },
+      "revised": { "type": "string", "description": "path to the revised gate-level netlist to compare" },
+      "lib": { "type": "string", "description": "path to the Liberty file (pin directions + comb/seq split)" }
+    }
+  },
+  "artifacts": []
+}
+"#;
+        print!("{DESCRIBE}");
+        return;
+    }
     if args.iter().any(|a| a == "-h" || a == "--help") || args.is_empty() {
         print!("{USAGE}");
         return;
