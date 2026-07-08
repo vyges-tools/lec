@@ -1,6 +1,6 @@
 [package]
 name = "vyges-lec"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2021"
 description = "Combinational logic equivalence check: two gate-level netlists in, an equivalence verdict (with counter-example) out."
 license = "Apache-2.0"
