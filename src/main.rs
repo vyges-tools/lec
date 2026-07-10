@@ -22,6 +22,7 @@ flags:
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
   --fail-on-diff   exit 3 if the designs are not equivalent (CI gate)
+  --describe            print a machine-readable JSON description of the command
   -h, --help · -V, --version
 ";
 
