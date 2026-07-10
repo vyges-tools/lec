@@ -97,7 +97,7 @@ fn main() {
       "lib": { "type": "string", "description": "path to the Liberty file (pin directions + comb/seq split)" }
     }
   },
-  "artifacts": []
+  "artifacts": [ { "role": "equivalence_report" } ]
 }
 "#;
         print!("{DESCRIBE}");
