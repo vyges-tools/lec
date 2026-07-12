@@ -12,6 +12,8 @@ repository = "https://github.com/vyges-tools/lec"
 # netlist / Liberty parsers come from the shared vyges-loom foundation.
 [dependencies]
 vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main" }
+# Structured events (vyges-events/1.0) for the MCP causal trail. Core-only.
+vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
 
 [[bin]]
 name = "vyges-lec"

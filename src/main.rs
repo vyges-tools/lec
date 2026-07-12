@@ -78,6 +78,66 @@ fn render_json(r: &LecReport) -> String {
     s
 }
 
+/// Emit the vyges-events causal trail for the LEC verdict + each differing endpoint —
+/// to stderr (the report goes to stdout / -o). code=LEC-* is the clustering key; objects
+/// are the endpoint / net refs used for cross-stage co-reference.
+fn emit_lec_events(r: &LecReport) {
+    use vyges_events::{Event, Severity};
+    let e = |sev, code: &str, msg: String, objs: Vec<String>| {
+        vyges_events::emit(&Event::new("vyges-lec", sev, msg).with_code(code).with_objects(objs));
+    };
+    if r.equivalent {
+        e(
+            Severity::Info,
+            "LEC-EQUIVALENT",
+            format!("LEC EQUIVALENT ({} endpoint(s) proven)", r.compared),
+            vec![],
+        );
+        return;
+    }
+    // verdict headline
+    e(
+        Severity::Error,
+        "LEC-DIFF",
+        format!(
+            "LEC NOT EQUIVALENT ({} compared, {} differ)",
+            r.compared,
+            r.mismatches.len()
+        ),
+        vec![],
+    );
+    // one event per differing endpoint, carrying the counter-example
+    for m in &r.mismatches {
+        let cex: Vec<String> = m
+            .counterexample
+            .iter()
+            .map(|(n, v)| format!("{n}={}", if *v { 1 } else { 0 }))
+            .collect();
+        e(
+            Severity::Error,
+            "LEC-DIFF",
+            format!("differ at `{}` when {}", m.endpoint, cex.join(" ")),
+            vec![format!("endpoint:{}", m.endpoint)],
+        );
+    }
+    for n in &r.only_in_golden {
+        e(
+            Severity::Warn,
+            "LEC-DIFF",
+            format!("endpoint only in golden: {n}"),
+            vec![format!("endpoint:{n}")],
+        );
+    }
+    for n in &r.only_in_revised {
+        e(
+            Severity::Warn,
+            "LEC-DIFF",
+            format!("endpoint only in revised: {n}"),
+            vec![format!("endpoint:{n}")],
+        );
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--describe") {
@@ -131,6 +191,7 @@ fn main() {
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
 
     let report = lec::equivalence(&g, &r, &lib).unwrap_or_else(|e| die(&e));
+    emit_lec_events(&report);
     let json = args.iter().any(|a| a == "--json");
     let text = if json { render_json(&report) } else { render_text(&report) };
     match opt(&args, "-o") {
