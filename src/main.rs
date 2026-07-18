@@ -182,6 +182,11 @@ fn main() {
         const DESCRIBE: &str = r#"{
   "name": "lec",
   "summary": "combinational logic equivalence check (golden vs revised)",
+  "maturity": "structured",
+  "provenance_limitations": [
+      "input_hash covers the argument vector, not the content of the two netlists or the Liberty it names.",
+      "Liberty `include` files are not enumerated."
+  ],
   "invocation": {
     "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
     "optional": [ { "arg": "out", "flag": "-o" } ],
