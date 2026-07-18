@@ -27,13 +27,18 @@ flags:
 ";
 
 fn opt(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+    args.iter()
+        .position(|a| a == name)
+        .and_then(|i| args.get(i + 1).cloned())
 }
 
 fn render_text(r: &LecReport) -> String {
     let mut s = String::new();
     if r.equivalent {
-        s.push_str(&format!("vyges-lec — EQUIVALENT ✓  ({} endpoint(s) proven)\n", r.compared));
+        s.push_str(&format!(
+            "vyges-lec — EQUIVALENT ✓  ({} endpoint(s) proven)\n",
+            r.compared
+        ));
         return s;
     }
     s.push_str(&format!(
@@ -42,9 +47,16 @@ fn render_text(r: &LecReport) -> String {
         r.mismatches.len()
     ));
     for m in r.mismatches.iter().take(100) {
-        let cex: Vec<String> =
-            m.counterexample.iter().map(|(n, v)| format!("{n}={}", if *v { 1 } else { 0 })).collect();
-        s.push_str(&format!("  differ at `{}`   when {}\n", m.endpoint, cex.join(" ")));
+        let cex: Vec<String> = m
+            .counterexample
+            .iter()
+            .map(|(n, v)| format!("{n}={}", if *v { 1 } else { 0 }))
+            .collect();
+        s.push_str(&format!(
+            "  differ at `{}`   when {}\n",
+            m.endpoint,
+            cex.join(" ")
+        ));
     }
     for n in &r.only_in_golden {
         s.push_str(&format!("  only in golden:  {n}\n"));
@@ -62,8 +74,11 @@ fn render_json(r: &LecReport) -> String {
     s.push_str("  \"mismatches\": [\n");
     for (i, m) in r.mismatches.iter().enumerate() {
         let comma = if i + 1 < r.mismatches.len() { "," } else { "" };
-        let cex: Vec<String> =
-            m.counterexample.iter().map(|(n, v)| format!("\"{n}\": {v}")).collect();
+        let cex: Vec<String> = m
+            .counterexample
+            .iter()
+            .map(|(n, v)| format!("\"{n}\": {v}"))
+            .collect();
         s.push_str(&format!(
             "    {{\"endpoint\": \"{}\", \"counterexample\": {{{}}}}}{}\n",
             m.endpoint,
@@ -84,7 +99,11 @@ fn render_json(r: &LecReport) -> String {
 fn emit_lec_events(r: &LecReport) {
     use vyges_events::{Event, Severity};
     let e = |sev, code: &str, msg: String, objs: Vec<String>| {
-        vyges_events::emit(&Event::new("vyges-lec", sev, msg).with_code(code).with_objects(objs));
+        vyges_events::emit(
+            &Event::new("vyges-lec", sev, msg)
+                .with_code(code)
+                .with_objects(objs),
+        );
     };
     if r.equivalent {
         e(
@@ -147,6 +166,7 @@ fn main() {
   "summary": "combinational logic equivalence check (golden vs revised)",
   "invocation": {
     "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
+    "optional": [ { "arg": "out", "flag": "-o" } ],
     "emits_json": true
   },
   "inputs": {
@@ -155,10 +175,11 @@ fn main() {
     "properties": {
       "golden": { "type": "string", "description": "path to the golden (reference) gate-level netlist" },
       "revised": { "type": "string", "description": "path to the revised gate-level netlist to compare" },
-      "lib": { "type": "string", "description": "path to the Liberty file (pin directions + comb/seq split)" }
+      "lib": { "type": "string", "description": "path to the Liberty file (pin directions + comb/seq split)" },
+      "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
     }
   },
-  "artifacts": [ { "role": "equivalence_report" } ]
+  "artifacts": [ { "role": "equivalence_report", "from_arg": "out" } ]
 }
 "#;
         print!("{DESCRIBE}");
@@ -193,7 +214,11 @@ fn main() {
     let report = lec::equivalence(&g, &r, &lib).unwrap_or_else(|e| die(&e));
     emit_lec_events(&report);
     let json = args.iter().any(|a| a == "--json");
-    let text = if json { render_json(&report) } else { render_text(&report) };
+    let text = if json {
+        render_json(&report)
+    } else {
+        render_text(&report)
+    };
     match opt(&args, "-o") {
         Some(p) => {
             if let Err(e) = std::fs::write(&p, &text) {

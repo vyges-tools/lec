@@ -40,10 +40,22 @@ impl Bdd {
     pub fn new() -> Bdd {
         // index 0 = FALSE terminal, 1 = TRUE terminal
         let nodes = vec![
-            Node { var: TERM_VAR, lo: 0, hi: 0 },
-            Node { var: TERM_VAR, lo: 1, hi: 1 },
+            Node {
+                var: TERM_VAR,
+                lo: 0,
+                hi: 0,
+            },
+            Node {
+                var: TERM_VAR,
+                lo: 1,
+                hi: 1,
+            },
         ];
-        Bdd { nodes, unique: HashMap::new(), ite_memo: HashMap::new() }
+        Bdd {
+            nodes,
+            unique: HashMap::new(),
+            ite_memo: HashMap::new(),
+        }
     }
 
     pub fn one(&self) -> u32 {
@@ -195,7 +207,10 @@ mod tests {
         let nc = b.not(c);
         let or = b.or(na, nc);
         let right = b.not(or);
-        assert_eq!(left, right, "ROBDD is canonical -> equal functions share a node");
+        assert_eq!(
+            left, right,
+            "ROBDD is canonical -> equal functions share a node"
+        );
     }
 
     #[test]

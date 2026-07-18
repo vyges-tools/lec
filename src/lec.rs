@@ -77,7 +77,10 @@ fn op_of(cell: &str) -> Option<Op> {
 }
 
 fn net_of<'a>(inst: &'a Inst, pin: &str) -> Option<&'a str> {
-    inst.conns.iter().find(|(p, _)| p == pin).map(|(_, n)| n.as_str())
+    inst.conns
+        .iter()
+        .find(|(p, _)| p == pin)
+        .map(|(_, n)| n.as_str())
 }
 
 /// One design's view: net -> (inst index, output pin); plus the netlist + lib.
@@ -141,7 +144,10 @@ struct Vars {
 
 impl Vars {
     fn new() -> Vars {
-        Vars { map: HashMap::new(), rev: Vec::new() }
+        Vars {
+            map: HashMap::new(),
+            rev: Vec::new(),
+        }
     }
     fn get(&mut self, name: &str) -> u32 {
         if let Some(&i) = self.map.get(name) {
@@ -170,9 +176,8 @@ fn build(
         return Ok(f);
     }
     // a free input: primary input, an undriven net, or a register (flop Q) output
-    let is_free = d.nl.inputs.iter().any(|p| p == net)
-        || !d.driver.contains_key(net)
-        || d.is_seq_driver(net);
+    let is_free =
+        d.nl.inputs.iter().any(|p| p == net) || !d.driver.contains_key(net) || d.is_seq_driver(net);
     if is_free {
         let idx = vars.get(net);
         let f = bdd.var(idx);
@@ -184,9 +189,14 @@ fn build(
     }
     let &(i, out_pin) = d.driver.get(net).unwrap();
     let inst = &d.nl.insts[i];
-    let cell = d.lib.cells.get(&inst.cell).ok_or_else(|| format!("no cell `{}` in Liberty", inst.cell))?;
+    let cell = d
+        .lib
+        .cells
+        .get(&inst.cell)
+        .ok_or_else(|| format!("no cell `{}` in Liberty", inst.cell))?;
     let _ = out_pin;
-    let op = op_of(&inst.cell).ok_or_else(|| format!("cell `{}` is not a known logic primitive", inst.cell))?;
+    let op = op_of(&inst.cell)
+        .ok_or_else(|| format!("cell `{}` is not a known logic primitive", inst.cell))?;
 
     // input pins (combinational primitives have no clock pin); skip the cell's
     // clock pin defensively if one is ever present.
@@ -215,7 +225,10 @@ fn apply_op(bdd: &mut Bdd, op: Op, ins: &[u32], pins: &[String]) -> Result<u32, 
         if ins.len() == n {
             Ok(())
         } else {
-            Err(format!("primitive expected {n} input(s), got {}", ins.len()))
+            Err(format!(
+                "primitive expected {n} input(s), got {}",
+                ins.len()
+            ))
         }
     };
     Ok(match op {
@@ -312,12 +325,17 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Lec
                 .into_iter()
                 .map(|(v, val)| (vars.name(v).to_string(), val))
                 .collect();
-            mismatches.push(Mismatch { endpoint: ep.clone(), counterexample: cex });
+            mismatches.push(Mismatch {
+                endpoint: ep.clone(),
+                counterexample: cex,
+            });
         }
     }
 
     Ok(LecReport {
-        equivalent: mismatches.is_empty() && only_in_golden.is_empty() && only_in_revised.is_empty(),
+        equivalent: mismatches.is_empty()
+            && only_in_golden.is_empty()
+            && only_in_revised.is_empty(),
         compared: shared.len(),
         mismatches,
         only_in_golden,
@@ -339,7 +357,8 @@ mod tests {
     #[test]
     fn de_morgan_rewrite_is_equivalent() {
         // golden: f = a & b   |   revised: f = !(!a | !b)
-        let g = nl("module t(a,b,f);\ninput a,b; output f;\nAND2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
+        let g =
+            nl("module t(a,b,f);\ninput a,b; output f;\nAND2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
         let r = nl(
             "module t(a,b,f);\ninput a,b; output f;\nwire na,nb,o;\n\
              INV i1(.A(a),.Y(na));\nINV i2(.A(b),.Y(nb));\nOR2 o1(.A(na),.B(nb),.Z(o));\nINV i3(.A(o),.Y(f));\nendmodule\n",
@@ -352,8 +371,10 @@ mod tests {
     #[test]
     fn a_real_bug_is_caught_with_a_counterexample() {
         // golden: f = a & b   |   revised (buggy): f = a | b
-        let g = nl("module t(a,b,f);\ninput a,b; output f;\nAND2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
-        let r = nl("module t(a,b,f);\ninput a,b; output f;\nOR2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
+        let g =
+            nl("module t(a,b,f);\ninput a,b; output f;\nAND2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
+        let r =
+            nl("module t(a,b,f);\ninput a,b; output f;\nOR2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
         let rep = equivalence(&g, &r, &lib()).unwrap();
         assert!(!rep.equivalent);
         assert_eq!(rep.mismatches.len(), 1);
@@ -367,10 +388,8 @@ mod tests {
     #[test]
     fn sequential_equivalence_cuts_at_registers() {
         // both register `a & b`; revised uses De Morgan in the cone feeding D.
-        let g = nl(
-            "module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d;\n\
-             AND2 g(.A(a),.B(b),.Z(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nendmodule\n",
-        );
+        let g = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d;\n\
+             AND2 g(.A(a),.B(b),.Z(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nendmodule\n");
         let r = nl(
             "module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire na,nb,o,d;\n\
              INV i1(.A(a),.Y(na));\nINV i2(.A(b),.Y(nb));\nOR2 o1(.A(na),.B(nb),.Z(o));\n\
