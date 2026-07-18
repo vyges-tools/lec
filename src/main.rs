@@ -179,7 +179,12 @@ fn main() {
       "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
     }
   },
-  "artifacts": [ { "role": "equivalence_report", "from_arg": "out" } ]
+  "artifacts": [ { "role": "equivalence_report", "from_arg": "out" } ],
+  "assertion": {
+    "id": "logic-equivalent",
+    "field": "equivalent",
+    "pass_when": { "is_true": true }
+  }
 }
 "#;
         print!("{DESCRIBE}");
