@@ -180,6 +180,7 @@ fn main() {
     if args.iter().any(|a| a == "--describe") {
         // Machine-readable description of `check` for tooling that drives it.
         const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
   "name": "lec",
   "summary": "combinational logic equivalence check (golden vs revised)",
   "maturity": "structured",
