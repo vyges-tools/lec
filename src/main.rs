@@ -12,10 +12,10 @@ use vyges_lec::lec::{self, LecReport};
 use vyges_lec::{liberty::Lib, netlist};
 
 const USAGE: &str = "\
-vyges-lec — combinational logic equivalence check (golden vs revised)
+vyges loom lec — combinational logic equivalence check (golden vs revised)
 
 usage:
-  vyges-lec check GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+  vyges loom lec check GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
 
 flags:
   --lib FILE       Liberty (pin directions + comb/seq split) — required
