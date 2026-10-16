@@ -11,6 +11,27 @@ use std::process::exit;
 use vyges_lec::lec::{self, LecReport};
 use vyges_lec::{liberty::Lib, netlist};
 
+/// A diagnostic as a structured event (`LEC-ERROR`, or `LEC-WARNING` for a warning; `vyges-events/1.0`)
+/// instead of a bare stderr line; text after a blank line (the usage) stays plain help.
+fn diag_line(msg: String) {
+    let (head, help) = match msg.split_once("\n\n") {
+        Some((h, rest)) => (h.to_string(), Some(rest.to_string())),
+        None => (msg, None),
+    };
+    let warn = head.starts_with("warning: ");
+    let text = head.strip_prefix("error: ").or_else(|| head.strip_prefix("warning: ")).unwrap_or(&head).to_string();
+    let (severity, code) = if warn { (vyges_events::Severity::Warn, "LEC-WARNING") } else { (vyges_events::Severity::Error, "LEC-ERROR") };
+    vyges_events::emit(&vyges_events::Event::new("vyges-lec", severity, text).with_code(code));
+    if let Some(h) = help {
+        eprintln!("{h}");
+    }
+}
+
+macro_rules! diag {
+    ($($t:tt)*) => { diag_line(format!($($t)*)) };
+}
+
+
 const USAGE: &str = "\
 vyges loom lec — combinational logic equivalence check (golden vs revised)
 
@@ -223,16 +244,16 @@ fn main() {
         return;
     }
     if args[0] != "check" {
-        eprintln!("error: unknown command {:?}\n{USAGE}", args[0]);
+        diag!("error: unknown command {:?}\n{USAGE}", args[0]);
         exit(2);
     }
     let pos: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with('-')).collect();
     let (Some(gold), Some(rev)) = (pos.first(), pos.get(1)) else {
-        eprintln!("error: `check` needs GOLDEN and REVISED netlist paths\n{USAGE}");
+        diag!("error: `check` needs GOLDEN and REVISED netlist paths\n{USAGE}");
         exit(2);
     };
     let Some(libp) = opt(&args, "--lib") else {
-        eprintln!("error: `check` needs --lib\n{USAGE}");
+        diag!("error: `check` needs --lib\n{USAGE}");
         exit(2);
     };
 
@@ -268,6 +289,6 @@ fn main() {
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("error: {msg}");
+    diag!("error: {msg}");
     exit(1);
 }
