@@ -85,6 +85,21 @@ fn net_of<'a>(inst: &'a Inst, pin: &str) -> Option<&'a str> {
         .map(|(_, n)| n.as_str())
 }
 
+/// What drives a gate's input pin: a net, or a constant the netlist ties the pin to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Src {
+    Net(String),
+    Const(bool),
+}
+
+/// The source of `pin`: its net, else its tie (`.B(1'b0)`), else nothing (unconnected).
+/// ⛔ A tie is an input like any other: dropping it would turn `AND2(a, 1'b0)` into `a`.
+fn src_of(inst: &Inst, pin: &str) -> Option<Src> {
+    net_of(inst, pin)
+        .map(|n| Src::Net(n.to_string()))
+        .or_else(|| inst.ties.iter().find(|(p, _)| p == pin).map(|&(_, v)| Src::Const(v)))
+}
+
 /// One design's view: net -> (inst index, output pin); plus the netlist + lib.
 pub(crate) struct Design<'a> {
     nl: &'a Netlist,
@@ -237,10 +252,13 @@ fn build(
     let mut child = Vec::new();
     let mut child_pins = Vec::new();
     for p in &in_pins {
-        if let Some(n) = net_of(inst, p) {
-            child.push(build(n, d, bdd, vars, memo, visiting)?);
-            child_pins.push(p.to_string());
-        }
+        let f = match src_of(inst, p) {
+            Some(Src::Net(n)) => build(&n, d, bdd, vars, memo, visiting)?,
+            Some(Src::Const(v)) => if v { bdd.one() } else { bdd.zero() },
+            None => continue,
+        };
+        child.push(f);
+        child_pins.push(p.to_string());
     }
     let f = apply_op(bdd, op, &child, &child_pins)?;
     visiting.remove(net);
@@ -333,13 +351,13 @@ pub(crate) fn endpoints(g: &Design, r: &Design) -> Endpoints {
 }
 
 /// One gate of a cone: the net it drives, its primitive, and its connected input pins with their
-/// nets, in the cell's pin order (the order `build` applies them in).
+/// sources (nets or ties), in the cell's pin order (the order `build` applies them in).
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
 pub(crate) struct Gate {
     pub out: String,
     pub op: Op,
     pub pins: Vec<String>,
-    pub ins: Vec<String>,
+    pub ins: Vec<Src>,
 }
 
 /// The logic feeding a set of endpoints, as `build` sees it: gates in dependency order (every
@@ -394,10 +412,12 @@ fn collect(
     let mut ins = Vec::new();
     for (n, p) in &cell.pins {
         if p.direction == Dir::In && cell.clock_pin.as_deref() != Some(n) {
-            if let Some(src) = net_of(inst, n) {
-                collect(src, d, c, done, visiting)?;
+            if let Some(src) = src_of(inst, n) {
+                if let Src::Net(net) = &src {
+                    collect(net, d, c, done, visiting)?;
+                }
                 pins.push(n.clone());
-                ins.push(src.to_string());
+                ins.push(src);
             }
         }
     }
@@ -515,6 +535,19 @@ mod tests {
         let g2 = nl("module t(a,b,f);\ninput a,b; output f;\nwire u;\n\
              AND2 g(.A(a),.B(b),.Z(f));\nFILL x(.A(u));\nendmodule\n");
         assert!(equivalence(&g2, &g2, &lib()).unwrap().equivalent);
+    }
+
+    /// A pin tied to a constant is an input of its gate: `AND2(a, 1'b0)` is 0, never `a`, and
+    /// `AND2(a, 1'b1)` is `a`. Dropped, the first would compare equal to a buffer.
+    #[test]
+    fn a_tied_pin_is_an_input() {
+        let buf = nl("module t(a,f);\ninput a; output f;\nBUF b(.A(a),.Y(f));\nendmodule\n");
+        let and0 = nl("module t(a,f);\ninput a; output f;\nAND2 g(.A(a),.B(1'b0),.Z(f));\nendmodule\n");
+        let and1 = nl("module t(a,f);\ninput a; output f;\nAND2 g(.A(a),.B(1'b1),.Z(f));\nendmodule\n");
+        let rep = equivalence(&and0, &buf, &lib()).unwrap();
+        assert!(!rep.equivalent);
+        assert_eq!(rep.mismatches[0].counterexample, [("a".to_string(), true)]);
+        assert!(equivalence(&and1, &buf, &lib()).unwrap().equivalent);
     }
 
     #[test]

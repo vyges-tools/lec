@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use vyges_abc_lib::{Abc, ProbStatus};
 
-use crate::lec::{self, Cone, Design, Op};
+use crate::lec::{self, Cone, Design, Op, Src};
 use crate::liberty::Lib;
 use crate::netlist::Netlist;
 
@@ -154,9 +154,15 @@ fn write_blif(model: &str, c: &Cone, pis: &BTreeMap<String, usize>, outs: &[Stri
     let _ = writeln!(s, ".model {model}");
     let _ = writeln!(s, ".inputs {}", (0..pis.len()).map(pi_name).collect::<Vec<_>>().join(" "));
     let _ = writeln!(s, ".outputs {}", (0..outs.len()).map(po_name).collect::<Vec<_>>().join(" "));
+    // A tied pin reads a constant net: `k0` has no cover row (always 0), `k1` the empty cube.
+    let _ = writeln!(s, ".names k0\n.names k1\n1");
+    let src = |x: &Src| match x {
+        Src::Net(n) => id[n.as_str()].as_str(),
+        Src::Const(v) => if *v { "k1" } else { "k0" },
+    };
     for g in &c.gates {
         let (order, rows) = cover(g.op, &g.pins)?;
-        let ins: Vec<&str> = order.iter().map(|&i| id[g.ins[i].as_str()].as_str()).collect();
+        let ins: Vec<&str> = order.iter().map(|&i| src(&g.ins[i])).collect();
         let _ = writeln!(s, ".names {} {}", ins.join(" "), id[g.out.as_str()]);
         for r in rows {
             let _ = writeln!(s, "{r}");
@@ -296,7 +302,13 @@ mod tests {
         let mut v: BTreeMap<String, bool> = cex.iter().cloned().collect();
         for g in &c.gates {
             let (order, rows) = cover(g.op, &g.pins).unwrap();
-            let ins: Vec<bool> = order.iter().map(|&i| *v.get(&g.ins[i]).unwrap_or(&false)).collect();
+            let ins: Vec<bool> = order
+                .iter()
+                .map(|&i| match &g.ins[i] {
+                    Src::Net(n) => *v.get(n).unwrap_or(&false),
+                    Src::Const(b) => *b,
+                })
+                .collect();
             let out = eval(&rows, &ins);
             v.insert(g.out.clone(), out);
         }
@@ -341,6 +353,20 @@ mod tests {
         let Verdict::Differs { endpoint, counterexample } = &rep.verdict else { panic!("{:?}", rep.verdict) };
         assert_eq!(endpoint, "z");
         assert_ne!(value(&g, endpoint, counterexample), value(&r, endpoint, counterexample));
+    }
+
+    /// A tied pin reads a constant net: `AND2(a, 1'b0)` against a buffer differs exactly at a = 1,
+    /// and `AND2(a, 1'b1)` is the buffer.
+    #[test]
+    fn a_tied_pin_is_an_input() {
+        let buf = nl("module t(a,f);\ninput a; output f;\nBUF b(.A(a),.Y(f));\nendmodule\n");
+        let and0 = nl("module t(a,f);\ninput a; output f;\nAND2 g(.A(a),.B(1'b0),.Z(f));\nendmodule\n");
+        let and1 = nl("module t(a,f);\ninput a; output f;\nAND2 g(.A(a),.B(1'b1),.Z(f));\nendmodule\n");
+        let rep = equivalence(&and0, &buf, &lib()).unwrap();
+        let Verdict::Differs { endpoint, counterexample } = &rep.verdict else { panic!("{:?}", rep.verdict) };
+        assert_eq!(counterexample, &[("a".to_string(), true)]);
+        assert_ne!(value(&and0, endpoint, counterexample), value(&buf, endpoint, counterexample));
+        assert_eq!(equivalence(&and1, &buf, &lib()).unwrap().verdict, Verdict::Equivalent);
     }
 
     /// a AND b against (a AND b) AND c differs ONLY at a = b = 1, c = 0, so the counterexample is
