@@ -30,5 +30,9 @@ pub mod abc;
 #[cfg(feature = "abc")]
 pub mod sec;
 
+/// Property checking through ABC (`--features abc`): a net that must never be 1.
+#[cfg(feature = "abc")]
+pub mod prop;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";

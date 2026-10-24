@@ -2,6 +2,7 @@
 //!
 //!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [--engine bdd|abc|both] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+//!   vyges-lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [-o OUT] [--json] [--fail-on-diff]
 //!
 //! Proves combinational equivalence of two gate-level netlists. Exit codes:
 //! 0 equivalent · 1 runtime error (including the two engines disagreeing) · 2 usage ·
@@ -39,11 +40,14 @@ vyges loom lec — combinational logic equivalence check (golden vs revised)
 usage:
   vyges loom lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
   vyges loom lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+  vyges loom lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [...]
 
 commands:
   check            combinational: registers cut and matched by instance name
   sec              sequential: registers kept as state, primary outputs compared on every
                    input sequence from the all-zero register state (one clock; needs --features abc)
+  prove            property: each --never NET stays 0 on every input sequence from the all-zero
+                   register state; --bound N checks cycles 0..N only (needs --features abc)
 
 flags:
   --lib FILE       Liberty (pin directions + comb/seq split) — required
@@ -273,12 +277,12 @@ fn main() {
         println!("vyges-lec {}", vyges_lec::VERSION);
         return;
     }
-    if args[0] != "check" && args[0] != "sec" {
+    if !["check", "sec", "prove"].contains(&args[0].as_str()) {
         diag!("error: unknown command {:?}\n{USAGE}", args[0]);
         exit(2);
     }
     // positionals: not a flag, not a flag's value
-    let valued = ["--lib", "--engine", "-o"];
+    let valued = ["--lib", "--engine", "-o", "--never", "--bound"];
     let pos: Vec<&String> = args[1..]
         .iter()
         .enumerate()
@@ -286,6 +290,31 @@ fn main() {
         .map(|(_, a)| a)
         .collect();
     let cmd = args[0].as_str();
+    if cmd == "prove" {
+        let (Some(design), None) = (pos.first(), pos.get(1)) else {
+            diag!("error: `prove` needs one DESIGN netlist path\n{USAGE}");
+            exit(2);
+        };
+        let Some(libp) = opt(&args, "--lib") else {
+            diag!("error: `prove` needs --lib\n{USAGE}");
+            exit(2);
+        };
+        let nets: Vec<String> = args.windows(2).filter(|w| w[0] == "--never").map(|w| w[1].clone()).collect();
+        if nets.is_empty() {
+            diag!("error: `prove` needs at least one --never NET\n{USAGE}");
+            exit(2);
+        }
+        let bound = opt(&args, "--bound").map(|b| {
+            b.parse::<usize>().unwrap_or_else(|_| {
+                diag!("error: --bound wants a cycle count, got {b:?}");
+                exit(2)
+            })
+        });
+        let d = netlist::load(design).unwrap_or_else(|e| die(&format!("{design}: {e}")));
+        let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
+        prove(&args, &d, &lib, &nets, bound);
+        return;
+    }
     let (Some(gold), Some(rev)) = (pos.first(), pos.get(1)) else {
         diag!("error: `{cmd}` needs GOLDEN and REVISED netlist paths\n{USAGE}");
         exit(2);
@@ -420,9 +449,18 @@ fn sec(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib: &Lib) {
         }
         s
     };
+    emit(args, &text, json);
+    if args.iter().any(|a| a == "--fail-on-diff") && !rep.equivalent() {
+        exit(if rep.verdict == SecVerdict::Undecided { 4 } else { 3 });
+    }
+}
+
+/// The `--json` / `-o` / stdout tail both ABC commands share.
+#[cfg(feature = "abc")]
+fn emit(args: &[String], text: &str, json: bool) {
     match opt(args, "-o") {
         Some(p) => {
-            if let Err(e) = std::fs::write(&p, &text) {
+            if let Err(e) = std::fs::write(&p, text) {
                 die(&format!("{p}: {e}"));
             }
             eprintln!("wrote {p}");
@@ -432,9 +470,75 @@ fn sec(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib: &Lib) {
         }
         None => print!("{text}"),
     }
-    if args.iter().any(|a| a == "--fail-on-diff") && !rep.equivalent() {
-        exit(if rep.verdict == SecVerdict::Undecided { 4 } else { 3 });
+}
+
+/// `prove`: each net stays 0. Exit codes as `check`'s: 3 a net is 1, 4 undecided (a bounded check
+/// that finds nothing exits 0: it was asked for).
+#[cfg(feature = "abc")]
+fn prove(args: &[String], d: &netlist::Netlist, lib: &Lib, nets: &[String], bound: Option<usize>) {
+    use vyges_events::{Event, Severity};
+    use vyges_lec::prop::{self, PropVerdict};
+    let rep = prop::never(d, lib, nets, bound).unwrap_or_else(|e| die(&e));
+    let (code, sev, msg) = match &rep.verdict {
+        PropVerdict::Holds => ("LEC-HOLDS", Severity::Info, format!("PROVE HOLDS ({} net(s) never 1)", nets.len())),
+        PropVerdict::HoldsWithin { cycles } => ("LEC-HOLDS", Severity::Info, format!("PROVE no net is 1 in cycles 0..{cycles} (bounded)")),
+        PropVerdict::Fails { net, cycle, .. } => ("LEC-FAILS", Severity::Error, format!("PROVE FAILS: `{net}` is 1 in cycle {cycle}")),
+        PropVerdict::Undecided => ("LEC-UNDECIDED", Severity::Warn, "PROVE UNDECIDED".to_string()),
+    };
+    vyges_events::emit(&Event::new("vyges-lec", sev, msg).with_code(code));
+    let json = args.iter().any(|a| a == "--json");
+    let text = if json {
+        let mut s = format!("{{\n  \"nets\": {:?},\n  \"registers\": {},\n", rep.nets, rep.registers);
+        if let Some(c) = &rep.clock {
+            s += &format!("  \"clock\": {c:?},\n");
+        }
+        s += &match &rep.verdict {
+            PropVerdict::Holds => "  \"verdict\": \"holds\"\n".to_string(),
+            PropVerdict::HoldsWithin { cycles } => format!("  \"verdict\": \"holds_within\",\n  \"cycles\": {cycles}\n"),
+            PropVerdict::Undecided => "  \"verdict\": \"undecided\"\n".to_string(),
+            PropVerdict::Fails { net, cycle, trace } => {
+                let cycles: Vec<String> = trace
+                    .iter()
+                    .map(|c| format!("{{{}}}", c.iter().map(|(n, v)| format!("{n:?}: {v}")).collect::<Vec<_>>().join(", ")))
+                    .collect();
+                format!("  \"verdict\": \"fails\",\n  \"fails\": {{\"net\": {net:?}, \"cycle\": {cycle}, \"inputs_per_cycle\": [{}]}}\n", cycles.join(", "))
+            }
+        };
+        with_report_path(&(s + "}\n"), opt(args, "-o").as_deref())
+    } else {
+        let regs = format!("{} register(s)", rep.registers);
+        let mut s = match &rep.verdict {
+            PropVerdict::Holds => format!(
+                "vyges-lec prove — HOLDS ✓  ({} net(s) never 1 on any input sequence from the all-zero register state; {regs})\n",
+                nets.len()
+            ),
+            PropVerdict::HoldsWithin { cycles } => format!(
+                "vyges-lec prove — NO FAILURE in cycles 0..{cycles}  (a bounded check, not a proof; {regs})\n"
+            ),
+            PropVerdict::Undecided => "vyges-lec prove — UNDECIDED ?  (the engine gave up within its limits)\n".to_string(),
+            PropVerdict::Fails { net, cycle, .. } => format!("vyges-lec prove — FAILS ✗  `{net}` is 1 in cycle {cycle} ({regs}), under:\n"),
+        };
+        if let PropVerdict::Fails { trace, .. } = &rep.verdict {
+            for (k, c) in trace.iter().enumerate() {
+                s += &format!("    cycle {k}: {}\n", c.iter().map(|(n, v)| format!("{n}={}", u8::from(*v))).collect::<Vec<_>>().join(" "));
+            }
+        }
+        s
+    };
+    emit(args, &text, json);
+    if args.iter().any(|a| a == "--fail-on-diff") {
+        match rep.verdict {
+            PropVerdict::Fails { .. } => exit(3),
+            PropVerdict::Undecided => exit(4),
+            _ => {}
+        }
     }
+}
+
+#[cfg(not(feature = "abc"))]
+fn prove(_: &[String], _: &netlist::Netlist, _: &Lib, _: &[String], _: Option<usize>) {
+    diag!("error: `prove` needs a build with the ABC engine (cargo build --features abc)");
+    exit(2);
 }
 
 #[cfg(not(feature = "abc"))]

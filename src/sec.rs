@@ -60,7 +60,7 @@ impl SecReport {
 }
 
 /// The one clock of a design's registers.
-fn one_clock(which: &str, c: &lec::Cone) -> Result<Option<String>, String> {
+pub(crate) fn one_clock(which: &str, c: &lec::Cone) -> Result<Option<String>, String> {
     let mut it = c.clocks.iter();
     let clock = it.next().cloned();
     if it.next().is_some() {
@@ -94,6 +94,36 @@ pub(crate) fn replay(c: &lec::Cone, outputs: &[String], trace: &[Vec<(String, bo
         state = c.regs.iter().map(|r| (lec::state_net(r), v[&lec::next_net(r)])).collect();
     }
     Ok(seen)
+}
+
+/// Run `f` (an ABC command) with the working directory in `dir`, restoring it after.
+/// ⛔ An UNDECIDED `dprove` writes the unsolved miter to `smNN.aig` in the working directory, and no
+/// option turns that off. The directory is process-wide, like the session itself.
+pub(crate) fn in_dir<T>(dir: &Scratch, f: impl FnOnce() -> T) -> Result<T, String> {
+    let cwd = std::env::current_dir().map_err(|e| format!("working directory: {e}"))?;
+    std::env::set_current_dir(dir.path()).map_err(|e| format!("{}: {e}", dir.path().display()))?;
+    let out = f();
+    std::env::set_current_dir(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
+    Ok(out)
+}
+
+/// ABC's counterexample as each cycle's primary-input values (cycles 0 to `last`), by the names
+/// `pis` gave the files' inputs.
+pub(crate) fn trace(abc: &Abc, pis: &BTreeMap<String, usize>, last: i32) -> Result<Vec<Vec<(String, bool)>>, String> {
+    let net: BTreeMap<String, &str> = pis.iter().map(|(n, &k)| (pi_name(k), n.as_str())).collect();
+    let mut names = Vec::new();
+    for i in 0.. {
+        let Some(name) = abc.pi_name(i) else { break };
+        names.push(net.get(&name).ok_or_else(|| format!("unknown input {name}"))?.to_string());
+    }
+    let mut trace = Vec::new();
+    for f in 0..=last {
+        let bits = abc.cex_inputs(f).ok_or_else(|| format!("ABC's counterexample has no inputs for cycle {f}"))?;
+        let mut cycle: Vec<(String, bool)> = names.iter().cloned().zip(bits).collect();
+        cycle.sort();
+        trace.push(cycle);
+    }
+    Ok(trace)
 }
 
 /// Check golden vs revised for sequential equivalence with ABC.
@@ -138,14 +168,7 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Sec
     // on a real netlist (picorv32, 4,778 latches in the miter) building that unrolling ran past 10
     // minutes; latch correspondence then proves the same pair in about a second. A difference is
     // still found, by the engines dprove runs after correspondence.
-    // ⛔ Run in the scratch directory: an UNDECIDED dprove writes the unsolved miter to `smNN.aig`
-    // in the working directory, and no option turns that off. The directory is process-wide, like
-    // the session itself; it is restored on the way out.
-    let cwd = std::env::current_dir().map_err(|e| format!("working directory: {e}"))?;
-    std::env::set_current_dir(dir.path()).map_err(|e| format!("{}: {e}", dir.path().display()))?;
-    let run = abc.execute_captured("strash; dprove -b");
-    std::env::set_current_dir(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
-    run.map_err(|e| e.to_string())?;
+    in_dir(&dir, || abc.execute_captured("strash; dprove -b"))?.map_err(|e| e.to_string())?;
     let verdict = match abc.prob_status() {
         ProbStatus::Unsat => SecVerdict::Equivalent,
         ProbStatus::Sat => {
@@ -154,19 +177,7 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Sec
                 .get(cex.po as usize)
                 .cloned()
                 .ok_or_else(|| format!("ABC disproved output {} of {}", cex.po, shared.len()))?;
-            let net: BTreeMap<String, &str> = pis.iter().map(|(n, &k)| (pi_name(k), n.as_str())).collect();
-            let mut names = Vec::new();
-            for i in 0.. {
-                let Some(name) = abc.pi_name(i) else { break };
-                names.push(net.get(&name).ok_or_else(|| format!("unknown miter input {name}"))?.to_string());
-            }
-            let mut trace = Vec::new();
-            for f in 0..=cex.frame {
-                let bits = abc.cex_inputs(f).ok_or_else(|| format!("ABC's counterexample has no inputs for cycle {f}"))?;
-                let mut cycle: Vec<(String, bool)> = names.iter().cloned().zip(bits).collect();
-                cycle.sort();
-                trace.push(cycle);
-            }
+            let trace = trace(&abc, &pis, cex.frame)?;
             // ⛔ Never report a difference the model does not show: replay the trace on both cones.
             let k = cex.po as usize;
             let at = |c: &lec::Cone| replay(c, std::slice::from_ref(&shared[k]), &trace).map(|v| v.last().map(|o| o[0]));

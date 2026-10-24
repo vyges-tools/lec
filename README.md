@@ -98,6 +98,29 @@ vyges-lec sec — NOT EQUIVALENT ✗  (1 output(s) compared; 1 vs 2 register(s))
   interpolation and PDR). A difference comes with the inputs of every cycle up to it, and is
   replayed on both designs before it is reported.
 
+## Property checking (`prove`)
+
+The same sequential model answers a safety question about one netlist: *can this net ever
+be 1?* An error flag, a "two grants at once" net, an assertion synthesized into gates.
+
+```sh
+vyges-lec prove design.v --lib cells.lib --never err --never both_grants   # a proof (PDR)
+vyges-lec prove design.v --lib cells.lib --never err --bound 20            # cycles 0..20 only
+```
+
+```text
+vyges-lec prove — FAILS ✗  `c3` is 1 in cycle 3 (2 register(s)), under:
+    cycle 0: en=1
+    cycle 1: en=1
+    cycle 2: en=1
+    cycle 3: en=0
+```
+
+Without `--bound` the answer is a proof (every net stays 0 on every input sequence from the
+all-zero register state) or the first net driven to 1, with its cycle and the inputs of every
+cycle up to it, replayed before it is reported. With `--bound N` it is a bounded search:
+finding nothing in cycles 0 to N is reported as exactly that, not as a proof.
+
 ## How it works
 
 - Each design's endpoints — primary outputs and flop data pins — are built into a
