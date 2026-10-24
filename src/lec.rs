@@ -153,6 +153,32 @@ pub(crate) fn func_value(f: &Func, pins: &[String], x: &[bool]) -> bool {
     }
 }
 
+/// A primitive's value, `x[k]` standing for `pins[k]` (the same rules as [`apply_op`]).
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) fn prim_value(op: Op, pins: &[String], x: &[bool]) -> Result<bool, String> {
+    let need = |n: usize| if x.len() == n { Ok(()) } else { Err(format!("primitive expected {n} input(s), got {}", x.len())) };
+    if x.is_empty() && !matches!(op, Op::Mux) {
+        return Err("primitive needs inputs".into());
+    }
+    let (and, or, odd) = (x.iter().all(|&v| v), x.iter().any(|&v| v), x.iter().filter(|&&v| v).count() % 2 == 1);
+    Ok(match op {
+        Op::Buf => { need(1)?; x[0] }
+        Op::Not => { need(1)?; !x[0] }
+        Op::And => and,
+        Op::Nand => !and,
+        Op::Or => or,
+        Op::Nor => !or,
+        Op::Xor => odd,
+        Op::Xnor => !odd,
+        Op::Mux => {
+            need(3)?;
+            let idx = |want: &str| pins.iter().position(|p| p.eq_ignore_ascii_case(want));
+            let (Some(a), Some(b), Some(s)) = (idx("A"), idx("B"), idx("S")) else { return Err("MUX needs pins A, B, S".into()) };
+            if x[s] { x[b] } else { x[a] }
+        }
+    })
+}
+
 /// What drives a gate's input pin: a net, or a constant the netlist ties the pin to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Src {
@@ -181,6 +207,9 @@ pub(crate) struct Design<'a> {
     unknown: BTreeMap<&'a str, &'a str>,
     /// Nets a `supply0` / `supply1` declaration holds constant (loom `Netlist.constants`).
     constants: BTreeMap<&'a str, bool>,
+    /// Registers are state, not cut points: a register output is a gate over the register's
+    /// stored value ([`seq_cone`]) instead of a free input.
+    sequential: bool,
 }
 
 impl<'a> Design<'a> {
@@ -201,7 +230,13 @@ impl<'a> Design<'a> {
             }
         }
         let constants = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-        Design { nl, lib, driver, unknown, constants }
+        Design { nl, lib, driver, unknown, constants, sequential: false }
+    }
+
+    /// The design with its registers kept as state (the sequential model, [`seq_cone`]).
+    #[cfg_attr(not(feature = "abc"), allow(dead_code))]
+    pub(crate) fn sequential(nl: &'a Netlist, lib: &'a Lib) -> Design<'a> {
+        Design { sequential: true, ..Design::new(nl, lib) }
     }
 
     /// Is `net` a free input of the model (a primary input, a register output, or undriven)?
@@ -209,7 +244,7 @@ impl<'a> Design<'a> {
     /// error, not a free input: that instance may well drive it, and treating it as free in both
     /// designs would compare it equal whatever the cell computes.
     fn is_free(&self, net: &str) -> Result<bool, String> {
-        if self.nl.inputs.iter().any(|p| p == net) || self.is_seq_driver(net) {
+        if self.nl.inputs.iter().any(|p| p == net) || (!self.sequential && self.is_seq_driver(net)) {
             return Ok(true);
         }
         if self.driver.contains_key(net) {
@@ -242,6 +277,42 @@ impl<'a> Design<'a> {
         match self.seq_driver(net) {
             Some((inst, pin)) => format!("{inst}/{pin}"),
             None => net.to_string(),
+        }
+    }
+
+    /// The primary input a register's clock pin reaches through buffers (cells whose function is
+    /// one input pin). ⛔ Anything else on the way (an inverter, a clock gate, logic) is an error:
+    /// the sequential model has ONE clock, the same rising edge for every register.
+    #[cfg_attr(not(feature = "abc"), allow(dead_code))]
+    fn clock_root(&self, inst: &Inst, pin: &str) -> Result<String, String> {
+        let mut net = match src_of(inst, pin)? {
+            Src::Net(n) => n,
+            Src::Const(_) => return Err(format!("register `{}`: clock pin `{pin}` is tied to a constant", inst.name)),
+        };
+        let mut seen = BTreeSet::new();
+        while let Some(&(i, out)) = self.driver.get(net.as_str()) {
+            let b = &self.nl.insts[i];
+            let cell = &self.lib.cells[&b.cell];
+            let via = match logic_of(b, cell, out) {
+                Ok((Logic::Func(Func::Port(p)), _)) if !cell.is_seq => p,
+                Ok((Logic::Prim(Op::Buf), pins)) if !cell.is_seq && pins.len() == 1 => pins[0].clone(),
+                _ => break,
+            };
+            if !seen.insert(net.clone()) {
+                return Err(format!("register `{}`: its clock buffers form a loop at `{net}`", inst.name));
+            }
+            net = match src_of(b, &via)? {
+                Src::Net(n) => n,
+                Src::Const(_) => return Err(format!("register `{}`: its clock is a constant", inst.name)),
+            };
+        }
+        if self.nl.inputs.iter().any(|p| p == &net) {
+            Ok(net)
+        } else {
+            Err(format!(
+                "register `{}`: its clock reaches net `{net}`, which is not a primary input (an inverted, gated or generated clock is not modelled)",
+                inst.name
+            ))
         }
     }
 
@@ -448,21 +519,199 @@ pub(crate) struct Gate {
 /// gate after the gates driving its inputs), and the free inputs (primary inputs, undriven nets,
 /// register outputs) the cone reads, as net -> the variable `build` names it.
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
+#[derive(Default)]
 pub(crate) struct Cone {
     pub gates: Vec<Gate>,
     pub free: BTreeMap<String, String>,
+    /// Sequential model only: the registers the cone reads, by instance name in the order found.
+    /// Each has a state signal ([`state_net`]) and a gate computing its next value ([`next_net`]).
+    pub regs: Vec<String>,
+    /// Sequential model only: the primary input each register's clock reaches.
+    #[cfg_attr(not(feature = "abc"), allow(dead_code))]
+    pub clocks: BTreeSet<String>,
 }
+
+/// The signal holding register `inst`'s stored value, and the one computing its next value. A
+/// space cannot occur in a netlist name, so neither can collide with a net.
+pub(crate) fn state_net(inst: &str) -> String {
+    format!("{inst} <state>")
+}
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) fn next_net(inst: &str) -> String {
+    format!("{inst} <next>")
+}
+
+/// The stored value in a register's expressions: a name no pin can have.
+const STATE: &str = "<state>";
 
 /// Collect the cone of `endpoints` with exactly `build`'s rules: the same free-input test, the
 /// same cell-to-primitive map, the same input pins, the same errors.
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
 pub(crate) fn cone(d: &Design, endpoints: &[String]) -> Result<Cone, String> {
-    let mut c = Cone { gates: Vec::new(), free: BTreeMap::new() };
+    let mut c = Cone::default();
     let mut done = BTreeSet::new();
     for ep in endpoints {
         collect(ep, d, &mut c, &mut done, &mut BTreeSet::new())?;
     }
     Ok(c)
+}
+
+/// The sequential model's cone: [`cone`] of `endpoints` on a [`Design::sequential`], then, for
+/// every register it reaches, the gate computing that register's next value and ITS cone, until no
+/// new register appears. Every register is clocked by the same primary input on the same edge.
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) fn seq_cone(d: &Design, endpoints: &[String]) -> Result<Cone, String> {
+    debug_assert!(d.sequential);
+    let mut c = Cone::default();
+    let mut done = BTreeSet::new();
+    for ep in endpoints {
+        collect(ep, d, &mut c, &mut done, &mut BTreeSet::new())?;
+    }
+    let index: HashMap<&str, usize> = d.nl.insts.iter().enumerate().map(|(i, x)| (x.name.as_str(), i)).collect();
+    let mut k = 0;
+    while k < c.regs.len() {
+        let inst = &d.nl.insts[index[c.regs[k].as_str()]];
+        k += 1;
+        let reg = Reg::of(inst, &d.lib.cells[&inst.cell])?;
+        c.clocks.insert(d.clock_root(inst, &reg.clock)?);
+        let (pins, ins) = reg.reads(inst, &reg.next)?;
+        for src in &ins {
+            if let Src::Net(n) = src {
+                collect(n, d, &mut c, &mut done, &mut BTreeSet::new())?;
+            }
+        }
+        c.gates.push(Gate { out: next_net(&inst.name), logic: Logic::Func(reg.next.clone()), pins, ins });
+    }
+    Ok(c)
+}
+
+/// A register as the sequential model reads it: one `ff` group, its clock pin, and over its input
+/// pins plus [`STATE`] (the stored value): the value it loads on the clock edge and the value each
+/// state variable shows.
+///
+/// ⛔ An asynchronous `clear` / `preset` is modelled synchronously: while it is active the outputs
+/// show the forced value AND the forced value is what the edge loads. That is exact at every clock
+/// edge (which is all the model observes) for a reset held across an edge; a pulse between two
+/// edges is not seen. Both active at once follow `clear_preset_var1` / `_var2` (`L`, `H`, `N` no
+/// change, `T` toggle); a library that leaves them out leaves that case undefined, an error here.
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+struct Reg {
+    clock: String,
+    next: Func,
+    iq: (String, Func),
+    iqn: (String, Func),
+}
+
+fn ite(c: &Func, t: Func, e: Func) -> Func {
+    use Func::*;
+    Or(Box::new(And(Box::new(c.clone()), Box::new(t))), Box::new(And(Box::new(Not(Box::new(c.clone()))), Box::new(e))))
+}
+
+/// `f` with each port `p` for which `by(p)` gives an expression replaced by it.
+fn subst(f: &Func, by: &dyn Fn(&str) -> Option<Func>) -> Func {
+    use Func::*;
+    match f {
+        Port(p) => by(p).unwrap_or_else(|| f.clone()),
+        Not(a) => Not(Box::new(subst(a, by))),
+        And(a, b) => And(Box::new(subst(a, by)), Box::new(subst(b, by))),
+        Or(a, b) => Or(Box::new(subst(a, by)), Box::new(subst(b, by))),
+        Xor(a, b) => Xor(Box::new(subst(a, by)), Box::new(subst(b, by))),
+        One | Zero => f.clone(),
+    }
+}
+
+impl Reg {
+    fn of(inst: &Inst, cell: &Cell) -> Result<Reg, String> {
+        let what = || format!("register `{}` ({})", inst.name, inst.cell);
+        let g = cell.seq_group.as_ref().ok_or_else(|| format!("{}: no single `ff` group to model (a bank or a `statetable`)", what()))?;
+        if g.latch {
+            return Err(format!("{}: a latch is not modelled", what()));
+        }
+        if g.attrs.contains_key("clocked_on_also") {
+            return Err(format!("{}: a second clock (`clocked_on_also`) is not modelled", what()));
+        }
+        let inputs: Vec<&str> = cell.pins.iter().filter(|(_, p)| p.direction == Dir::In).map(|(n, _)| n.as_str()).collect();
+        let parse = |key: &str| -> Result<Option<Func>, String> {
+            g.attrs
+                .get(key)
+                .map(|e| Func::parse_in(e, |p| inputs.contains(&p)).ok_or_else(|| format!("{}: `{key}` `{e}` does not parse over its input pins", what())))
+                .transpose()
+        };
+        let clock = match parse("clocked_on")? {
+            Some(Func::Port(p)) => p,
+            Some(_) => return Err(format!("{}: clock `{}` is not one pin's rising edge", what(), g.attrs["clocked_on"])),
+            None => return Err(format!("{}: its `ff` has no `clocked_on`", what())),
+        };
+        let next_state = parse("next_state")?.ok_or_else(|| format!("{}: its `ff` has no `next_state`", what()))?;
+        let state = Func::Port(STATE.into());
+        let (clear, preset) = (parse("clear")?, parse("preset")?);
+        // the value under clear / preset (one of them, or neither), else `normal`
+        let forced = |normal: Func| match (&clear, &preset) {
+            (Some(c), Some(p)) => ite(c, Func::Zero, ite(p, Func::One, normal)),
+            (Some(c), None) => ite(c, Func::Zero, normal),
+            (None, Some(p)) => ite(p, Func::One, normal),
+            (None, None) => normal,
+        };
+        // both at once: `clear_preset_var1` for IQ (and the value loaded), `_var2` for IQN
+        let both = |key: &str, keep: Func| -> Result<Option<(Func, Func)>, String> {
+            let (Some(c), Some(p)) = (&clear, &preset) else { return Ok(None) };
+            let v = match g.attrs.get(key).map(|v| v.trim()) {
+                Some("L") => Func::Zero,
+                Some("H") => Func::One,
+                Some("N") => keep.clone(),
+                Some("T") => Func::Not(Box::new(keep)),
+                Some(v) => return Err(format!("{}: `{key}` `{v}` is not modelled", what())),
+                None => return Err(format!("{}: clear and preset with no `{key}` (both active is undefined)", what())),
+            };
+            Ok(Some((Func::And(Box::new(c.clone()), Box::new(p.clone())), v)))
+        };
+        let iq_shown = forced(state.clone());
+        let not_state = Func::Not(Box::new(state.clone()));
+        let (iq, iqn, next) = match (both("clear_preset_var1", state.clone())?, both("clear_preset_var2", not_state)?) {
+            (Some((cp, v1)), Some((_, v2))) => (
+                ite(&cp, v1.clone(), iq_shown.clone()),
+                ite(&cp, v2, Func::Not(Box::new(iq_shown))),
+                ite(&cp, v1, forced(next_state)),
+            ),
+            _ => (iq_shown.clone(), Func::Not(Box::new(iq_shown)), forced(next_state)),
+        };
+        Ok(Reg { clock, next, iq: (g.iq.clone(), iq), iqn: (g.iqn.clone(), iqn) })
+    }
+
+    /// Output pin `out`'s function over the input pins and [`STATE`]: the pin's Liberty function with
+    /// each state variable replaced by the value it shows.
+    fn output(&self, inst: &Inst, cell: &Cell, out: &str) -> Result<Func, String> {
+        let f = cell
+            .pins
+            .get(out)
+            .and_then(|p| p.function.as_deref())
+            .ok_or_else(|| format!("register `{}` ({}): output `{out}` has no function", inst.name, inst.cell))?;
+        let known = |p: &str| p == self.iq.0 || p == self.iqn.0 || cell.pins.get(p).is_some_and(|x| x.direction == Dir::In);
+        let f = Func::parse_in(f, known)
+            .ok_or_else(|| format!("register `{}` ({}): output `{out}` function `{f}` does not parse", inst.name, inst.cell))?;
+        Ok(subst(&f, &|p| {
+            if p == self.iq.0 {
+                Some(self.iq.1.clone())
+            } else if p == self.iqn.0 {
+                Some(self.iqn.1.clone())
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// The pins `f` reads, in the order the gate lists them (input pins in name order, then
+    /// [`STATE`]), and their sources (the register's own state signal for [`STATE`]).
+    fn reads(&self, inst: &Inst, f: &Func) -> Result<(Vec<String>, Vec<Src>), String> {
+        let mut pins: Vec<String> = f.ports().into_iter().map(str::to_string).collect();
+        pins.sort_by_key(|p| (p == STATE, p.clone()));
+        pins.dedup();
+        let ins = pins
+            .iter()
+            .map(|p| if p == STATE { Ok(Src::Net(state_net(&inst.name))) } else { src_of(inst, p) })
+            .collect::<Result<_, _>>()?;
+        Ok((pins, ins))
+    }
 }
 
 fn collect(
@@ -496,7 +745,28 @@ fn collect(
         .cells
         .get(&inst.cell)
         .ok_or_else(|| format!("no cell `{}` in Liberty", inst.cell))?;
-    let (logic, pins) = logic_of(inst, cell, out_pin)?;
+    // the sequential model: a register output is its pin's function of the stored value
+    let (logic, pins) = if d.sequential && cell.is_seq {
+        if !c.regs.contains(&inst.name) {
+            c.regs.push(inst.name.clone());
+        }
+        let reg = Reg::of(inst, cell)?;
+        let f = reg.output(inst, cell, out_pin)?;
+        let (pins, ins) = reg.reads(inst, &f)?;
+        for src in &ins {
+            if let Src::Net(n) = src {
+                if *n != state_net(&inst.name) {
+                    collect(n, d, c, done, visiting)?;
+                }
+            }
+        }
+        visiting.remove(net);
+        done.insert(net.to_string());
+        c.gates.push(Gate { out: net.to_string(), logic: Logic::Func(f), pins, ins });
+        return Ok(());
+    } else {
+        logic_of(inst, cell, out_pin)?
+    };
     let mut ins = Vec::new();
     for p in &pins {
         let src = src_of(inst, p)?;

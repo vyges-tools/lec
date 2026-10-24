@@ -26,5 +26,9 @@ pub mod lec;
 #[cfg(feature = "abc")]
 pub mod abc;
 
+/// Sequential equivalence through ABC (`--features abc`): the registers kept as state.
+#[cfg(feature = "abc")]
+pub mod sec;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";

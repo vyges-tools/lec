@@ -96,7 +96,7 @@ pub fn cross_check(bdd: &crate::lec::LecReport, abc: &AbcReport) -> Result<(), S
 /// Signal names in the BLIF files are generated, not the netlist's: Verilog names may hold
 /// characters BLIF reads as syntax, and ABC matches the two files' inputs and outputs BY NAME,
 /// ordering them alphabetically. Fixed-width numbers make that order the numeric order.
-fn pi_name(k: usize) -> String {
+pub(crate) fn pi_name(k: usize) -> String {
     format!("i{k:08}")
 }
 fn po_name(k: usize) -> String {
@@ -166,10 +166,15 @@ fn cover_prim(op: Op, pins: &[String]) -> Result<(Vec<usize>, Vec<String>), Stri
 
 /// One design as BLIF: inputs `pis` (free-input variable -> index, the union over both designs),
 /// outputs this design's nets of the shared endpoints in order, internal nets numbered per file.
-fn write_blif(model: &str, c: &Cone, pis: &BTreeMap<String, usize>, outs: &[String]) -> Result<String, String> {
-    let mut id: BTreeMap<&str, String> = c.free.iter().map(|(n, v)| (n.as_str(), pi_name(pis[v]))).collect();
+/// A sequential cone's registers are latches from 0, loading their next-value gates.
+pub(crate) fn write_blif(model: &str, c: &Cone, pis: &BTreeMap<String, usize>, outs: &[String]) -> Result<String, String> {
+    let mut id: BTreeMap<String, String> = c.free.iter().map(|(n, v)| (n.clone(), pi_name(pis[v]))).collect();
     for (k, g) in c.gates.iter().enumerate() {
-        id.insert(g.out.as_str(), format!("n{k}"));
+        id.insert(g.out.clone(), format!("n{k}"));
+    }
+    // the sequential model's registers: each state signal is a latch output
+    for (k, r) in c.regs.iter().enumerate() {
+        id.insert(lec::state_net(r), format!("s{k}"));
     }
     let mut s = String::new();
     let _ = writeln!(s, ".model {model}");
@@ -194,22 +199,25 @@ fn write_blif(model: &str, c: &Cone, pis: &BTreeMap<String, usize>, outs: &[Stri
     for (k, ep) in outs.iter().enumerate() {
         let _ = writeln!(s, ".names {} {}\n1 1", id[ep.as_str()], po_name(k));
     }
+    for r in &c.regs {
+        let _ = writeln!(s, ".latch {} {} 0", id[&lec::next_net(r)], id[&lec::state_net(r)]);
+    }
     s.push_str(".end\n");
     Ok(s)
 }
 
 /// A fresh directory for the two BLIF files, removed on drop.
-struct Scratch(PathBuf);
+pub(crate) struct Scratch(PathBuf);
 
 impl Scratch {
-    fn new() -> Result<Scratch, String> {
+    pub(crate) fn new() -> Result<Scratch, String> {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
         let p = std::env::temp_dir().join(format!("vyges-lec-{}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         std::fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(Scratch(p))
     }
-    fn write(&self, name: &str, text: &str) -> Result<PathBuf, String> {
+    pub(crate) fn write(&self, name: &str, text: &str) -> Result<PathBuf, String> {
         let p = self.0.join(name);
         std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(p)
@@ -222,7 +230,7 @@ impl Drop for Scratch {
     }
 }
 
-fn arg(p: &Path) -> Result<String, String> {
+pub(crate) fn arg(p: &Path) -> Result<String, String> {
     let s = p.to_str().ok_or_else(|| format!("non-UTF-8 path {}", p.display()))?;
     if s.chars().any(|c| c.is_whitespace() || c == ';' || c == '"') {
         return Err(format!("path not usable in an ABC command: {s}"));
@@ -566,6 +574,7 @@ mod tests {
                     let (order, rows) = cover(&Logic::Prim(op), &pins).unwrap();
                     let ins: Vec<bool> = order.iter().map(|&i| x[i]).collect();
                     assert_eq!(eval(&rows, &ins), want, "{op:?} {x:?}");
+                    assert_eq!(lec::prim_value(op, &pins, &x), Ok(want), "{op:?} {x:?} (the replay's value)");
                 }
             }
         }
@@ -577,6 +586,7 @@ mod tests {
             let x = [s, a, b];
             let ins: Vec<bool> = order.iter().map(|&i| x[i]).collect();
             assert_eq!(eval(&rows, &ins), if s { b } else { a }, "s={s} a={a} b={b}");
+            assert_eq!(lec::prim_value(Op::Mux, &pins, &x), Ok(if s { b } else { a }));
         }
         let (_, rows) = cover(&Logic::Prim(Op::Not), &p(&["A"])).unwrap();
         assert!(eval(&rows, &[false]) && !eval(&rows, &[true]));

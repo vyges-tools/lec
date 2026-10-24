@@ -1,0 +1,84 @@
+/* Registers and gates with Liberty functions, for the sequential model (`sec`). */
+library (seq) {
+  cell (BUF) {
+    pin (A) { direction : input; }
+    pin (Y) { direction : output; function : "A"; }
+  }
+  cell (INV) {
+    pin (A) { direction : input; }
+    pin (Y) { direction : output; function : "!A"; }
+  }
+  cell (AND2) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A&B"; }
+  }
+  cell (OR2) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A|B"; }
+  }
+  cell (XOR2) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A^B"; }
+  }
+  cell (MUX2) {
+    pin (A0) { direction : input; }
+    pin (A1) { direction : input; }
+    pin (S) { direction : input; }
+    pin (Y) { direction : output; function : "(A0&!S)|(A1&S)"; }
+  }
+  /* a plain register */
+  cell (DFF) {
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  /* cleared while RESET_B is low */
+  cell (DFR) {
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; clear : "!RESET_B"; }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (RESET_B) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  /* preset while SET_B is low */
+  cell (DFS) {
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; preset : "!SET_B"; }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (SET_B) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  /* both; with both active IQ is L (clear wins) and IQN is H */
+  cell (DFRS) {
+    ff (IQ, IQN) {
+      clocked_on : "CK"; next_state : "D"; clear : "!RESET_B"; preset : "!SET_B";
+      clear_preset_var1 : L; clear_preset_var2 : H;
+    }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (RESET_B) { direction : input; }
+    pin (SET_B) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  /* a scan register: SCE selects SCD; QN reads the complement */
+  cell (SDF) {
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "(D&!SCE)|(SCD&SCE)"; }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (SCD) { direction : input; }
+    pin (SCE) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+    pin (QN) { direction : output; function : "IQN"; }
+  }
+  /* a latch: refused by the sequential model */
+  cell (LAT) {
+    latch (IQ, IQN) { enable : "G"; data_in : "D"; }
+    pin (G) { direction : input; }
+    pin (D) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+}

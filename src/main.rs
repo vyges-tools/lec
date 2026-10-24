@@ -1,6 +1,7 @@
 //! vyges-lec CLI.
 //!
 //!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [--engine bdd|abc|both] [-o OUT] [--json] [--fail-on-diff]
+//!   vyges-lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
 //!
 //! Proves combinational equivalence of two gate-level netlists. Exit codes:
 //! 0 equivalent · 1 runtime error (including the two engines disagreeing) · 2 usage ·
@@ -37,6 +38,12 @@ vyges loom lec — combinational logic equivalence check (golden vs revised)
 
 usage:
   vyges loom lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
+  vyges loom lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+
+commands:
+  check            combinational: registers cut and matched by instance name
+  sec              sequential: registers kept as state, primary outputs compared on every
+                   input sequence from the all-zero register state (one clock; needs --features abc)
 
 flags:
   --lib FILE       Liberty (pin directions + comb/seq split) — required
@@ -266,17 +273,25 @@ fn main() {
         println!("vyges-lec {}", vyges_lec::VERSION);
         return;
     }
-    if args[0] != "check" {
+    if args[0] != "check" && args[0] != "sec" {
         diag!("error: unknown command {:?}\n{USAGE}", args[0]);
         exit(2);
     }
-    let pos: Vec<&String> = args[1..].iter().filter(|a| !a.starts_with('-')).collect();
+    // positionals: not a flag, not a flag's value
+    let valued = ["--lib", "--engine", "-o"];
+    let pos: Vec<&String> = args[1..]
+        .iter()
+        .enumerate()
+        .filter(|(i, a)| !a.starts_with('-') && !(*i > 0 && valued.contains(&args[*i].as_str())))
+        .map(|(_, a)| a)
+        .collect();
+    let cmd = args[0].as_str();
     let (Some(gold), Some(rev)) = (pos.first(), pos.get(1)) else {
-        diag!("error: `check` needs GOLDEN and REVISED netlist paths\n{USAGE}");
+        diag!("error: `{cmd}` needs GOLDEN and REVISED netlist paths\n{USAGE}");
         exit(2);
     };
     let Some(libp) = opt(&args, "--lib") else {
-        diag!("error: `check` needs --lib\n{USAGE}");
+        diag!("error: `{cmd}` needs --lib\n{USAGE}");
         exit(2);
     };
 
@@ -284,6 +299,10 @@ fn main() {
     let r = netlist::load(rev).unwrap_or_else(|e| die(&format!("{rev}: {e}")));
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
 
+    if cmd == "sec" {
+        sec(&args, &g, &r, &lib);
+        return;
+    }
     let engine = opt(&args, "--engine").unwrap_or_else(|| "bdd".into());
     let report = match engine.as_str() {
         "bdd" => lec::equivalence(&g, &r, &lib).unwrap_or_else(|e| die(&e)),
@@ -334,6 +353,93 @@ fn with_abc(engine: &str, g: &netlist::Netlist, r: &netlist::Netlist, lib: &Lib)
 #[cfg(not(feature = "abc"))]
 fn with_abc(engine: &str, _: &netlist::Netlist, _: &netlist::Netlist, _: &Lib) -> LecReport {
     diag!("error: --engine {engine} needs a build with the ABC engine (cargo build --features abc)");
+    exit(2);
+}
+
+/// `sec`: the sequential check, its report and its exit code (as `check`'s).
+#[cfg(feature = "abc")]
+fn sec(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib: &Lib) {
+    use vyges_events::{Event, Severity};
+    use vyges_lec::sec::{self, SecReport, SecVerdict};
+    let rep = sec::equivalence(g, r, lib).unwrap_or_else(|e| die(&e));
+    let regs = |r: &SecReport| format!("{} vs {} register(s)", r.golden_registers, r.revised_registers);
+    let (code, sev, msg) = match &rep.verdict {
+        SecVerdict::Undecided => ("LEC-UNDECIDED", Severity::Warn, format!("SEC UNDECIDED ({} output(s) compared)", rep.compared)),
+        _ if rep.equivalent() => ("LEC-EQUIVALENT", Severity::Info, format!("SEC EQUIVALENT ({} output(s) proven, {})", rep.compared, regs(&rep))),
+        SecVerdict::Differs { output, cycle, .. } => ("LEC-DIFF", Severity::Error, format!("SEC NOT EQUIVALENT: `{output}` differs in cycle {cycle}")),
+        SecVerdict::Equivalent => ("LEC-DIFF", Severity::Error, "SEC NOT EQUIVALENT: the designs have different outputs".to_string()),
+    };
+    vyges_events::emit(&Event::new("vyges-lec", sev, msg).with_code(code));
+    let bit = |v: &(String, bool)| format!("{}={}", v.0, u8::from(v.1));
+    let json = args.iter().any(|a| a == "--json");
+    let text = if json {
+        let mut s = format!(
+            "{{\n  \"equivalent\": {},\n  \"compared\": {},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n",
+            rep.equivalent(),
+            rep.compared,
+            rep.golden_registers,
+            rep.revised_registers
+        );
+        if let Some(c) = &rep.clock {
+            s += &format!("  \"clock\": {c:?},\n");
+        }
+        match &rep.verdict {
+            SecVerdict::Undecided => s += "  \"undecided\": true,\n",
+            SecVerdict::Differs { output, cycle, trace } => {
+                let cycles: Vec<String> = trace
+                    .iter()
+                    .map(|c| format!("{{{}}}", c.iter().map(|(n, v)| format!("{n:?}: {v}")).collect::<Vec<_>>().join(", ")))
+                    .collect();
+                s += &format!("  \"differs\": {{\"output\": {output:?}, \"cycle\": {cycle}, \"inputs_per_cycle\": [{}]}},\n", cycles.join(", "));
+            }
+            SecVerdict::Equivalent => {}
+        }
+        s += &format!("  \"only_in_golden\": {:?},\n  \"only_in_revised\": {:?}\n}}\n", rep.only_in_golden, rep.only_in_revised);
+        with_report_path(&s, opt(args, "-o").as_deref())
+    } else {
+        let mut s = match &rep.verdict {
+            SecVerdict::Undecided => format!("vyges-lec sec — UNDECIDED ?  ({} output(s) compared; the engine gave up within its limits)\n", rep.compared),
+            _ if rep.equivalent() => format!(
+                "vyges-lec sec — EQUIVALENT ✓  ({} output(s) proven on every input sequence from the all-zero register state; {})\n",
+                rep.compared,
+                regs(&rep)
+            ),
+            _ => format!("vyges-lec sec — NOT EQUIVALENT ✗  ({} output(s) compared; {})\n", rep.compared, regs(&rep)),
+        };
+        if let SecVerdict::Differs { output, cycle, trace } = &rep.verdict {
+            s += &format!("  `{output}` differs in cycle {cycle} (cycle 0 is before the first clock edge), under:\n");
+            for (k, c) in trace.iter().enumerate() {
+                s += &format!("    cycle {k}: {}\n", c.iter().map(bit).collect::<Vec<_>>().join(" "));
+            }
+        }
+        for n in &rep.only_in_golden {
+            s += &format!("  only in golden:  {n}\n");
+        }
+        for n in &rep.only_in_revised {
+            s += &format!("  only in revised: {n}\n");
+        }
+        s
+    };
+    match opt(args, "-o") {
+        Some(p) => {
+            if let Err(e) = std::fs::write(&p, &text) {
+                die(&format!("{p}: {e}"));
+            }
+            eprintln!("wrote {p}");
+            if json {
+                print!("{text}");
+            }
+        }
+        None => print!("{text}"),
+    }
+    if args.iter().any(|a| a == "--fail-on-diff") && !rep.equivalent() {
+        exit(if rep.verdict == SecVerdict::Undecided { 4 } else { 3 });
+    }
+}
+
+#[cfg(not(feature = "abc"))]
+fn sec(_: &[String], _: &netlist::Netlist, _: &netlist::Netlist, _: &Lib) {
+    diag!("error: `sec` needs a build with the ABC engine (cargo build --features abc)");
     exit(2);
 }
 

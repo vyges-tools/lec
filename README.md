@@ -65,6 +65,39 @@ cargo build --release --features abc   # links the prebuilt ABC archive (see vyg
 
 With `--fail-on-diff`, an `abc` run that gives up within its limits exits 4 (undecided).
 
+## Sequential equivalence (`sec`)
+
+`check` cuts both designs at the registers, so it needs them to correspond one to one.
+`sec` keeps the registers as state and asks a stronger question: *do the two designs
+produce the same primary outputs on every input sequence, from the same starting
+state?* It still holds when registers do not line up: one duplicated, two merged, one
+removed because it never changes.
+
+```sh
+vyges-lec sec golden.v revised.v --lib cells.lib     # needs --features abc
+```
+
+```text
+vyges-lec sec — NOT EQUIVALENT ✗  (1 output(s) compared; 1 vs 2 register(s))
+  `y` differs in cycle 3 (cycle 0 is before the first clock edge), under:
+    cycle 0: en=1
+    cycle 1: en=1
+    cycle 2: en=1
+    cycle 3: en=0
+```
+
+- Each register is its cell's Liberty `ff` group: `next_state` is loaded on the rising edge
+  of `clocked_on`, and the output pins read the state through their `function`
+  (so scan registers and inverted outputs are covered).
+- An asynchronous `clear` / `preset` acts at the clock edge: while active, the output shows
+  the forced value and the edge loads it (`clear_preset_var1`/`_var2` when both are active).
+- Every register starts at 0 and is clocked by one primary input, reached through buffers.
+  An inverted, gated or generated clock, a second clock, a latch or a register bank is a
+  hard error, never a guess.
+- ABC proves it (a multi-output sequential miter, register correspondence, then
+  interpolation and PDR). A difference comes with the inputs of every cycle up to it, and is
+  replayed on both designs before it is reported.
+
 ## How it works
 
 - Each design's endpoints — primary outputs and flop data pins — are built into a
@@ -99,8 +132,8 @@ one design. Text + `--json`, a `--fail-on-diff` CI exit code. The ROBDD package
   `function` attributes falls back to a **name-prefix primitive map**. A function that
   does not parse, an unrecognized cell, or a cell missing from the Liberty that touches a
   compared cone is a hard error (never a silent wrong answer). UDPs are not read;
-- sequential equivalence assumes **registers matched by instance name** (no retiming, no
-  state re-encoding) — sequential/retiming LEC is a separate, larger problem;
+- `check` matches **registers by instance name** (no retiming, no state re-encoding); `sec`
+  does not need them to match, and models one rising-edge clock from an all-zero state;
 - the `bdd` engine is a single **monolithic BDD** with a static variable order:
   correct for any size, but wide datapaths (multipliers) can blow up memory; the
   `abc` engine (SAT-based) is the path for those;
