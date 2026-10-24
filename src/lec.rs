@@ -6,9 +6,10 @@
 //! are the same node. When they differ, the miter (their XOR) yields a concrete
 //! input **counter-example**.
 //!
-//! Gate functions come from a built-in standard-cell primitive map (keyed on the
-//! cell name's logic prefix — INV/BUF/AND/OR/NAND/NOR/XOR/XNOR/MUX); the Liberty
-//! gives pin directions and tells combinational cells from sequential. Sequential
+//! Gate functions come from the Liberty `function` of the output pin, else from a
+//! built-in standard-cell primitive map (keyed on the cell name's logic prefix —
+//! INV/BUF/AND/OR/NAND/NOR/XOR/XNOR/MUX); the Liberty gives pin directions and tells
+//! combinational cells from sequential. Sequential
 //! state is cut at the registers: flop Q nets are free inputs, flop D nets are
 //! endpoints — i.e. this proves the *combinational* logic between registers, the
 //! standard combinational-LEC model (registers matched by name).
@@ -16,8 +17,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::bdd::Bdd;
-use crate::liberty::{Dir, Lib};
+use crate::liberty::{Cell, Dir, Lib};
 use crate::netlist::{Inst, Netlist};
+use vyges_loom::liberty_func::Func;
 
 #[derive(Debug, Clone)]
 pub struct Mismatch {
@@ -83,6 +85,72 @@ fn net_of<'a>(inst: &'a Inst, pin: &str) -> Option<&'a str> {
         .iter()
         .find(|(p, _)| p == pin)
         .map(|(_, n)| n.as_str())
+}
+
+/// A gate's logic: the Liberty `function` of the pin it drives, else the primitive its cell name
+/// says (a library with no `function` attributes).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Logic {
+    Prim(Op),
+    Func(Func),
+}
+
+/// The logic of `inst` at output `out_pin`, and its input pins in the cell's pin order. With a
+/// `function`, the inputs are the pins it names (a tie cell's `"1"` names none); without one, every
+/// input pin but a clock. ⛔ A `function` that does not parse over the cell's input pins is an
+/// error, never a fall back to the name: the name is only a guess.
+fn logic_of(inst: &Inst, cell: &Cell, out_pin: &str) -> Result<(Logic, Vec<String>), String> {
+    let inputs: Vec<&str> = cell
+        .pins
+        .iter()
+        .filter(|(n, p)| p.direction == Dir::In && cell.clock_pin.as_deref() != Some(n))
+        .map(|(n, _)| n.as_str())
+        .collect();
+    if let Some(f) = cell.pins.get(out_pin).and_then(|p| p.function.as_deref()) {
+        let func = Func::parse_in(f, |p| inputs.contains(&p)).ok_or_else(|| {
+            format!("cell `{}` pin `{out_pin}`: function `{f}` does not parse over its input pins", inst.cell)
+        })?;
+        let named = func.ports();
+        let pins = inputs.iter().filter(|p| named.contains(p)).map(|p| p.to_string()).collect();
+        return Ok((Logic::Func(func), pins));
+    }
+    let op = op_of(&inst.cell).ok_or_else(|| format!("cell `{}` is not a known logic primitive", inst.cell))?;
+    Ok((Logic::Prim(op), inputs.iter().map(|p| p.to_string()).collect()))
+}
+
+/// A `function` over BDDs, `ins[k]` standing for `pins[k]`.
+fn func_bdd(bdd: &mut Bdd, f: &Func, pins: &[String], ins: &[u32]) -> u32 {
+    match f {
+        Func::Port(p) => ins[pins.iter().position(|x| x == p).expect("logic_of keeps every named pin")],
+        Func::Not(a) => {
+            let a = func_bdd(bdd, a, pins, ins);
+            bdd.not(a)
+        }
+        Func::And(a, b) | Func::Or(a, b) | Func::Xor(a, b) => {
+            let (x, y) = (func_bdd(bdd, a, pins, ins), func_bdd(bdd, b, pins, ins));
+            match f {
+                Func::And(..) => bdd.and(x, y),
+                Func::Or(..) => bdd.or(x, y),
+                _ => bdd.xor(x, y),
+            }
+        }
+        Func::One => bdd.one(),
+        Func::Zero => bdd.zero(),
+    }
+}
+
+/// A `function`'s value, `x[k]` standing for `pins[k]`.
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) fn func_value(f: &Func, pins: &[String], x: &[bool]) -> bool {
+    match f {
+        Func::Port(p) => x[pins.iter().position(|q| q == p).expect("logic_of keeps every named pin")],
+        Func::Not(a) => !func_value(a, pins, x),
+        Func::And(a, b) => func_value(a, pins, x) && func_value(b, pins, x),
+        Func::Or(a, b) => func_value(a, pins, x) || func_value(b, pins, x),
+        Func::Xor(a, b) => func_value(a, pins, x) != func_value(b, pins, x),
+        Func::One => true,
+        Func::Zero => false,
+    }
 }
 
 /// What drives a gate's input pin: a net, or a constant the netlist ties the pin to.
@@ -247,29 +315,19 @@ fn build(
         .cells
         .get(&inst.cell)
         .ok_or_else(|| format!("no cell `{}` in Liberty", inst.cell))?;
-    let _ = out_pin;
-    let op = op_of(&inst.cell)
-        .ok_or_else(|| format!("cell `{}` is not a known logic primitive", inst.cell))?;
-
-    // input pins (combinational primitives have no clock pin); skip the cell's
-    // clock pin defensively if one is ever present.
-    let in_pins: Vec<&str> = cell
-        .pins
-        .iter()
-        .filter(|(n, p)| p.direction == Dir::In && cell.clock_pin.as_deref() != Some(n))
-        .map(|(n, _)| n.as_str())
-        .collect();
+    let (logic, pins) = logic_of(inst, cell, out_pin)?;
     let mut child = Vec::new();
-    let mut child_pins = Vec::new();
-    for p in &in_pins {
+    for p in &pins {
         let f = match src_of(inst, p)? {
             Src::Net(n) => build(&n, d, bdd, vars, memo, visiting)?,
             Src::Const(v) => if v { bdd.one() } else { bdd.zero() },
         };
         child.push(f);
-        child_pins.push(p.to_string());
     }
-    let f = apply_op(bdd, op, &child, &child_pins)?;
+    let f = match &logic {
+        Logic::Prim(op) => apply_op(bdd, *op, &child, &pins)?,
+        Logic::Func(func) => func_bdd(bdd, func, &pins, &child),
+    };
     visiting.remove(net);
     memo.insert(net.to_string(), f);
     Ok(f)
@@ -359,12 +417,12 @@ pub(crate) fn endpoints(g: &Design, r: &Design) -> Endpoints {
     }
 }
 
-/// One gate of a cone: the net it drives, its primitive, and its connected input pins with their
-/// sources (nets or ties), in the cell's pin order (the order `build` applies them in).
+/// One gate of a cone: the net it drives, its logic, and its input pins with their sources (nets or
+/// ties), in the cell's pin order (the order `build` applies them in).
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
 pub(crate) struct Gate {
     pub out: String,
-    pub op: Op,
+    pub logic: Logic,
     pub pins: Vec<String>,
     pub ins: Vec<Src>,
 }
@@ -403,7 +461,7 @@ fn collect(
     // a supply net: a buffer of its constant, as `build` reads it
     if let Some(&v) = d.constants.get(net) {
         done.insert(net.to_string());
-        c.gates.push(Gate { out: net.to_string(), op: Op::Buf, pins: vec!["A".into()], ins: vec![Src::Const(v)] });
+        c.gates.push(Gate { out: net.to_string(), logic: Logic::Prim(Op::Buf), pins: vec!["A".into()], ins: vec![Src::Const(v)] });
         return Ok(());
     }
     if d.is_free(net)? {
@@ -414,30 +472,25 @@ fn collect(
     if !visiting.insert(net.to_string()) {
         return Err(format!("combinational loop through net `{net}`"));
     }
-    let &(i, _) = d.driver.get(net).unwrap();
+    let &(i, out_pin) = d.driver.get(net).unwrap();
     let inst = &d.nl.insts[i];
     let cell = d
         .lib
         .cells
         .get(&inst.cell)
         .ok_or_else(|| format!("no cell `{}` in Liberty", inst.cell))?;
-    let op = op_of(&inst.cell)
-        .ok_or_else(|| format!("cell `{}` is not a known logic primitive", inst.cell))?;
-    let mut pins = Vec::new();
+    let (logic, pins) = logic_of(inst, cell, out_pin)?;
     let mut ins = Vec::new();
-    for (n, p) in &cell.pins {
-        if p.direction == Dir::In && cell.clock_pin.as_deref() != Some(n) {
-            let src = src_of(inst, n)?;
-            if let Src::Net(net) = &src {
-                collect(net, d, c, done, visiting)?;
-            }
-            pins.push(n.clone());
-            ins.push(src);
+    for p in &pins {
+        let src = src_of(inst, p)?;
+        if let Src::Net(net) = &src {
+            collect(net, d, c, done, visiting)?;
         }
+        ins.push(src);
     }
     visiting.remove(net);
     done.insert(net.to_string());
-    c.gates.push(Gate { out: net.to_string(), op, pins, ins });
+    c.gates.push(Gate { out: net.to_string(), logic, pins, ins });
     Ok(())
 }
 
@@ -583,6 +636,47 @@ mod tests {
         assert!(equivalence(&and1, &buf, &lib()).unwrap().equivalent);
         let and0 = nl("module t(a,f);\ninput a; output f;\nsupply0 gnd;\nAND2 g(.A(a),.B(gnd),.Z(f));\nendmodule\n");
         assert!(!equivalence(&and0, &buf, &lib()).unwrap().equivalent);
+    }
+
+    fn func_lib() -> Lib {
+        Lib::load("tests/data/func.lib").expect("func.lib")
+    }
+
+    /// Rule (Liberty `function`): a cell's logic is its output pin's function, so an AOI is the
+    /// NOR of an AND and an input, and a half adder's CO and S are each their OWN pin's function.
+    #[test]
+    fn a_cell_is_its_liberty_function() {
+        let l = func_lib();
+        let g = nl("module t(a,b,c,y);\ninput a,b,c; output y;\nAOI21X g(.A1(a),.A2(b),.B1(c),.Y(y));\nendmodule\n");
+        let r = nl("module t(a,b,c,y);\ninput a,b,c; output y;\nwire ab,o;\n\
+             AND2X g1(.A(a),.B(b),.Y(ab));\nOR2X g2(.A(ab),.B(c),.Y(o));\nINVX g3(.A(o),.Y(y));\nendmodule\n");
+        assert!(equivalence(&g, &r, &l).unwrap().equivalent);
+        let ao = nl("module t(a,b,c,y);\ninput a,b,c; output y;\nAO21X g(.A1(a),.A2(b),.B1(c),.X(y));\nendmodule\n");
+        assert!(!equivalence(&g, &ao, &l).unwrap().equivalent);
+        let ha = nl("module t(a,b,c,s);\ninput a,b; output c,s;\nHAX h(.A(a),.B(b),.CO(c),.S(s));\nendmodule\n");
+        let prim = nl("module t(a,b,c,s);\ninput a,b; output c,s;\nAND2X g1(.A(a),.B(b),.Y(c));\nXOR2X g2(.A(a),.B(b),.Y(s));\nendmodule\n");
+        let rep = equivalence(&ha, &prim, &l).unwrap();
+        assert!(rep.equivalent, "{:?}", rep.mismatches);
+        assert_eq!(rep.compared, 2);
+    }
+
+    /// A tie cell's function is its constant; the function wins over a name that says otherwise;
+    /// a function over a pin the cell lacks is an error, never a guess from the name.
+    #[test]
+    fn tie_cells_and_names_follow_the_function() {
+        let l = func_lib();
+        let buf = nl("module t(a,f);\ninput a; output f;\nBUFX b(.A(a),.Y(f));\nendmodule\n");
+        let tie = |cell: &str, pin: &str| {
+            nl(&format!("module t(a,f);\ninput a; output f;\nwire k;\n{cell} t(.{pin}(k));\nAND2X g(.A(a),.B(k),.Y(f));\nendmodule\n"))
+        };
+        assert!(equivalence(&tie("TIEHI", "HI"), &buf, &l).unwrap().equivalent);
+        assert!(!equivalence(&tie("TIELO", "LO"), &buf, &l).unwrap().equivalent);
+        let and = nl("module t(a,b,f);\ninput a,b; output f;\nAND2X g(.A(a),.B(b),.Y(f));\nendmodule\n");
+        let named_or = nl("module t(a,b,f);\ninput a,b; output f;\nORACLE g(.A(a),.B(b),.Y(f));\nendmodule\n");
+        assert!(equivalence(&and, &named_or, &l).unwrap().equivalent);
+        let bad = nl("module t(a,f);\ninput a; output f;\nBAD g(.A(a),.Y(f));\nendmodule\n");
+        let e = equivalence(&bad, &buf, &l).unwrap_err();
+        assert!(e.contains("function `A&Q` does not parse"), "{e}");
     }
 
     #[test]

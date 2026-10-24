@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use vyges_abc_lib::{Abc, ProbStatus};
 
-use crate::lec::{self, Cone, Design, Op, Src};
+use crate::lec::{self, Cone, Design, Logic, Op, Src};
 use crate::liberty::Lib;
 use crate::netlist::Netlist;
 
@@ -103,9 +103,30 @@ fn po_name(k: usize) -> String {
     format!("o{k:08}")
 }
 
-/// The single-output cover (BLIF `.names` rows) of a primitive over `ins` inputs, in the pin
-/// order `cone` recorded; `pins` names them (MUX finds A, B, S by name, as the BDD engine does).
-fn cover(op: Op, pins: &[String]) -> Result<(Vec<usize>, Vec<String>), String> {
+/// The single-output cover (BLIF `.names` rows) of a gate's logic over its inputs, in the pin
+/// order `cone` recorded. A `function` is written as its on-set, one row per true assignment (a
+/// constant `1` over no inputs is the single row `1`; a constant `0` has none).
+fn cover(logic: &Logic, pins: &[String]) -> Result<(Vec<usize>, Vec<String>), String> {
+    let op = match logic {
+        Logic::Prim(op) => *op,
+        Logic::Func(f) => {
+            let n = pins.len();
+            let rows = (0..1u64 << n)
+                .map(|m| (0..n).map(|i| m >> (n - 1 - i) & 1 == 1).collect::<Vec<bool>>())
+                .filter(|x| lec::func_value(f, pins, x))
+                .map(|x| {
+                    let cube: String = x.iter().map(|&b| if b { '1' } else { '0' }).collect();
+                    if cube.is_empty() { "1".to_string() } else { format!("{cube} 1") }
+                })
+                .collect();
+            return Ok(((0..n).collect(), rows));
+        }
+    };
+    cover_prim(op, pins)
+}
+
+/// A primitive's cover; `pins` names its inputs (MUX finds A, B, S by name, as the BDD engine does).
+fn cover_prim(op: Op, pins: &[String]) -> Result<(Vec<usize>, Vec<String>), String> {
     let n = pins.len();
     let order: Vec<usize> = (0..n).collect();
     let need = |k: usize| -> Result<(), String> {
@@ -161,7 +182,7 @@ fn write_blif(model: &str, c: &Cone, pis: &BTreeMap<String, usize>, outs: &[Stri
         Src::Const(v) => if *v { "k1" } else { "k0" },
     };
     for g in &c.gates {
-        let (order, rows) = cover(g.op, &g.pins)?;
+        let (order, rows) = cover(&g.logic, &g.pins)?;
         let ins: Vec<&str> = order.iter().map(|&i| src(&g.ins[i])).collect();
         let _ = writeln!(s, ".names {} {}", ins.join(" "), id[g.out.as_str()]);
         for r in rows {
@@ -284,7 +305,7 @@ mod tests {
     fn eval(rows: &[String], ins: &[bool]) -> bool {
         let mut phase = true;
         for r in rows {
-            let (cube, out) = r.split_once(' ').unwrap();
+            let (cube, out) = r.split_once(' ').unwrap_or(("", r));
             phase = out == "1";
             if cube.chars().zip(ins).all(|(c, &v)| c == '-' || (c == '1') == v) {
                 return phase;
@@ -301,7 +322,7 @@ mod tests {
         let c = lec::cone(&d, &[ep.to_string()]).unwrap();
         let mut v: BTreeMap<String, bool> = cex.iter().cloned().collect();
         for g in &c.gates {
-            let (order, rows) = cover(g.op, &g.pins).unwrap();
+            let (order, rows) = cover(&g.logic, &g.pins).unwrap();
             let ins: Vec<bool> = order
                 .iter()
                 .map(|&i| match &g.ins[i] {
@@ -388,6 +409,38 @@ mod tests {
         let rep = equivalence(&and0, &buf, &lib()).unwrap();
         let Verdict::Differs { counterexample, .. } = &rep.verdict else { panic!("{:?}", rep.verdict) };
         assert_eq!(counterexample, &[("a".to_string(), true)]);
+    }
+
+    /// The function path through ABC: an AOI, a half adder's two outputs and a tie cell, written
+    /// as on-set covers, agree with the same logic in primitives; an AO21 for the AOI differs, and
+    /// the counterexample shows it.
+    #[test]
+    fn cells_are_their_liberty_functions() {
+        let l = Lib::load("tests/data/func.lib").unwrap();
+        let g = nl("module t(a,b,c,y,co,s);\ninput a,b,c; output y,co,s;\nwire k;\n\
+             AOI21X g(.A1(a),.A2(b),.B1(c),.Y(y));\nTIEHI t(.HI(k));\nHAX h(.A(a),.B(k),.CO(co),.S(s));\nendmodule\n");
+        let r = nl("module t(a,b,c,y,co,s);\ninput a,b,c; output y,co,s;\nwire ab,o;\n\
+             AND2X g1(.A(a),.B(b),.Y(ab));\nOR2X g2(.A(ab),.B(c),.Y(o));\nINVX g3(.A(o),.Y(y));\n\
+             BUFX g4(.A(a),.Y(co));\nINVX g5(.A(a),.Y(s));\nendmodule\n");
+        assert_eq!(equivalence(&g, &r, &l).unwrap().verdict, Verdict::Equivalent);
+        let ao = nl("module t(a,b,c,y,co,s);\ninput a,b,c; output y,co,s;\n\
+             AO21X g(.A1(a),.A2(b),.B1(c),.X(y));\nBUFX g4(.A(a),.Y(co));\nINVX g5(.A(a),.Y(s));\nendmodule\n");
+        let rep = equivalence(&g, &ao, &l).unwrap();
+        let Verdict::Differs { endpoint, counterexample } = &rep.verdict else { panic!("{:?}", rep.verdict) };
+        assert_eq!(endpoint, "y");
+        let v = |nl: &Netlist| {
+            let d = Design::new(nl, &l);
+            let c = lec::cone(&d, std::slice::from_ref(endpoint)).unwrap();
+            let mut v: BTreeMap<String, bool> = counterexample.iter().cloned().collect();
+            for g in &c.gates {
+                let (order, rows) = cover(&g.logic, &g.pins).unwrap();
+                let ins: Vec<bool> = order.iter().map(|&i| match &g.ins[i] { Src::Net(n) => *v.get(n).unwrap_or(&false), Src::Const(b) => *b }).collect();
+                let out = eval(&rows, &ins);
+                v.insert(g.out.clone(), out);
+            }
+            v[endpoint.as_str()]
+        };
+        assert_ne!(v(&g), v(&ao));
     }
 
     /// a AND b against (a AND b) AND c differs ONLY at a = b = 1, c = 0, so the counterexample is
@@ -488,7 +541,7 @@ mod tests {
                 let or = x.iter().any(|&v| v);
                 let xor = x.iter().filter(|&&v| v).count() % 2 == 1;
                 for (op, want) in [(Op::And, and), (Op::Nand, !and), (Op::Or, or), (Op::Nor, !or), (Op::Xor, xor), (Op::Xnor, !xor)] {
-                    let (order, rows) = cover(op, &pins).unwrap();
+                    let (order, rows) = cover(&Logic::Prim(op), &pins).unwrap();
                     let ins: Vec<bool> = order.iter().map(|&i| x[i]).collect();
                     assert_eq!(eval(&rows, &ins), want, "{op:?} {x:?}");
                 }
@@ -498,12 +551,12 @@ mod tests {
         let pins = p(&["S", "A", "B"]);
         for m in 0..8u32 {
             let (s, a, b) = (m & 1 == 1, m & 2 == 2, m & 4 == 4);
-            let (order, rows) = cover(Op::Mux, &pins).unwrap();
+            let (order, rows) = cover(&Logic::Prim(Op::Mux), &pins).unwrap();
             let x = [s, a, b];
             let ins: Vec<bool> = order.iter().map(|&i| x[i]).collect();
             assert_eq!(eval(&rows, &ins), if s { b } else { a }, "s={s} a={a} b={b}");
         }
-        let (_, rows) = cover(Op::Not, &p(&["A"])).unwrap();
+        let (_, rows) = cover(&Logic::Prim(Op::Not), &p(&["A"])).unwrap();
         assert!(eval(&rows, &[false]) && !eval(&rows, &[true]));
     }
 }

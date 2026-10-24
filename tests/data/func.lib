@@ -1,0 +1,61 @@
+/* Cells with Liberty `function` attributes, for the function path of both engines. */
+library (func) {
+  cell (AND2X) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A&B"; }
+  }
+  cell (OR2X) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A+B"; }
+  }
+  cell (INVX) {
+    pin (A) { direction : input; }
+    pin (Y) { direction : output; function : "!A"; }
+  }
+  cell (BUFX) {
+    pin (A) { direction : input; }
+    pin (Y) { direction : output; function : "A"; }
+  }
+  cell (XOR2X) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A^B"; }
+  }
+  cell (AOI21X) {
+    pin (A1) { direction : input; }
+    pin (A2) { direction : input; }
+    pin (B1) { direction : input; }
+    pin (Y) { direction : output; function : "!((A1&A2)|B1)"; }
+  }
+  cell (AO21X) {
+    pin (A1) { direction : input; }
+    pin (A2) { direction : input; }
+    pin (B1) { direction : input; }
+    pin (X) { direction : output; function : "(A1&A2)|B1"; }
+  }
+  cell (HAX) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (CO) { direction : output; function : "A&B"; }
+    pin (S) { direction : output; function : "A^B"; }
+  }
+  cell (TIEHI) {
+    pin (HI) { direction : output; function : "1"; }
+  }
+  cell (TIELO) {
+    pin (LO) { direction : output; function : "0"; }
+  }
+  /* The name says OR; the function says AND. */
+  cell (ORACLE) {
+    pin (A) { direction : input; }
+    pin (B) { direction : input; }
+    pin (Y) { direction : output; function : "A&B"; }
+  }
+  /* The function names a pin the cell does not have. */
+  cell (BAD) {
+    pin (A) { direction : input; }
+    pin (Y) { direction : output; function : "A&Q"; }
+  }
+}

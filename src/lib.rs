@@ -12,8 +12,9 @@
 //! Q nets are free inputs, flop D nets are endpoints — the standard combinational
 //! equivalence model with registers matched by name.
 //!
-//! Gate functions come from a built-in standard-cell primitive map; the Liberty
-//! supplies pin directions and the combinational/sequential split. Pure std beyond
+//! Gate functions come from the Liberty `function` attribute of each output pin (a
+//! built-in standard-cell primitive map stands in for libraries without one); the
+//! Liberty also supplies pin directions and the combinational/sequential split. Pure std beyond
 //! the shared parsers.
 
 pub use vyges_loom::{liberty, netlist};

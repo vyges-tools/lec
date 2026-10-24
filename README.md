@@ -91,17 +91,18 @@ one design. Text + `--json`, a `--fail-on-diff` CI exit code. The ROBDD package
 
 **Depth reserved (honest):**
 
-- gate functions come from a **name-prefix primitive map**, not the Liberty boolean
-  `function` attribute or a UDP — an unrecognized cell, or a cell missing from the
-  Liberty that touches a compared cone, is a hard error (never a silent wrong answer), but complex cells (AOI/OAI, full adders, custom UDPs) need
-  the function-attribute path that is the next step;
+- a gate's logic is its output pin's Liberty `function` (so AOI/OAI, multi-output cells
+  such as half and full adders, and tie cells are covered); a library with no
+  `function` attributes falls back to a **name-prefix primitive map**. A function that
+  does not parse, an unrecognized cell, or a cell missing from the Liberty that touches a
+  compared cone is a hard error (never a silent wrong answer). UDPs are not read;
 - sequential equivalence assumes **matched registers by name** (no retiming, no
   state re-encoding) — sequential/retiming LEC is a separate, larger problem;
 - the `bdd` engine is a single **monolithic BDD** with a static variable order:
   correct for any size, but wide datapaths (multipliers) can blow up memory; the
   `abc` engine (SAT-based) is the path for those;
 - a pin tied to a literal (`.B(1'b0)`) and a `supply0`/`supply1` net are constants, in both
-  engines; tie cells are not yet folded in (an unrecognized cell, so a hard error);
+  engines;
 - an input pin left unconnected is an error where its gate lies in a compared cone: it floats.
 
 **Validation roadmap:** cross-check verdicts against an established equivalence
