@@ -35,11 +35,11 @@ compare, and a mismatch's miter walks straight to a counter-example.
 
 ## Use it
 
-Through the Vyges CLI, as part of the `formal` group:
+Through the Vyges CLI, installed with the physical engines:
 
 ```sh
-vyges install formal
-vyges formal lec check golden.v revised.v --lib cells.lib
+vyges install physical
+vyges physical lec check golden.v revised.v --lib cells.lib
 ```
 
 Or the standalone binary:
