@@ -58,9 +58,90 @@ flags:
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
   --fail-on-diff   exit 3 if the designs are not equivalent, 4 if undecided (CI gate)
-  --describe            print a machine-readable JSON description of the command
+  --describe       print a machine-readable JSON description of every command
   -h, --help · -V, --version
 ";
+
+/// Every command `main` dispatches; the descriptor describes each one (a test holds them together).
+const COMMANDS: [&str; 3] = ["check", "sec", "prove"];
+
+/// The thread block's place in [`DESCRIBE`], filled from loom so every engine words it the same.
+const THREADS_TOKEN: &str = "\"@THREADS@\"";
+
+fn describe() -> String {
+    DESCRIBE.replace(THREADS_TOKEN, vyges_loom::threads::DESCRIBE_SINGLE_THREADED)
+}
+
+/// The machine-readable contract `vyges mcp` and the docs generator read. The top-level
+/// `invocation` and `assertion` are `check`'s, the command a caller gets by default; `commands`
+/// describes all three. `vyges mcp` runs the top-level invocation, so `inputs` requires
+/// `check`'s arguments.
+///
+/// ⚠️ A descriptor rots toward whatever was true when it was written: this one described `check`
+/// alone, as "combinational", for as long as `sec` and `prove` had shipped.
+const DESCRIBE: &str = r#"{
+  "schema": "vyges-tool-descriptor/1.1",
+  "name": "lec",
+  "summary": "formal checks on gate-level netlists: combinational and sequential equivalence, and property checking, with counter-examples",
+  "maturity": "structured",
+  "provenance_limitations": [
+    "input_hash covers the argument vector, not the content of the netlists or the Liberty it names.",
+    "Liberty `include` files are not enumerated.",
+    "check is COMBINATIONAL: registers are cut (an output a free input, a data pin an endpoint) and matched by instance name, so two designs that differ only in register naming or retiming are reported as differing.",
+    "check's default engine is ABC's SAT-based prover in the released build (built with the ABC engine), which names the FIRST differing endpoint; --engine bdd lists every differing endpoint but its BDDs can grow past what a real core allows; --engine both runs the two and is an error if they disagree. A build without the ABC engine has only bdd, and sec and prove exit 2.",
+    "sec and prove share one sequential model: registers are their Liberty ff groups, all starting at 0, on ONE rising-edge clock traced back through buffers to a primary input. Asynchronous clear and preset are modelled synchronously. Latches, register banks, inverted or gated clocks and a second clock are refused with an error rather than approximated.",
+    "Every counter-example sec or prove reports is replayed on the model before it is reported; one that does not replay is an error, never a verdict.",
+    "Any command can be UNDECIDED when ABC gives up within its limits; it is reported as undecided (exit 4 with --fail-on-diff), never as a pass.",
+    "prove --bound N checks cycles 0 to N only: no failure there is `holds_within`, which is not a proof."
+  ],
+  "invocation": {
+    "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
+    "optional": [ { "arg": "out", "flag": "-o" }, { "arg": "engine", "flag": "--engine" } ],
+    "emits_json": true
+  },
+  "commands": [
+    {
+      "name": "check",
+      "summary": "combinational equivalence: registers cut and matched by instance name",
+      "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
+      "optional": [ { "arg": "out", "flag": "-o" }, { "arg": "engine", "flag": "--engine" } ],
+      "assertion": { "id": "logic-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
+    },
+    {
+      "name": "sec",
+      "summary": "sequential equivalence: registers kept as state, primary outputs compared on every input sequence from the all-zero register state",
+      "args_template": ["sec", "{golden}", "{revised}", "--lib", "{lib}"],
+      "optional": [ { "arg": "out", "flag": "-o" } ],
+      "assertion": { "id": "sequentially-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
+    },
+    {
+      "name": "prove",
+      "summary": "property check: each named net stays 0 on every input sequence from the all-zero register state",
+      "args_template": ["prove", "{design}", "--lib", "{lib}"],
+      "optional": [ { "arg": "never", "flag": "--never" }, { "arg": "bound", "flag": "--bound" }, { "arg": "out", "flag": "-o" } ],
+      "assertion": { "id": "property-holds", "field": "verdict", "pass_when": { "in": ["holds", "holds_within"] } }
+    }
+  ],
+  "inputs": {
+    "type": "object",
+    "required": ["golden", "revised", "lib"],
+    "properties": {
+      "golden": { "type": "string", "description": "check, sec: path to the golden (reference) gate-level netlist" },
+      "revised": { "type": "string", "description": "check, sec: path to the revised gate-level netlist to compare" },
+      "design": { "type": "string", "description": "prove: path to the gate-level netlist" },
+      "lib": { "type": "string", "description": "path to the Liberty file (pin directions, cell functions, ff groups)" },
+      "engine": { "type": "string", "enum": ["abc", "bdd", "both"], "description": "check: the engine (abc by default in a build with it, bdd otherwise)" },
+      "never": { "type": "string", "description": "prove: a net that must never be 1 (--never may be given more than once)" },
+      "bound": { "type": "integer", "description": "prove: check cycles 0 to N only (bounded, not a proof)" },
+      "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+    }
+  },
+  "consumes": ["netlist", "liberty"],
+  "artifacts": [ { "role": "equivalence_report", "field": "report_path" } ],
+  "threads": "@THREADS@",
+  "assertion": { "id": "logic-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
+}
+"#;
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -233,40 +314,7 @@ fn with_report_path(json: &str, path: Option<&str>) -> String {
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--describe") {
-        // Machine-readable description of `check` for tooling that drives it.
-        const DESCRIBE: &str = r#"{
-  "schema": "vyges-tool-descriptor/1.1",
-  "name": "lec",
-  "summary": "combinational logic equivalence check (golden vs revised)",
-  "maturity": "structured",
-  "provenance_limitations": [
-      "input_hash covers the argument vector, not the content of the two netlists or the Liberty it names.",
-      "Liberty `include` files are not enumerated."
-  ],
-  "invocation": {
-    "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
-    "optional": [ { "arg": "out", "flag": "-o" } ],
-    "emits_json": true
-  },
-  "inputs": {
-    "type": "object",
-    "required": ["golden", "revised", "lib"],
-    "properties": {
-      "golden": { "type": "string", "description": "path to the golden (reference) gate-level netlist" },
-      "revised": { "type": "string", "description": "path to the revised gate-level netlist to compare" },
-      "lib": { "type": "string", "description": "path to the Liberty file (pin directions + comb/seq split)" },
-      "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
-    }
-  },
-  "artifacts": [ { "role": "equivalence_report", "field": "report_path" } ],
-  "assertion": {
-    "id": "logic-equivalent",
-    "field": "equivalent",
-    "pass_when": { "is_true": true }
-  }
-}
-"#;
-        print!("{DESCRIBE}");
+        print!("{}", describe());
         return;
     }
     if args.iter().any(|a| a == "-h" || a == "--help") || args.is_empty() {
@@ -277,7 +325,7 @@ fn main() {
         println!("vyges-lec {}", vyges_lec::VERSION);
         return;
     }
-    if !["check", "sec", "prove"].contains(&args[0].as_str()) {
+    if !COMMANDS.contains(&args[0].as_str()) {
         diag!("error: unknown command {:?}\n{USAGE}", args[0]);
         exit(2);
     }
@@ -567,5 +615,17 @@ mod tests {
         assert_eq!(super::DEFAULT_ENGINE, "abc");
         #[cfg(not(feature = "abc"))]
         assert_eq!(super::DEFAULT_ENGINE, "bdd");
+    }
+
+    /// Every command `main` dispatches has its own entry in the descriptor, and the thread block
+    /// is loom's, not the placeholder: an agent reading `--describe` sees the whole surface.
+    #[test]
+    fn the_descriptor_describes_every_command() {
+        let d = super::describe();
+        for c in super::COMMANDS {
+            assert!(d.contains(&format!("\"name\": \"{c}\"")), "no descriptor entry for `{c}`");
+        }
+        assert!(!d.contains("@THREADS@"), "the threads placeholder was not filled");
+        assert!(d.contains("\"parallel\": false"), "{d}");
     }
 }
