@@ -378,6 +378,18 @@ mod tests {
         assert!(e.contains("input pin `B` of instance `g` (AND2) is unconnected"), "{e}");
     }
 
+    /// A supply net is its constant in the cone this engine writes, as in the BDD engine.
+    #[test]
+    fn a_supply_net_is_its_constant() {
+        let buf = nl("module t(a,f);\ninput a; output f;\nBUF b(.A(a),.Y(f));\nendmodule\n");
+        let and1 = nl("module t(a,f);\ninput a; output f;\nsupply1 vdd;\nAND2 g(.A(a),.B(vdd),.Z(f));\nendmodule\n");
+        assert_eq!(equivalence(&and1, &buf, &lib()).unwrap().verdict, Verdict::Equivalent);
+        let and0 = nl("module t(a,f);\ninput a; output f;\nsupply0 gnd;\nAND2 g(.A(a),.B(gnd),.Z(f));\nendmodule\n");
+        let rep = equivalence(&and0, &buf, &lib()).unwrap();
+        let Verdict::Differs { counterexample, .. } = &rep.verdict else { panic!("{:?}", rep.verdict) };
+        assert_eq!(counterexample, &[("a".to_string(), true)]);
+    }
+
     /// a AND b against (a AND b) AND c differs ONLY at a = b = 1, c = 0, so the counterexample is
     /// exactly that assignment (an inverted one, a = b = 0, c = 1, shows nothing).
     #[test]

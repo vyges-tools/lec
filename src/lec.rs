@@ -111,6 +111,8 @@ pub(crate) struct Design<'a> {
     /// Nets touching an instance whose cell is NOT in the Liberty: net -> that instance. Without
     /// the cell's pin directions nothing says whether the instance drives the net.
     unknown: BTreeMap<&'a str, &'a str>,
+    /// Nets a `supply0` / `supply1` declaration holds constant (loom `Netlist.constants`).
+    constants: BTreeMap<&'a str, bool>,
 }
 
 impl<'a> Design<'a> {
@@ -130,7 +132,8 @@ impl<'a> Design<'a> {
                 }
             }
         }
-        Design { nl, lib, driver, unknown }
+        let constants = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        Design { nl, lib, driver, unknown, constants }
     }
 
     /// Is `net` a free input of the model (a primary input, a register output, or undriven)?
@@ -222,6 +225,10 @@ fn build(
 ) -> Result<u32, String> {
     if let Some(&f) = memo.get(net) {
         return Ok(f);
+    }
+    // a supply net: its constant, whatever touches it
+    if let Some(&v) = d.constants.get(net) {
+        return Ok(if v { bdd.one() } else { bdd.zero() });
     }
     // a free input: primary input, an undriven net, or a register (flop Q) output
     if d.is_free(net)? {
@@ -393,6 +400,12 @@ fn collect(
     if done.contains(net) {
         return Ok(());
     }
+    // a supply net: a buffer of its constant, as `build` reads it
+    if let Some(&v) = d.constants.get(net) {
+        done.insert(net.to_string());
+        c.gates.push(Gate { out: net.to_string(), op: Op::Buf, pins: vec!["A".into()], ins: vec![Src::Const(v)] });
+        return Ok(());
+    }
     if d.is_free(net)? {
         c.free.insert(net.to_string());
         done.insert(net.to_string());
@@ -559,6 +572,17 @@ mod tests {
         let open = nl("module t(a,f);\ninput a; output f;\nAND2 g(.A(a),.Z(f));\nendmodule\n");
         let e = equivalence(&open, &buf, &lib()).unwrap_err();
         assert!(e.contains("input pin `B` of instance `g` (AND2) is unconnected"), "{e}");
+    }
+
+    /// A `supply0` / `supply1` net is its constant, not a free input: `AND2(a, vdd)` with `vdd`
+    /// on `supply1` is `a`. Free, `vdd` would make it differ from a buffer.
+    #[test]
+    fn a_supply_net_is_its_constant() {
+        let buf = nl("module t(a,f);\ninput a; output f;\nBUF b(.A(a),.Y(f));\nendmodule\n");
+        let and1 = nl("module t(a,f);\ninput a; output f;\nsupply1 vdd;\nAND2 g(.A(a),.B(vdd),.Z(f));\nendmodule\n");
+        assert!(equivalence(&and1, &buf, &lib()).unwrap().equivalent);
+        let and0 = nl("module t(a,f);\ninput a; output f;\nsupply0 gnd;\nAND2 g(.A(a),.B(gnd),.Z(f));\nendmodule\n");
+        assert!(!equivalence(&and0, &buf, &lib()).unwrap().equivalent);
     }
 
     #[test]

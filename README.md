@@ -100,9 +100,8 @@ one design. Text + `--json`, a `--fail-on-diff` CI exit code. The ROBDD package
 - the `bdd` engine is a single **monolithic BDD** with a static variable order:
   correct for any size, but wide datapaths (multipliers) can blow up memory; the
   `abc` engine (SAT-based) is the path for those;
-- a pin tied to a literal (`.B(1'b0)`) is an input of its gate, in both engines; not yet
-  folded in: `supply0`/`supply1` nets (read as free inputs, so the check can report a
-  difference that is not there) and tie cells (an unrecognized cell, so a hard error);
+- a pin tied to a literal (`.B(1'b0)`) and a `supply0`/`supply1` net are constants, in both
+  engines; tie cells are not yet folded in (an unrecognized cell, so a hard error);
 - an input pin left unconnected is an error where its gate lies in a compared cone: it floats.
 
 **Validation roadmap:** cross-check verdicts against an established equivalence
