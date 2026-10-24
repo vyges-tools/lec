@@ -138,7 +138,14 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Sec
     // on a real netlist (picorv32, 4,778 latches in the miter) building that unrolling ran past 10
     // minutes; latch correspondence then proves the same pair in about a second. A difference is
     // still found, by the engines dprove runs after correspondence.
-    abc.execute_captured("strash; dprove -b").map_err(|e| e.to_string())?;
+    // ⛔ Run in the scratch directory: an UNDECIDED dprove writes the unsolved miter to `smNN.aig`
+    // in the working directory, and no option turns that off. The directory is process-wide, like
+    // the session itself; it is restored on the way out.
+    let cwd = std::env::current_dir().map_err(|e| format!("working directory: {e}"))?;
+    std::env::set_current_dir(dir.path()).map_err(|e| format!("{}: {e}", dir.path().display()))?;
+    let run = abc.execute_captured("strash; dprove -b");
+    std::env::set_current_dir(&cwd).map_err(|e| format!("{}: {e}", cwd.display()))?;
+    run.map_err(|e| e.to_string())?;
     let verdict = match abc.prob_status() {
         ProbStatus::Unsat => SecVerdict::Equivalent,
         ProbStatus::Sat => {

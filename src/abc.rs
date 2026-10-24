@@ -217,6 +217,9 @@ impl Scratch {
         std::fs::create_dir_all(&p).map_err(|e| format!("{}: {e}", p.display()))?;
         Ok(Scratch(p))
     }
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
     pub(crate) fn write(&self, name: &str, text: &str) -> Result<PathBuf, String> {
         let p = self.0.join(name);
         std::fs::write(&p, text).map_err(|e| format!("{}: {e}", p.display()))?;
