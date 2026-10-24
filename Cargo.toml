@@ -14,6 +14,13 @@ repository = "https://github.com/vyges-tools/lec"
 vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main" }
 # Structured events (vyges-events/1.0) for the MCP causal trail. Core-only.
 vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main", default-features = false }
+# The ABC engine (`--engine abc|both`). Optional: it links a prebuilt ABC archive, which the default
+# std-only, offline build does not need.
+vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main", optional = true }
+
+[features]
+default = []
+abc = ["dep:vyges-abc-lib"]
 
 [[bin]]
 name = "vyges-lec"

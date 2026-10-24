@@ -21,3 +21,22 @@ jobs:
         run: cargo build --locked --verbose
       - name: Test
         run: cargo test --locked --verbose
+
+  # The ABC engine (`--features abc`) against the prebuilt archive published for the abc-lib
+  # commit Cargo.lock pins: no Bazel here, and the archive is the one built from those inputs.
+  abc-engine:
+    name: build & test (ABC engine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prebuilt ABC for the locked abc-lib
+        run: |
+          cargo fetch --locked
+          dir=$(cargo metadata --locked --format-version 1 --features abc \
+                | jq -r '.packages[] | select(.name == "vyges-abc-lib") | .manifest_path' | xargs dirname)
+          bash "$dir/scripts/fetch-bundle.sh" "$RUNNER_TEMP/abc" >> "$GITHUB_ENV"
+      - name: Clippy
+        run: cargo clippy --locked --all-targets --features abc -- -D warnings
+      - name: Test
+        run: cargo test --locked --features abc --verbose

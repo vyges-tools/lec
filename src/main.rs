@@ -1,10 +1,10 @@
 //! vyges-lec CLI.
 //!
-//!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+//!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [--engine bdd|abc|both] [-o OUT] [--json] [--fail-on-diff]
 //!
 //! Proves combinational equivalence of two gate-level netlists. Exit codes:
-//! 0 equivalent · 1 runtime error · 2 usage · 3 NOT equivalent (only with
-//! --fail-on-diff).
+//! 0 equivalent · 1 runtime error (including the two engines disagreeing) · 2 usage ·
+//! 3 NOT equivalent (only with --fail-on-diff) · 4 undecided (only with --fail-on-diff).
 
 use std::process::exit;
 
@@ -36,13 +36,17 @@ const USAGE: &str = "\
 vyges loom lec — combinational logic equivalence check (golden vs revised)
 
 usage:
-  vyges loom lec check GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+  vyges loom lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
 
 flags:
   --lib FILE       Liberty (pin directions + comb/seq split) — required
+  --engine E       bdd (default): exact BDDs, lists every differing endpoint
+                   abc: SAT-based (ABC), scales further, names the first differing endpoint
+                   both: run both and fail if they disagree; reports the bdd result
+                   (abc and both need a build with --features abc)
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
-  --fail-on-diff   exit 3 if the designs are not equivalent (CI gate)
+  --fail-on-diff   exit 3 if the designs are not equivalent, 4 if undecided (CI gate)
   --describe            print a machine-readable JSON description of the command
   -h, --help · -V, --version
 ";
@@ -55,6 +59,13 @@ fn opt(args: &[String], name: &str) -> Option<String> {
 
 fn render_text(r: &LecReport) -> String {
     let mut s = String::new();
+    if r.undecided {
+        s.push_str(&format!(
+            "vyges-lec — UNDECIDED ?  ({} compared; the engine gave up within its limits)\n",
+            r.compared
+        ));
+        return s;
+    }
     if r.equivalent {
         s.push_str(&format!(
             "vyges-lec — EQUIVALENT ✓  ({} endpoint(s) proven)\n",
@@ -92,6 +103,9 @@ fn render_json(r: &LecReport) -> String {
     let mut s = String::from("{\n");
     s.push_str(&format!("  \"equivalent\": {},\n", r.equivalent));
     s.push_str(&format!("  \"compared\": {},\n", r.compared));
+    if r.undecided {
+        s.push_str("  \"undecided\": true,\n");
+    }
     s.push_str("  \"mismatches\": [\n");
     for (i, m) in r.mismatches.iter().enumerate() {
         let comma = if i + 1 < r.mismatches.len() { "," } else { "" };
@@ -126,6 +140,15 @@ fn emit_lec_events(r: &LecReport) {
                 .with_objects(objs),
         );
     };
+    if r.undecided {
+        e(
+            Severity::Warn,
+            "LEC-UNDECIDED",
+            format!("LEC UNDECIDED ({} compared)", r.compared),
+            vec![],
+        );
+        return;
+    }
     if r.equivalent {
         e(
             Severity::Info,
@@ -261,7 +284,15 @@ fn main() {
     let r = netlist::load(rev).unwrap_or_else(|e| die(&format!("{rev}: {e}")));
     let lib = Lib::load(&libp).unwrap_or_else(|e| die(&format!("{libp}: {e}")));
 
-    let report = lec::equivalence(&g, &r, &lib).unwrap_or_else(|e| die(&e));
+    let engine = opt(&args, "--engine").unwrap_or_else(|| "bdd".into());
+    let report = match engine.as_str() {
+        "bdd" => lec::equivalence(&g, &r, &lib).unwrap_or_else(|e| die(&e)),
+        "abc" | "both" => with_abc(&engine, &g, &r, &lib),
+        other => {
+            diag!("error: unknown --engine {other:?} (bdd, abc or both)\n{USAGE}");
+            exit(2);
+        }
+    };
     emit_lec_events(&report);
     let json = args.iter().any(|a| a == "--json");
     let text = if json {
@@ -284,8 +315,26 @@ fn main() {
         None => print!("{text}"),
     }
     if args.iter().any(|a| a == "--fail-on-diff") && !report.equivalent {
-        exit(3);
+        exit(if report.undecided { 4 } else { 3 });
     }
+}
+
+#[cfg(feature = "abc")]
+fn with_abc(engine: &str, g: &netlist::Netlist, r: &netlist::Netlist, lib: &Lib) -> LecReport {
+    use vyges_lec::abc;
+    let a = abc::equivalence(g, r, lib).unwrap_or_else(|e| die(&e));
+    if engine == "abc" {
+        return a.into();
+    }
+    let b = lec::equivalence(g, r, lib).unwrap_or_else(|e| die(&e));
+    abc::cross_check(&b, &a).unwrap_or_else(|e| die(&e));
+    b
+}
+
+#[cfg(not(feature = "abc"))]
+fn with_abc(engine: &str, _: &netlist::Netlist, _: &netlist::Netlist, _: &Lib) -> LecReport {
+    diag!("error: --engine {engine} needs a build with the ABC engine (cargo build --features abc)");
+    exit(2);
 }
 
 fn die(msg: &str) -> ! {

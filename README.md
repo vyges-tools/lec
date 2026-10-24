@@ -40,13 +40,30 @@ cargo build --release            # std-only; the BDD package is in-tree
 vyges-lec check golden.v revised.v --lib cells.lib                  # -> verdict
 vyges-lec check golden.v revised.v --lib cells.lib --json
 vyges-lec check golden.v revised.v --lib cells.lib --fail-on-diff   # exit 3 if differ
-# flags: --lib FILE · -o FILE · --json · --fail-on-diff · -h · -V
+# flags: --lib FILE · --engine bdd|abc|both · -o FILE · --json · --fail-on-diff · -h · -V
 ```
 
 ```text
 vyges-lec — NOT EQUIVALENT ✗  (1 compared, 1 differ)
   differ at `f`   when a=1 b=0
 ```
+
+## Two engines
+
+| `--engine` | how | reports |
+| --- | --- | --- |
+| `bdd` (default) | the in-tree ROBDD: exact, canonical | every differing endpoint, each with a counter-example |
+| `abc` | ABC's SAT-based prover over the same model, through [`vyges-abc-lib`](https://github.com/vyges-tools/abc-lib) | the first differing endpoint and its counter-example; scales to datapaths where BDDs grow too large |
+| `both` | runs both and fails if they disagree | the `bdd` report |
+
+Both engines read the same model, so on every design both finish they must give the same verdict:
+two independent provers checking each other. `abc` and `both` need the optional feature:
+
+```sh
+cargo build --release --features abc   # links the prebuilt ABC archive (see vyges-abc-lib)
+```
+
+With `--fail-on-diff`, an `abc` run that gives up within its limits exits 4 (undecided).
 
 ## How it works
 
@@ -80,9 +97,9 @@ one design. Text + `--json`, a `--fail-on-diff` CI exit code. The ROBDD package
   the function-attribute path that is the next step;
 - sequential equivalence assumes **matched registers by name** (no retiming, no
   state re-encoding) — sequential/retiming LEC is a separate, larger problem;
-- a single **monolithic BDD** with a static variable order: correct for any size,
-  but wide datapaths (multipliers) can blow up memory — dynamic reordering and an
-  AIG+SAT path are the scaling passes;
+- the `bdd` engine is a single **monolithic BDD** with a static variable order:
+  correct for any size, but wide datapaths (multipliers) can blow up memory; the
+  `abc` engine (SAT-based) is the path for those;
 - constants/tie cells and `1'b0`/`1'b1` literals are not yet folded in.
 
 **Validation roadmap:** cross-check verdicts against an established equivalence

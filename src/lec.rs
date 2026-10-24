@@ -33,10 +33,12 @@ pub struct LecReport {
     pub mismatches: Vec<Mismatch>,
     pub only_in_golden: Vec<String>,
     pub only_in_revised: Vec<String>,
+    /// The engine gave up within its limits (the ABC engine only): neither proved nor disproved.
+    pub undecided: bool,
 }
 
-#[derive(Clone, Copy)]
-enum Op {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Op {
     Buf,
     Not,
     And,
@@ -84,14 +86,14 @@ fn net_of<'a>(inst: &'a Inst, pin: &str) -> Option<&'a str> {
 }
 
 /// One design's view: net -> (inst index, output pin); plus the netlist + lib.
-struct Design<'a> {
+pub(crate) struct Design<'a> {
     nl: &'a Netlist,
     lib: &'a Lib,
     driver: BTreeMap<&'a str, (usize, &'a str)>,
 }
 
 impl<'a> Design<'a> {
-    fn new(nl: &'a Netlist, lib: &'a Lib) -> Design<'a> {
+    pub(crate) fn new(nl: &'a Netlist, lib: &'a Lib) -> Design<'a> {
         let mut driver = BTreeMap::new();
         for (i, inst) in nl.insts.iter().enumerate() {
             if let Some(cell) = lib.cells.get(&inst.cell) {
@@ -287,6 +289,100 @@ fn apply_op(bdd: &mut Bdd, op: Op, ins: &[u32], pins: &[String]) -> Result<u32, 
     })
 }
 
+/// The endpoints both designs have (compared), and those only one has (reported, not compared).
+pub(crate) struct Endpoints {
+    pub shared: Vec<String>,
+    pub only_in_golden: Vec<String>,
+    pub only_in_revised: Vec<String>,
+}
+
+pub(crate) fn endpoints(g: &Design, r: &Design) -> Endpoints {
+    let g_eps: BTreeSet<String> = g.endpoints().into_iter().collect();
+    let r_eps: BTreeSet<String> = r.endpoints().into_iter().collect();
+    Endpoints {
+        shared: g_eps.intersection(&r_eps).cloned().collect(),
+        only_in_golden: g_eps.difference(&r_eps).cloned().collect(),
+        only_in_revised: r_eps.difference(&g_eps).cloned().collect(),
+    }
+}
+
+/// One gate of a cone: the net it drives, its primitive, and its connected input pins with their
+/// nets, in the cell's pin order (the order `build` applies them in).
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) struct Gate {
+    pub out: String,
+    pub op: Op,
+    pub pins: Vec<String>,
+    pub ins: Vec<String>,
+}
+
+/// The logic feeding a set of endpoints, as `build` sees it: gates in dependency order (every
+/// gate after the gates driving its inputs), and the free inputs (primary inputs, undriven nets,
+/// register outputs) the cone reads.
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) struct Cone {
+    pub gates: Vec<Gate>,
+    pub free: BTreeSet<String>,
+}
+
+/// Collect the cone of `endpoints` with exactly `build`'s rules: the same free-input test, the
+/// same cell-to-primitive map, the same input pins, the same errors.
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) fn cone(d: &Design, endpoints: &[String]) -> Result<Cone, String> {
+    let mut c = Cone { gates: Vec::new(), free: BTreeSet::new() };
+    let mut done = BTreeSet::new();
+    for ep in endpoints {
+        collect(ep, d, &mut c, &mut done, &mut BTreeSet::new())?;
+    }
+    Ok(c)
+}
+
+fn collect(
+    net: &str,
+    d: &Design,
+    c: &mut Cone,
+    done: &mut BTreeSet<String>,
+    visiting: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    if done.contains(net) {
+        return Ok(());
+    }
+    let is_free =
+        d.nl.inputs.iter().any(|p| p == net) || !d.driver.contains_key(net) || d.is_seq_driver(net);
+    if is_free {
+        c.free.insert(net.to_string());
+        done.insert(net.to_string());
+        return Ok(());
+    }
+    if !visiting.insert(net.to_string()) {
+        return Err(format!("combinational loop through net `{net}`"));
+    }
+    let &(i, _) = d.driver.get(net).unwrap();
+    let inst = &d.nl.insts[i];
+    let cell = d
+        .lib
+        .cells
+        .get(&inst.cell)
+        .ok_or_else(|| format!("no cell `{}` in Liberty", inst.cell))?;
+    let op = op_of(&inst.cell)
+        .ok_or_else(|| format!("cell `{}` is not a known logic primitive", inst.cell))?;
+    let mut pins = Vec::new();
+    let mut ins = Vec::new();
+    for (n, p) in &cell.pins {
+        if p.direction == Dir::In && cell.clock_pin.as_deref() != Some(n) {
+            if let Some(src) = net_of(inst, n) {
+                collect(src, d, c, done, visiting)?;
+                pins.push(n.clone());
+                ins.push(src.to_string());
+            }
+        }
+    }
+    visiting.remove(net);
+    done.insert(net.to_string());
+    c.gates.push(Gate { out: net.to_string(), op, pins, ins });
+    Ok(())
+}
+
 /// Check golden vs revised for combinational equivalence.
 pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<LecReport, String> {
     if lib.cells.is_empty() {
@@ -305,11 +401,7 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Lec
         vars.get(p);
     }
 
-    let g_eps: BTreeSet<String> = g.endpoints().into_iter().collect();
-    let r_eps: BTreeSet<String> = r.endpoints().into_iter().collect();
-    let only_in_golden: Vec<String> = g_eps.difference(&r_eps).cloned().collect();
-    let only_in_revised: Vec<String> = r_eps.difference(&g_eps).cloned().collect();
-    let shared: Vec<String> = g_eps.intersection(&r_eps).cloned().collect();
+    let Endpoints { shared, only_in_golden, only_in_revised } = endpoints(&g, &r);
 
     let mut mismatches = Vec::new();
     for ep in &shared {
@@ -340,6 +432,7 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Lec
         mismatches,
         only_in_golden,
         only_in_revised,
+        undecided: false,
     })
 }
 

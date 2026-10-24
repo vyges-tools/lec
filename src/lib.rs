@@ -21,5 +21,9 @@ pub use vyges_loom::{liberty, netlist};
 pub mod bdd;
 pub mod lec;
 
+/// The same check through ABC (`--features abc`): a second, SAT-based engine over the same model.
+#[cfg(feature = "abc")]
+pub mod abc;
+
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const COPYRIGHT: &str = "© 2026 Vyges. All Rights Reserved.  https://vyges.com";
