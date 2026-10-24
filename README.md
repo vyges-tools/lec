@@ -92,8 +92,8 @@ one design. Text + `--json`, a `--fail-on-diff` CI exit code. The ROBDD package
 **Depth reserved (honest):**
 
 - gate functions come from a **name-prefix primitive map**, not the Liberty boolean
-  `function` attribute or a UDP — an unrecognized cell is a hard error (never a
-  silent wrong answer), but complex cells (AOI/OAI, full adders, custom UDPs) need
+  `function` attribute or a UDP — an unrecognized cell, or a cell missing from the
+  Liberty that touches a compared cone, is a hard error (never a silent wrong answer), but complex cells (AOI/OAI, full adders, custom UDPs) need
   the function-attribute path that is the next step;
 - sequential equivalence assumes **matched registers by name** (no retiming, no
   state re-encoding) — sequential/retiming LEC is a separate, larger problem;

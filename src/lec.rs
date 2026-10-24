@@ -90,11 +90,15 @@ pub(crate) struct Design<'a> {
     nl: &'a Netlist,
     lib: &'a Lib,
     driver: BTreeMap<&'a str, (usize, &'a str)>,
+    /// Nets touching an instance whose cell is NOT in the Liberty: net -> that instance. Without
+    /// the cell's pin directions nothing says whether the instance drives the net.
+    unknown: BTreeMap<&'a str, &'a str>,
 }
 
 impl<'a> Design<'a> {
     pub(crate) fn new(nl: &'a Netlist, lib: &'a Lib) -> Design<'a> {
         let mut driver = BTreeMap::new();
+        let mut unknown = BTreeMap::new();
         for (i, inst) in nl.insts.iter().enumerate() {
             if let Some(cell) = lib.cells.get(&inst.cell) {
                 for (pin, net) in &inst.conns {
@@ -102,9 +106,33 @@ impl<'a> Design<'a> {
                         driver.insert(net.as_str(), (i, pin.as_str()));
                     }
                 }
+            } else {
+                for (_, net) in &inst.conns {
+                    unknown.entry(net.as_str()).or_insert(inst.name.as_str());
+                }
             }
         }
-        Design { nl, lib, driver }
+        Design { nl, lib, driver, unknown }
+    }
+
+    /// Is `net` a free input of the model (a primary input, a register output, or undriven)?
+    /// ⛔ An "undriven" net that touches an instance of a cell missing from the Liberty is an
+    /// error, not a free input: that instance may well drive it, and treating it as free in both
+    /// designs would compare it equal whatever the cell computes.
+    fn is_free(&self, net: &str) -> Result<bool, String> {
+        if self.nl.inputs.iter().any(|p| p == net) || self.is_seq_driver(net) {
+            return Ok(true);
+        }
+        if self.driver.contains_key(net) {
+            return Ok(false);
+        }
+        match self.unknown.get(net) {
+            Some(inst) => Err(format!(
+                "net `{net}` connects to instance `{inst}`, whose cell `{}` is not in the Liberty",
+                self.nl.insts.iter().find(|i| i.name == *inst).map(|i| i.cell.as_str()).unwrap_or("?")
+            )),
+            None => Ok(true),
+        }
     }
 
     fn is_seq_driver(&self, net: &str) -> bool {
@@ -178,9 +206,7 @@ fn build(
         return Ok(f);
     }
     // a free input: primary input, an undriven net, or a register (flop Q) output
-    let is_free =
-        d.nl.inputs.iter().any(|p| p == net) || !d.driver.contains_key(net) || d.is_seq_driver(net);
-    if is_free {
+    if d.is_free(net)? {
         let idx = vars.get(net);
         let f = bdd.var(idx);
         memo.insert(net.to_string(), f);
@@ -347,9 +373,7 @@ fn collect(
     if done.contains(net) {
         return Ok(());
     }
-    let is_free =
-        d.nl.inputs.iter().any(|p| p == net) || !d.driver.contains_key(net) || d.is_seq_driver(net);
-    if is_free {
+    if d.is_free(net)? {
         c.free.insert(net.to_string());
         done.insert(net.to_string());
         return Ok(());
@@ -476,6 +500,21 @@ mod tests {
         let val = |n: &str| cex.iter().find(|(k, _)| k == n).map(|(_, v)| *v);
         // at least one of a,b is in the counterexample and they aren't equal-true
         assert!(val("a").is_some() || val("b").is_some());
+    }
+
+    /// A cell the Liberty lacks may drive the net it touches: an error, never a free input. As a
+    /// free input in both designs, `f` would compare equal although the cells differ (XOR2 vs
+    /// XNOR2, neither in the example Liberty).
+    #[test]
+    fn a_cell_missing_from_the_liberty_is_an_error() {
+        let g = nl("module t(a,b,f);\ninput a,b; output f;\nXOR2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
+        let r = nl("module t(a,b,f);\ninput a,b; output f;\nXNOR2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
+        let e = equivalence(&g, &r, &lib()).unwrap_err();
+        assert!(e.contains("`XOR2` is not in the Liberty"), "{e}");
+        // A missing cell outside every compared cone (here: on an unused net) is no error.
+        let g2 = nl("module t(a,b,f);\ninput a,b; output f;\nwire u;\n\
+             AND2 g(.A(a),.B(b),.Z(f));\nFILL x(.A(u));\nendmodule\n");
+        assert!(equivalence(&g2, &g2, &lib()).unwrap().equivalent);
     }
 
     #[test]
