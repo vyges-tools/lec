@@ -92,12 +92,15 @@ pub(crate) enum Src {
     Const(bool),
 }
 
-/// The source of `pin`: its net, else its tie (`.B(1'b0)`), else nothing (unconnected).
+/// The source of input `pin`: its net, else its tie (`.B(1'b0)`).
 /// ⛔ A tie is an input like any other: dropping it would turn `AND2(a, 1'b0)` into `a`.
-fn src_of(inst: &Inst, pin: &str) -> Option<Src> {
+/// ⛔ An unconnected input is an error, not a dropped input: it floats, and skipping it would turn
+/// `AND2(a, <open>)` into `a` just the same.
+fn src_of(inst: &Inst, pin: &str) -> Result<Src, String> {
     net_of(inst, pin)
         .map(|n| Src::Net(n.to_string()))
         .or_else(|| inst.ties.iter().find(|(p, _)| p == pin).map(|&(_, v)| Src::Const(v)))
+        .ok_or_else(|| format!("input pin `{pin}` of instance `{}` ({}) is unconnected", inst.name, inst.cell))
 }
 
 /// One design's view: net -> (inst index, output pin); plus the netlist + lib.
@@ -252,10 +255,9 @@ fn build(
     let mut child = Vec::new();
     let mut child_pins = Vec::new();
     for p in &in_pins {
-        let f = match src_of(inst, p) {
-            Some(Src::Net(n)) => build(&n, d, bdd, vars, memo, visiting)?,
-            Some(Src::Const(v)) => if v { bdd.one() } else { bdd.zero() },
-            None => continue,
+        let f = match src_of(inst, p)? {
+            Src::Net(n) => build(&n, d, bdd, vars, memo, visiting)?,
+            Src::Const(v) => if v { bdd.one() } else { bdd.zero() },
         };
         child.push(f);
         child_pins.push(p.to_string());
@@ -412,13 +414,12 @@ fn collect(
     let mut ins = Vec::new();
     for (n, p) in &cell.pins {
         if p.direction == Dir::In && cell.clock_pin.as_deref() != Some(n) {
-            if let Some(src) = src_of(inst, n) {
-                if let Src::Net(net) = &src {
-                    collect(net, d, c, done, visiting)?;
-                }
-                pins.push(n.clone());
-                ins.push(src);
+            let src = src_of(inst, n)?;
+            if let Src::Net(net) = &src {
+                collect(net, d, c, done, visiting)?;
             }
+            pins.push(n.clone());
+            ins.push(src);
         }
     }
     visiting.remove(net);
@@ -548,6 +549,16 @@ mod tests {
         assert!(!rep.equivalent);
         assert_eq!(rep.mismatches[0].counterexample, [("a".to_string(), true)]);
         assert!(equivalence(&and1, &buf, &lib()).unwrap().equivalent);
+    }
+
+    /// An unconnected input floats: an error, never a dropped input. Dropped, `AND2(a, <open>)`
+    /// would read as `a` and compare equal to a buffer.
+    #[test]
+    fn an_unconnected_input_is_an_error() {
+        let buf = nl("module t(a,f);\ninput a; output f;\nBUF b(.A(a),.Y(f));\nendmodule\n");
+        let open = nl("module t(a,f);\ninput a; output f;\nAND2 g(.A(a),.Z(f));\nendmodule\n");
+        let e = equivalence(&open, &buf, &lib()).unwrap_err();
+        assert!(e.contains("input pin `B` of instance `g` (AND2) is unconnected"), "{e}");
     }
 
     #[test]

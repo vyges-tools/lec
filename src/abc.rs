@@ -369,6 +369,15 @@ mod tests {
         assert_eq!(equivalence(&and1, &buf, &lib()).unwrap().verdict, Verdict::Equivalent);
     }
 
+    /// An unconnected input floats: the cone this engine writes refuses it, as the BDD engine does.
+    #[test]
+    fn an_unconnected_input_is_an_error() {
+        let buf = nl("module t(a,f);\ninput a; output f;\nBUF b(.A(a),.Y(f));\nendmodule\n");
+        let open = nl("module t(a,f);\ninput a; output f;\nAND2 g(.A(a),.Z(f));\nendmodule\n");
+        let e = equivalence(&open, &buf, &lib()).unwrap_err();
+        assert!(e.contains("input pin `B` of instance `g` (AND2) is unconnected"), "{e}");
+    }
+
     /// a AND b against (a AND b) AND c differs ONLY at a = b = 1, c = 0, so the counterexample is
     /// exactly that assignment (an inverted one, a = b = 0, c = 1, shows nothing).
     #[test]
