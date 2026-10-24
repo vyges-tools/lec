@@ -51,10 +51,10 @@ commands:
 
 flags:
   --lib FILE       Liberty (pin directions + comb/seq split) — required
-  --engine E       bdd (default): exact BDDs, lists every differing endpoint
-                   abc: SAT-based (ABC), scales further, names the first differing endpoint
+  --engine E       abc: SAT-based (ABC), scales to real netlists, names the first differing
+                        endpoint (the default in a build with --features abc, as released)
+                   bdd: exact BDDs, lists every differing endpoint (the default without it)
                    both: run both and fail if they disagree; reports the bdd result
-                   (abc and both need a build with --features abc)
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
   --fail-on-diff   exit 3 if the designs are not equivalent, 4 if undecided (CI gate)
@@ -332,7 +332,7 @@ fn main() {
         sec(&args, &g, &r, &lib);
         return;
     }
-    let engine = opt(&args, "--engine").unwrap_or_else(|| "bdd".into());
+    let engine = opt(&args, "--engine").unwrap_or_else(|| DEFAULT_ENGINE.into());
     let report = match engine.as_str() {
         "bdd" => lec::equivalence(&g, &r, &lib).unwrap_or_else(|e| die(&e)),
         "abc" | "both" => with_abc(&engine, &g, &r, &lib),
@@ -547,7 +547,25 @@ fn sec(_: &[String], _: &netlist::Netlist, _: &netlist::Netlist, _: &Lib) {
     exit(2);
 }
 
+/// `check`'s engine when `--engine` is not given: ABC when the build has it. The BDD engine is exact
+/// but did not finish a real core (picorv32, >300 s) that ABC proves in a fraction of a second; a
+/// build without ABC has only the BDD engine.
+const DEFAULT_ENGINE: &str = if cfg!(feature = "abc") { "abc" } else { "bdd" };
+
 fn die(msg: &str) -> ! {
     diag!("error: {msg}");
     exit(1);
+}
+
+#[cfg(test)]
+mod tests {
+    /// ABC is `check`'s default exactly when it is built in (the released binary); without it the
+    /// default is the only engine there is.
+    #[test]
+    fn the_default_engine_is_abc_when_built_in() {
+        #[cfg(feature = "abc")]
+        assert_eq!(super::DEFAULT_ENGINE, "abc");
+        #[cfg(not(feature = "abc"))]
+        assert_eq!(super::DEFAULT_ENGINE, "bdd");
+    }
 }

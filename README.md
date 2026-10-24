@@ -45,7 +45,8 @@ vyges physical lec check golden.v revised.v --lib cells.lib
 Or the standalone binary:
 
 ```sh
-cargo build --release            # std-only; the BDD package is in-tree
+cargo build --release --features abc   # as released: links the prebuilt ABC archive
+cargo build --release                  # std-only: the in-tree BDD engine, `check` only
 
 vyges-lec check golden.v revised.v --lib cells.lib                  # -> verdict
 vyges-lec check golden.v revised.v --lib cells.lib --json
@@ -62,12 +63,13 @@ vyges-lec — NOT EQUIVALENT ✗  (1 compared, 1 differ)
 
 | `--engine` | how | reports |
 | --- | --- | --- |
-| `bdd` (default) | the in-tree ROBDD: exact, canonical | every differing endpoint, each with a counter-example |
-| `abc` | ABC's SAT-based prover over the same model, through [`vyges-abc-lib`](https://github.com/vyges-tools/abc-lib) | the first differing endpoint and its counter-example; scales to datapaths where BDDs grow too large |
+| `abc` (default, as released) | ABC's SAT-based prover over the same model, through [`vyges-abc-lib`](https://github.com/vyges-tools/abc-lib) | the first differing endpoint and its counter-example; scales to real netlists and datapaths where BDDs grow too large |
+| `bdd` (default without ABC) | the in-tree ROBDD: exact, canonical | every differing endpoint, each with a counter-example |
 | `both` | runs both and fails if they disagree | the `bdd` report |
 
 Both engines read the same model, so on every design both finish they must give the same verdict:
-two independent provers checking each other. `abc` and `both` need the optional feature:
+two independent provers checking each other. The released binary carries ABC; a source build needs
+the optional feature for `abc`, `both`, `sec` and `prove` (without it `check` uses `bdd`):
 
 ```sh
 cargo build --release --features abc   # links the prebuilt ABC archive (see vyges-abc-lib)
