@@ -7,5 +7,10 @@ License in the accompanying LICENSE file or at:
 
     http://www.apache.org/licenses/LICENSE-2.0
 
-vyges-lec checks two gate-level netlists for combinational equivalence and reports
-the verdict with counterexamples where they diverge.
+vyges-lec checks gate-level netlists for logic equivalence (combinational and
+sequential) and for properties, and reports counterexamples where they fail.
+
+The released binary links the vyges-abc-lib archive, which carries ABC (The Regents
+of the University of California, BSD-3-Clause style) and zlib (Zlib licence), and on
+Linux the LLVM C++ runtime (Apache-2.0 WITH LLVM-exception). Their notices ship
+beside the binary in NOTICE-abc and licenses-abc/.

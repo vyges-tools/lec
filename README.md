@@ -1,8 +1,9 @@
 # vyges-lec
 
-Combinational **logic equivalence** check: two gate-level **netlists** (golden and
-revised) and a **Liberty** in, a verdict out — *do they compute the same function?*
-— with a concrete input **counter-example** when they don't.
+Formal checks on gate-level **netlists**, with a **Liberty** for the cell functions:
+**logic equivalence** of two netlists — combinational (`check`) and sequential (`sec`) —
+and **property checking** of one (`prove`). Every failure comes with a concrete
+**counter-example**.
 
 > **Vyges open EDA tools.** Commercial-grade silicon sign-off capability, built on
 > open standards and plain file formats — and meant to be accessible to everyone,
@@ -33,6 +34,15 @@ functions are equal *iff* they are the same node: the equivalence test is a poin
 compare, and a mismatch's miter walks straight to a counter-example.
 
 ## Use it
+
+Through the Vyges CLI, as part of the `formal` group:
+
+```sh
+vyges install formal
+vyges formal lec check golden.v revised.v --lib cells.lib
+```
+
+Or the standalone binary:
 
 ```sh
 cargo build --release            # std-only; the BDD package is in-tree

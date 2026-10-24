@@ -38,8 +38,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # The released binary carries the ABC engine (`sec`, `prove`, `--engine abc`): the prebuilt
+      # archive published for the abc-lib commit Cargo.lock pins, as the ci job builds against.
+      # The three targets are exactly the three abc-lib publishes.
+      - name: Prebuilt ABC for the locked abc-lib
+        shell: bash
+        run: |
+          cargo fetch --locked
+          dir=$(cargo metadata --locked --format-version 1 --features abc \
+                | jq -r '.packages[] | select(.name == "vyges-abc-lib") | .manifest_path' | xargs dirname)
+          bash "$dir/scripts/fetch-bundle.sh" "$RUNNER_TEMP/abc" >> "$GITHUB_ENV"
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --locked --release --features abc --target ${{ matrix.target }}
       - name: Package
         shell: bash
         run: |
@@ -48,6 +58,9 @@ jobs:
           mkdir -p "$stage"
           cp "target/${{ matrix.target }}/release/${bin}" "$stage/"
           cp README.md LICENSE NOTICE "$stage/"
+          # the linked ABC archive's notices (ABC, zlib, and on Linux the LLVM C++ runtime)
+          cp -R "$VYGES_ABC_PREBUILT_DIR/licenses" "$stage/licenses-abc"
+          cp "$VYGES_ABC_PREBUILT_DIR/NOTICE" "$stage/NOTICE-abc"
           tar -czf "${stage}.tar.gz" "$stage"
       - uses: actions/upload-artifact@v7
         with:

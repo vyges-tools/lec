@@ -35,12 +35,12 @@ macro_rules! diag {
 
 
 const USAGE: &str = "\
-vyges loom lec — combinational logic equivalence check (golden vs revised)
+vyges formal lec — logic equivalence (combinational, sequential) and property checking
 
 usage:
-  vyges loom lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
-  vyges loom lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
-  vyges loom lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [...]
+  vyges formal lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
+  vyges formal lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+  vyges formal lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [...]
 
 commands:
   check            combinational: registers cut and matched by instance name

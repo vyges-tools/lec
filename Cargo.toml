@@ -2,7 +2,7 @@
 name = "vyges-lec"
 version = "0.1.45"
 edition = "2021"
-description = "Combinational logic equivalence check: two gate-level netlists in, an equivalence verdict (with counter-example) out."
+description = "Formal checks on gate-level netlists: combinational and sequential equivalence, and property checking, with counter-examples."
 license = "Apache-2.0"
 authors = ["Vyges <https://vyges.com/contact>"]
 homepage = "https://vyges.com"
