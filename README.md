@@ -70,16 +70,19 @@ With `--fail-on-diff`, an `abc` run that gives up within its limits exits 4 (und
 - Each design's endpoints — primary outputs and flop data pins — are built into a
   **ROBDD** in *one shared package over one shared variable order* (primary inputs
   by name).
-- Gate functions come from a built-in standard-cell **primitive map**, keyed on the
-  cell name's logic prefix: INV/BUF, AND/NAND, OR/NOR, XOR/XNOR (any fan-in), and
-  MUX (`S ? B : A`). The Liberty gives pin directions and splits combinational from
+- Gate functions come from each output pin's Liberty `function`; for a library
+  without one, from a built-in standard-cell **primitive map** keyed on the cell
+  name's logic prefix: INV/BUF, AND/NAND, OR/NOR, XOR/XNOR (any fan-in), and MUX
+  (`S ? B : A`). The Liberty also gives pin directions and splits combinational from
   sequential cells.
 - Matching endpoints are compared by node identity. Equal → proven equivalent.
   Different → the miter `golden ⊕ revised` is solved for one satisfying assignment,
   reported as the input cube under which the designs disagree.
-- **Sequential** designs are cut at the registers — flop Q nets become free inputs,
-  flop D nets become endpoints — so the check proves the combinational logic between
-  registers (registers matched by name).
+- **Sequential** designs are cut at the registers — flop outputs become free inputs,
+  flop data pins become endpoints — so the check proves the combinational logic
+  between registers. Registers are matched by **instance name** (`inst/Q`, `inst/D`),
+  not by the nets on their pins, so a netlist whose nets were renamed by buffering or
+  resizing still lines up with its source.
 
 ## Current state (v0.1.0)
 
@@ -96,7 +99,7 @@ one design. Text + `--json`, a `--fail-on-diff` CI exit code. The ROBDD package
   `function` attributes falls back to a **name-prefix primitive map**. A function that
   does not parse, an unrecognized cell, or a cell missing from the Liberty that touches a
   compared cone is a hard error (never a silent wrong answer). UDPs are not read;
-- sequential equivalence assumes **matched registers by name** (no retiming, no
+- sequential equivalence assumes **registers matched by instance name** (no retiming, no
   state re-encoding) — sequential/retiming LEC is a separate, larger problem;
 - the `bdd` engine is a single **monolithic BDD** with a static variable order:
   correct for any size, but wide datapaths (multipliers) can blow up memory; the

@@ -9,8 +9,8 @@
 //! This is the formal sibling of simulation: a simulator shows two designs agree on
 //! the vectors you ran; `vyges-lec` proves they agree on *all* of them (or hands you
 //! the input where they don't). Sequential designs are cut at the registers — flop
-//! Q nets are free inputs, flop D nets are endpoints — the standard combinational
-//! equivalence model with registers matched by name.
+//! outputs are free inputs, flop data pins are endpoints — the standard combinational
+//! equivalence model with registers matched by instance name.
 //!
 //! Gate functions come from the Liberty `function` attribute of each output pin (a
 //! built-in standard-cell primitive map stands in for libraries without one); the

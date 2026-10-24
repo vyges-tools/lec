@@ -12,7 +12,7 @@
 //! ⛔ ABC stops at the FIRST output it disproves, so a [`Verdict::Differs`] names one differing
 //! endpoint, not all of them (the BDD engine lists every one).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -164,10 +164,10 @@ fn cover_prim(op: Op, pins: &[String]) -> Result<(Vec<usize>, Vec<String>), Stri
     })
 }
 
-/// One design as BLIF: inputs `pis` (net -> index, the union over both designs), outputs the
-/// shared endpoints in order, internal nets numbered per file.
+/// One design as BLIF: inputs `pis` (free-input variable -> index, the union over both designs),
+/// outputs this design's nets of the shared endpoints in order, internal nets numbered per file.
 fn write_blif(model: &str, c: &Cone, pis: &BTreeMap<String, usize>, outs: &[String]) -> Result<String, String> {
-    let mut id: BTreeMap<&str, String> = pis.iter().map(|(n, &k)| (n.as_str(), pi_name(k))).collect();
+    let mut id: BTreeMap<&str, String> = c.free.iter().map(|(n, v)| (n.as_str(), pi_name(pis[v]))).collect();
     for (k, g) in c.gates.iter().enumerate() {
         id.insert(g.out.as_str(), format!("n{k}"));
     }
@@ -247,14 +247,14 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Abc
     if eps.shared.is_empty() {
         return Ok(report(Verdict::Equivalent));
     }
-    let gc = lec::cone(&g, &eps.shared)?;
-    let rc = lec::cone(&r, &eps.shared)?;
-    // Both files declare the same inputs: every free input either cone reads.
-    let pis: BTreeMap<String, usize> =
-        gc.free.union(&rc.free).enumerate().map(|(k, n)| (n.clone(), k)).collect();
+    let gc = lec::cone(&g, &eps.golden_nets)?;
+    let rc = lec::cone(&r, &eps.revised_nets)?;
+    // Both files declare the same inputs: every free input variable either cone reads.
+    let vars: BTreeSet<&String> = gc.free.values().chain(rc.free.values()).collect();
+    let pis: BTreeMap<String, usize> = vars.into_iter().enumerate().map(|(k, v)| (v.clone(), k)).collect();
     let dir = Scratch::new()?;
-    let gp = dir.write("golden.blif", &write_blif("golden", &gc, &pis, &eps.shared)?)?;
-    let rp = dir.write("revised.blif", &write_blif("revised", &rc, &pis, &eps.shared)?)?;
+    let gp = dir.write("golden.blif", &write_blif("golden", &gc, &pis, &eps.golden_nets)?)?;
+    let rp = dir.write("revised.blif", &write_blif("revised", &rc, &pis, &eps.revised_nets)?)?;
 
     let mut abc = Abc::start().map_err(|e| e.to_string())?;
     // ⛔ A MULTI-output miter (one output per endpoint) and `iprove`, which names the output it
@@ -320,7 +320,8 @@ mod tests {
         let l = lib();
         let d = Design::new(nl, &l);
         let c = lec::cone(&d, &[ep.to_string()]).unwrap();
-        let mut v: BTreeMap<String, bool> = cex.iter().cloned().collect();
+        let cex: BTreeMap<&str, bool> = cex.iter().map(|(k, b)| (k.as_str(), *b)).collect();
+        let mut v: BTreeMap<String, bool> = c.free.iter().map(|(n, var)| (n.clone(), *cex.get(var.as_str()).unwrap_or(&false))).collect();
         for g in &c.gates {
             let (order, rows) = cover(&g.logic, &g.pins).unwrap();
             let ins: Vec<bool> = order
@@ -431,7 +432,8 @@ mod tests {
         let v = |nl: &Netlist| {
             let d = Design::new(nl, &l);
             let c = lec::cone(&d, std::slice::from_ref(endpoint)).unwrap();
-            let mut v: BTreeMap<String, bool> = counterexample.iter().cloned().collect();
+            let cex: BTreeMap<&str, bool> = counterexample.iter().map(|(k, b)| (k.as_str(), *b)).collect();
+            let mut v: BTreeMap<String, bool> = c.free.iter().map(|(n, var)| (n.clone(), *cex.get(var.as_str()).unwrap_or(&false))).collect();
             for g in &c.gates {
                 let (order, rows) = cover(&g.logic, &g.pins).unwrap();
                 let ins: Vec<bool> = order.iter().map(|&i| match &g.ins[i] { Src::Net(n) => *v.get(n).unwrap_or(&false), Src::Const(b) => *b }).collect();
@@ -441,6 +443,26 @@ mod tests {
             v[endpoint.as_str()]
         };
         assert_ne!(v(&g), v(&ao));
+    }
+
+    /// Registers match by instance through this engine too: a renamed Q net behind an output
+    /// buffer and a renamed D net are still the same register; a rewired D is caught at `r/D`.
+    #[test]
+    fn registers_match_by_instance_not_by_net() {
+        let g = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d;\n\
+             AND2 g(.A(a),.B(q),.Z(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nendmodule\n");
+        let r = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d2,net9;\n\
+             AND2 g(.A(a),.B(net9),.Z(d2));\nDFF r(.CK(clk),.D(d2),.Q(net9));\nBUF ob(.A(net9),.Y(q));\nendmodule\n");
+        let rep = equivalence(&g, &r, &lib()).unwrap();
+        assert_eq!(rep.verdict, Verdict::Equivalent);
+        assert_eq!(rep.compared, 2);
+        let w = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d2,net9;\n\
+             OR2 g(.A(a),.B(net9),.Z(d2));\nDFF r(.CK(clk),.D(d2),.Q(net9));\nBUF ob(.A(net9),.Y(q));\nendmodule\n");
+        let rep = equivalence(&g, &w, &lib()).unwrap();
+        let Verdict::Differs { endpoint, counterexample } = &rep.verdict else { panic!("{:?}", rep.verdict) };
+        assert_eq!(endpoint, "r/D");
+        let v = |n: &str| counterexample.iter().find(|(k, _)| k == n).map(|(_, v)| *v);
+        assert_ne!(v("a"), v("r/Q"), "{counterexample:?}");
     }
 
     /// a AND b against (a AND b) AND c differs ONLY at a = b = 1, c = 0, so the counterexample is

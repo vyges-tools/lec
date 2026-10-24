@@ -10,9 +10,9 @@
 //! built-in standard-cell primitive map (keyed on the cell name's logic prefix —
 //! INV/BUF/AND/OR/NAND/NOR/XOR/XNOR/MUX); the Liberty gives pin directions and tells
 //! combinational cells from sequential. Sequential
-//! state is cut at the registers: flop Q nets are free inputs, flop D nets are
-//! endpoints — i.e. this proves the *combinational* logic between registers, the
-//! standard combinational-LEC model (registers matched by name).
+//! state is cut at the registers: flop outputs are free inputs (`inst/Q`), flop data
+//! pins are endpoints (`inst/D`) — i.e. this proves the *combinational* logic between
+//! registers, the standard combinational-LEC model (registers matched by instance name).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -225,31 +225,43 @@ impl<'a> Design<'a> {
     }
 
     fn is_seq_driver(&self, net: &str) -> bool {
-        self.driver
-            .get(net)
-            .and_then(|&(i, _)| self.lib.cells.get(&self.nl.insts[i].cell))
-            .map(|c| c.is_seq)
-            .unwrap_or(false)
+        self.seq_driver(net).is_some()
     }
 
-    /// Endpoints to compare: primary outputs + flop data pins (setup-constrained).
-    fn endpoints(&self) -> Vec<String> {
-        let mut e: Vec<String> = self.nl.outputs.clone();
+    /// The register (instance, output pin) driving `net`, if a sequential cell drives it.
+    fn seq_driver(&self, net: &str) -> Option<(&'a str, &'a str)> {
+        let &(i, pin) = self.driver.get(net)?;
+        let inst = &self.nl.insts[i];
+        self.lib.cells.get(&inst.cell).filter(|c| c.is_seq).map(|_| (inst.name.as_str(), pin))
+    }
+
+    /// The name of free input `net`, shared by both designs: a register output is `inst/pin`, so a
+    /// register matches by its INSTANCE name whatever its output net is called (repair renames it
+    /// when it buffers an output port); any other free input is its net.
+    fn var_of(&self, net: &str) -> String {
+        match self.seq_driver(net) {
+            Some((inst, pin)) => format!("{inst}/{pin}"),
+            None => net.to_string(),
+        }
+    }
+
+    /// Endpoints to compare, as (key, net): primary outputs by port name, flop data pins
+    /// (setup-constrained) as `inst/pin` — matched by the register, not by its data net.
+    fn endpoints(&self) -> BTreeMap<String, String> {
+        let mut e: BTreeMap<String, String> = self.nl.outputs.iter().map(|o| (o.clone(), o.clone())).collect();
         for inst in &self.nl.insts {
             if let Some(cell) = self.lib.cells.get(&inst.cell) {
                 if cell.is_seq {
                     for (pin, p) in &cell.pins {
                         if !p.setup.is_empty() {
                             if let Some(n) = net_of(inst, pin) {
-                                e.push(n.to_string());
+                                e.insert(format!("{}/{pin}", inst.name), n.to_string());
                             }
                         }
                     }
                 }
             }
         }
-        e.sort();
-        e.dedup();
         e
     }
 }
@@ -300,7 +312,7 @@ fn build(
     }
     // a free input: primary input, an undriven net, or a register (flop Q) output
     if d.is_free(net)? {
-        let idx = vars.get(net);
+        let idx = vars.get(&d.var_of(net));
         let f = bdd.var(idx);
         memo.insert(net.to_string(), f);
         return Ok(f);
@@ -400,20 +412,25 @@ fn apply_op(bdd: &mut Bdd, op: Op, ins: &[u32], pins: &[String]) -> Result<u32, 
     })
 }
 
-/// The endpoints both designs have (compared), and those only one has (reported, not compared).
+/// The endpoints both designs have (compared, by key, with each design's net), and the keys only
+/// one has (reported, not compared).
 pub(crate) struct Endpoints {
     pub shared: Vec<String>,
+    pub golden_nets: Vec<String>,
+    pub revised_nets: Vec<String>,
     pub only_in_golden: Vec<String>,
     pub only_in_revised: Vec<String>,
 }
 
 pub(crate) fn endpoints(g: &Design, r: &Design) -> Endpoints {
-    let g_eps: BTreeSet<String> = g.endpoints().into_iter().collect();
-    let r_eps: BTreeSet<String> = r.endpoints().into_iter().collect();
+    let (ge, re) = (g.endpoints(), r.endpoints());
+    let shared: Vec<String> = ge.keys().filter(|k| re.contains_key(*k)).cloned().collect();
     Endpoints {
-        shared: g_eps.intersection(&r_eps).cloned().collect(),
-        only_in_golden: g_eps.difference(&r_eps).cloned().collect(),
-        only_in_revised: r_eps.difference(&g_eps).cloned().collect(),
+        golden_nets: shared.iter().map(|k| ge[k].clone()).collect(),
+        revised_nets: shared.iter().map(|k| re[k].clone()).collect(),
+        only_in_golden: ge.keys().filter(|k| !re.contains_key(*k)).cloned().collect(),
+        only_in_revised: re.keys().filter(|k| !ge.contains_key(*k)).cloned().collect(),
+        shared,
     }
 }
 
@@ -429,18 +446,18 @@ pub(crate) struct Gate {
 
 /// The logic feeding a set of endpoints, as `build` sees it: gates in dependency order (every
 /// gate after the gates driving its inputs), and the free inputs (primary inputs, undriven nets,
-/// register outputs) the cone reads.
+/// register outputs) the cone reads, as net -> the variable `build` names it.
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
 pub(crate) struct Cone {
     pub gates: Vec<Gate>,
-    pub free: BTreeSet<String>,
+    pub free: BTreeMap<String, String>,
 }
 
 /// Collect the cone of `endpoints` with exactly `build`'s rules: the same free-input test, the
 /// same cell-to-primitive map, the same input pins, the same errors.
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
 pub(crate) fn cone(d: &Design, endpoints: &[String]) -> Result<Cone, String> {
-    let mut c = Cone { gates: Vec::new(), free: BTreeSet::new() };
+    let mut c = Cone { gates: Vec::new(), free: BTreeMap::new() };
     let mut done = BTreeSet::new();
     for ep in endpoints {
         collect(ep, d, &mut c, &mut done, &mut BTreeSet::new())?;
@@ -465,7 +482,7 @@ fn collect(
         return Ok(());
     }
     if d.is_free(net)? {
-        c.free.insert(net.to_string());
+        c.free.insert(net.to_string(), d.var_of(net));
         done.insert(net.to_string());
         return Ok(());
     }
@@ -512,14 +529,14 @@ pub fn equivalence(golden: &Netlist, revised: &Netlist, lib: &Lib) -> Result<Lec
         vars.get(p);
     }
 
-    let Endpoints { shared, only_in_golden, only_in_revised } = endpoints(&g, &r);
+    let Endpoints { shared, golden_nets, revised_nets, only_in_golden, only_in_revised } = endpoints(&g, &r);
 
     let mut mismatches = Vec::new();
-    for ep in &shared {
+    for (k, ep) in shared.iter().enumerate() {
         let mut gm = HashMap::new();
         let mut rm = HashMap::new();
-        let fg = build(ep, &g, &mut bdd, &mut vars, &mut gm, &mut BTreeSet::new())?;
-        let fr = build(ep, &r, &mut bdd, &mut vars, &mut rm, &mut BTreeSet::new())?;
+        let fg = build(&golden_nets[k], &g, &mut bdd, &mut vars, &mut gm, &mut BTreeSet::new())?;
+        let fr = build(&revised_nets[k], &r, &mut bdd, &mut vars, &mut rm, &mut BTreeSet::new())?;
         if fg != fr {
             let miter = bdd.xor(fg, fr);
             let cex = bdd
@@ -677,6 +694,29 @@ mod tests {
         let bad = nl("module t(a,f);\ninput a; output f;\nBAD g(.A(a),.Y(f));\nendmodule\n");
         let e = equivalence(&bad, &buf, &l).unwrap_err();
         assert!(e.contains("function `A&Q` does not parse"), "{e}");
+    }
+
+    /// Registers match by INSTANCE: a register output is the variable `inst/Q` and a data pin the
+    /// endpoint `inst/D`, whatever the nets are called. Repair buffers an output port and renames
+    /// the register's Q net (and here its D net): still equivalent. Two registers that trade
+    /// their data inputs are not.
+    #[test]
+    fn registers_match_by_instance_not_by_net() {
+        let g = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d;\n\
+             AND2 g(.A(a),.B(q),.Z(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nendmodule\n");
+        let r = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d2,net9;\n\
+             AND2 g(.A(a),.B(net9),.Z(d2));\nDFF r(.CK(clk),.D(d2),.Q(net9));\nBUF ob(.A(net9),.Y(q));\nendmodule\n");
+        let rep = equivalence(&g, &r, &lib()).unwrap();
+        assert!(rep.equivalent, "{:?} {:?} {:?}", rep.mismatches, rep.only_in_golden, rep.only_in_revised);
+        assert_eq!(rep.compared, 2, "q and r/D");
+        let two = |da: &str, db: &str| {
+            nl(&format!("module t(a,b,clk,x,y);\ninput a,b,clk; output x,y;\n\
+                 DFF ra(.CK(clk),.D({da}),.Q(x));\nDFF rb(.CK(clk),.D({db}),.Q(y));\nendmodule\n"))
+        };
+        let rep = equivalence(&two("a", "b"), &two("b", "a"), &lib()).unwrap();
+        let mut at: Vec<&str> = rep.mismatches.iter().map(|m| m.endpoint.as_str()).collect();
+        at.sort();
+        assert_eq!(at, ["ra/D", "rb/D"]);
     }
 
     #[test]
