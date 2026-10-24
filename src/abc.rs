@@ -303,13 +303,15 @@ mod tests {
     use super::*;
 
     fn lib() -> Lib {
-        Lib::load("examples/cells.lib").expect("cells.lib")
+        Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/cells.lib")).expect("cells.lib")
     }
     fn nl(src: &str) -> Netlist {
         crate::netlist::parse(src).unwrap()
     }
+    /// Test files by absolute path: `sec` moves the process's working directory while its prover
+    /// runs, and tests run in parallel.
     fn file(p: &str) -> Netlist {
-        crate::netlist::load(p).unwrap()
+        crate::netlist::load(&format!("{}/{p}", env!("CARGO_MANIFEST_DIR"))).unwrap()
     }
 
     /// The value a BLIF cover gives an input combination (rows of one phase, as `cover` writes).
@@ -428,7 +430,7 @@ mod tests {
     /// the counterexample shows it.
     #[test]
     fn cells_are_their_liberty_functions() {
-        let l = Lib::load("tests/data/func.lib").unwrap();
+        let l = Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/func.lib")).unwrap();
         let g = nl("module t(a,b,c,y,co,s);\ninput a,b,c; output y,co,s;\nwire k;\n\
              AOI21X g(.A1(a),.A2(b),.B1(c),.Y(y));\nTIEHI t(.HI(k));\nHAX h(.A(a),.B(k),.CO(co),.S(s));\nendmodule\n");
         let r = nl("module t(a,b,c,y,co,s);\ninput a,b,c; output y,co,s;\nwire ab,o;\n\

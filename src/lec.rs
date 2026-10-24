@@ -839,7 +839,7 @@ mod tests {
     use super::*;
 
     fn lib() -> Lib {
-        Lib::load("examples/cells.lib").expect("cells.lib")
+        Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/examples/cells.lib")).expect("cells.lib")
     }
     fn nl(src: &str) -> Netlist {
         crate::netlist::parse(src).unwrap()
@@ -926,7 +926,7 @@ mod tests {
     }
 
     fn func_lib() -> Lib {
-        Lib::load("tests/data/func.lib").expect("func.lib")
+        Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/func.lib")).expect("func.lib")
     }
 
     /// Rule (Liberty `function`): a cell's logic is its output pin's function, so an AOI is the

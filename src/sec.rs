@@ -186,7 +186,7 @@ mod tests {
     use super::*;
 
     fn lib() -> Lib {
-        Lib::load("tests/data/seq.lib").expect("seq.lib")
+        Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/seq.lib")).expect("seq.lib")
     }
     fn nl(src: &str) -> Netlist {
         crate::netlist::parse(src).unwrap()
