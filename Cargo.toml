@@ -19,6 +19,9 @@ vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main",
 vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main", optional = true }
 
 [features]
+# The command-line entry built into the library too (`cli_main`), for the suite binaries
+# that link every engine and run the one they are invoked as.
+suite = []
 default = []
 abc = ["dep:vyges-abc-lib"]
 
