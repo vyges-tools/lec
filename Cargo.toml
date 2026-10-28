@@ -1,6 +1,6 @@
 [package]
 name = "vyges-lec"
-version = "0.1.47"
+version = "0.1.48"
 edition = "2021"
 description = "Formal checks on gate-level netlists: combinational and sequential equivalence, and property checking, with counter-examples."
 license = "Apache-2.0"
