@@ -296,6 +296,24 @@ mod tests {
         assert_eq!(equivalence(&both, &sync2, &lib()).unwrap().verdict, SecVerdict::Equivalent);
     }
 
+    /// An enable register's `next_state` reads its own state, `(D&DE) | (IQ&!DE)`: it is a plain
+    /// register behind a hold mux. Equal to DFF + MUX2, and different when the mux selects wrongly.
+    #[test]
+    fn an_enable_register_holds_its_state() {
+        let edf = nl("module t(clk,de,d,q);\ninput clk,de,d; output q;\n\
+             EDF r(.CK(clk),.D(d),.DE(de),.Q(q));\nendmodule\n");
+        let mux = |a0: &str, a1: &str| {
+            nl(&format!(
+                "module t(clk,de,d,q);\ninput clk,de,d; output q;\nwire n;\n\
+                 MUX2 m(.A0({a0}),.A1({a1}),.S(de),.Y(n));\nDFF r(.CK(clk),.D(n),.Q(q));\nendmodule\n"
+            ))
+        };
+        assert_eq!(equivalence(&edf, &mux("q", "d"), &lib()).unwrap().verdict, SecVerdict::Equivalent);
+        let rep = equivalence(&edf, &mux("d", "q"), &lib()).unwrap();
+        let (output, cycle, trace) = differs(&rep);
+        assert_ne!(simulate(&edf, output, trace)[cycle], simulate(&mux("d", "q"), output, trace)[cycle]);
+    }
+
     /// A scan register is its `next_state` mux; QN reads the inverted state.
     #[test]
     fn a_scan_register_and_an_inverted_output() {

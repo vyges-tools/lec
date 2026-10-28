@@ -81,4 +81,16 @@ library (seq) {
     pin (D) { direction : input; }
     pin (Q) { direction : output; function : "IQ"; }
   }
+  /* an enable register: its next_state reads its own state (sky130 edfxtp) */
+  cell (EDF) {
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "(D&DE) | (IQ&!DE)"; }
+    pin (CK) { direction : input; clock : true; }
+    pin (D) { direction : input; }
+    pin (DE) { direction : input; }
+    pin (Q) { direction : output; function : "IQ"; }
+  }
+  /* a constant-0 tie (sky130 conb LO) */
+  cell (TIE0) {
+    pin (LO) { direction : output; function : "0"; }
+  }
 }

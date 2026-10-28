@@ -40,7 +40,8 @@ vyges physical lec — logic equivalence (combinational, sequential) and propert
 usage:
   vyges physical lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
-  vyges physical lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [...]
+  vyges physical lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N]
+                          [-o OUT] [--json] [--fail-on-diff]
 
 commands:
   check            combinational: registers cut and matched by instance name
@@ -57,7 +58,8 @@ flags:
                    both: run both and fail if they disagree; reports the bdd result
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
-  --fail-on-diff   exit 3 if the designs are not equivalent, 4 if undecided (CI gate)
+  --fail-on-diff   exit 3 if the designs are not equivalent (prove: a net can be 1),
+                   4 if undecided (CI gate); without it a verdict exits 0
   --describe       print a machine-readable JSON description of every command
   -h, --help · -V, --version
 ";

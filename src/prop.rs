@@ -43,6 +43,9 @@ pub struct PropReport {
     pub clock: Option<String>,
 }
 
+/// Nodes the one-cycle BDD of the property nets may grow to before the question is left to ABC.
+const BDD_LIMIT: usize = 1 << 20;
+
 /// Check that each of `nets` stays 0: unbounded (`pdr`), or over cycles 0 to `bound`.
 pub fn never(design: &Netlist, lib: &Lib, nets: &[String], bound: Option<usize>) -> Result<PropReport, String> {
     if lib.cells.is_empty() {
@@ -67,6 +70,41 @@ pub fn never(design: &Netlist, lib: &Lib, nets: &[String], bound: Option<usize>)
     let report = |verdict| PropReport { verdict, nets: nets.to_vec(), registers: c.regs.len(), clock: clock.clone() };
     let pis: BTreeMap<String, usize> =
         c.free.values().collect::<BTreeSet<_>>().into_iter().enumerate().map(|(k, v)| (v.clone(), k)).collect();
+
+    // One cycle's logic, exactly, while it stays small. ⛔ ABC cannot decide a property net that is
+    // constant 0: `pdr` drops the output and reports UNDECIDED, and `bmc3` refuses a design with no
+    // register. Both cases are decided here instead.
+    // - A net that is 0 for every state and every input is 0 in every cycle: it holds.
+    // - With no register every cycle is cycle 0, so a net that can be 1 is 1 in cycle 0, under the
+    //   inputs of a satisfying assignment (replayed on the model, as ABC's are).
+    let mut live: Vec<String> = nets.to_vec();
+    if let Some((bdd, outs, names)) = lec::cone_bdds(&c, nets, BDD_LIMIT)? {
+        if c.regs.is_empty() {
+            let Some((k, &f)) = outs.iter().enumerate().find(|(_, &f)| f != bdd.zero()) else {
+                return Ok(report(PropVerdict::Holds));
+            };
+            let set: BTreeMap<u32, bool> = bdd.sat_one(f).expect("a non-zero BDD is satisfiable").into_iter().collect();
+            let inputs: Vec<(String, bool)> = pis
+                .keys()
+                .map(|v| {
+                    let val = names.iter().position(|n| n == v).and_then(|i| set.get(&(i as u32)).copied()).unwrap_or(false);
+                    (v.clone(), val)
+                })
+                .collect();
+            let net = nets[k].clone();
+            let trace = vec![inputs];
+            let seen = crate::sec::replay(&c, std::slice::from_ref(&net), &trace)?;
+            if seen.last().map(|o| o[0]) != Some(true) {
+                return Err(format!("the cycle-0 assignment for `{net}` does not replay: the net is 0 there"));
+            }
+            return Ok(report(PropVerdict::Fails { net, cycle: 0, trace }));
+        }
+        live = nets.iter().zip(&outs).filter(|(_, &f)| f != bdd.zero()).map(|(n, _)| n.clone()).collect();
+        if live.is_empty() {
+            return Ok(report(PropVerdict::Holds));
+        }
+    }
+    let nets = live.as_slice();
     let dir = Scratch::new()?;
     let path = dir.write("design.blif", &write_blif("design", &c, &pis, nets)?)?;
 
@@ -166,6 +204,60 @@ mod tests {
         let rep = never(&counter(false), &lib(), &s(&["c3"]), Some(3)).unwrap();
         let PropVerdict::Fails { cycle, .. } = rep.verdict else { panic!("{:?}", rep.verdict) };
         assert_eq!(cycle, 3);
+    }
+
+    /// A net tied to constant 0 holds, with or without registers in the design: ABC's `pdr` drops a
+    /// constant output and says UNDECIDED, so the one-cycle BDD decides it. A net that is 0 in every
+    /// state (q AND NOT q) holds the same way.
+    #[test]
+    fn a_constant_zero_net_holds() {
+        let tie = crate::netlist::parse(
+            "module t(clk,a,p);\ninput clk,a; output p;\nwire z;\nTIE0 t0(.LO(z));\nBUF b(.A(z),.Y(p));\nendmodule\n",
+        )
+        .unwrap();
+        let rep = never(&tie, &lib(), &s(&["p"]), None).unwrap();
+        assert_eq!((rep.verdict, rep.registers), (PropVerdict::Holds, 0));
+        let qq = crate::netlist::parse(
+            "module t(clk,en,p);\ninput clk,en; output p;\nwire q,d,nq;\n\
+             XOR2 x(.A(en),.B(q),.Y(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nINV i(.A(q),.Y(nq));\nAND2 a(.A(q),.B(nq),.Y(p));\nendmodule\n",
+        )
+        .unwrap();
+        let rep = never(&qq, &lib(), &s(&["p"]), None).unwrap();
+        assert_eq!((rep.verdict, rep.registers), (PropVerdict::Holds, 1));
+        // and beside a net that does fail, the failing one is still named
+        let rep = never(&qq, &lib(), &s(&["p", "q"]), None).unwrap();
+        let PropVerdict::Fails { net, cycle, .. } = &rep.verdict else { panic!("{:?}", rep.verdict) };
+        assert_eq!((net.as_str(), *cycle), ("q", 1));
+    }
+
+    /// With no register every cycle is cycle 0: a net that can be 1 is 1 there, under the inputs
+    /// that make it 1.
+    #[test]
+    fn a_register_free_net_fails_in_cycle_0() {
+        let and = crate::netlist::parse(
+            "module t(clk,a,b,p);\ninput clk,a,b; output p;\nAND2 g(.A(a),.B(b),.Y(p));\nendmodule\n",
+        )
+        .unwrap();
+        let rep = never(&and, &lib(), &s(&["p"]), None).unwrap();
+        let PropVerdict::Fails { net, cycle, trace } = &rep.verdict else { panic!("{:?}", rep.verdict) };
+        assert_eq!((net.as_str(), *cycle), ("p", 0));
+        assert_eq!(trace, &vec![vec![("a".to_string(), true), ("b".to_string(), true)]]);
+    }
+
+    /// `assign p2 = p1;` is a wire: p2 is p1's value, never a free input of its own.
+    #[test]
+    fn an_aliased_output_is_its_net() {
+        let src = |tie: &str| {
+            crate::netlist::parse(&format!(
+                "module t(clk,a,p1,p2);\ninput clk,a; output p1,p2;\nwire z;\n{tie}\nBUF b(.A(z),.Y(p1));\nassign p2 = p1;\nendmodule\n"
+            ))
+            .unwrap()
+        };
+        let rep = never(&src("TIE0 t0(.LO(z));"), &lib(), &s(&["p2"]), None).unwrap();
+        assert_eq!(rep.verdict, PropVerdict::Holds);
+        let rep = never(&src("BUF t0(.A(a),.Y(z));"), &lib(), &s(&["p2"]), None).unwrap();
+        let PropVerdict::Fails { net, trace, .. } = &rep.verdict else { panic!("{:?}", rep.verdict) };
+        assert_eq!((net.as_str(), trace[0].as_slice()), ("p2", [("a".to_string(), true)].as_slice()));
     }
 
     #[test]

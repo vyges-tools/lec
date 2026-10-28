@@ -207,6 +207,9 @@ pub(crate) struct Design<'a> {
     unknown: BTreeMap<&'a str, &'a str>,
     /// Nets a `supply0` / `supply1` declaration holds constant (loom `Netlist.constants`).
     constants: BTreeMap<&'a str, bool>,
+    /// `assign a = b;` names one net twice. Each name that is not the class's source maps to it:
+    /// the one name that is driven, constant or a primary input ([`resolve_aliases`]).
+    alias: BTreeMap<&'a str, &'a str>,
     /// Registers are state, not cut points: a register output is a gate over the register's
     /// stored value ([`seq_cone`]) instead of a free input.
     sequential: bool,
@@ -229,8 +232,9 @@ impl<'a> Design<'a> {
                 }
             }
         }
-        let constants = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
-        Design { nl, lib, driver, unknown, constants, sequential: false }
+        let constants: BTreeMap<&str, bool> = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
+        let alias = resolve_aliases(nl, &driver, &constants);
+        Design { nl, lib, driver, unknown, constants, alias, sequential: false }
     }
 
     /// The design with its registers kept as state (the sequential model, [`seq_cone`]).
@@ -337,6 +341,122 @@ impl<'a> Design<'a> {
     }
 }
 
+/// The alias classes of `nl.aliases` (`assign a = b;`, transitively), each name mapped to its
+/// class's SOURCE: the one member that a gate drives, a `supply` holds constant, or that is a
+/// primary input. With no source the class is one undriven net, named by its least member so every
+/// name reads the same free variable.
+///
+/// ⛔ An alias is a wire, never a free input. Left unresolved, the undriven side of
+/// `assign out2 = out1;` read as a primary input of its own: `prove` reported `out2` as 1 in cycle 0
+/// with no register in the design, and `check` would compare two such ports equal whatever drove
+/// `out1`. A class with two sources (two drivers shorted by an `assign`) is left unresolved.
+fn resolve_aliases<'a>(
+    nl: &'a Netlist,
+    driver: &BTreeMap<&'a str, (usize, &'a str)>,
+    constants: &BTreeMap<&'a str, bool>,
+) -> BTreeMap<&'a str, &'a str> {
+    let mut parent: BTreeMap<&'a str, &'a str> = BTreeMap::new();
+    fn find<'a>(p: &mut BTreeMap<&'a str, &'a str>, x: &'a str) -> &'a str {
+        let mut r = x;
+        while let Some(&q) = p.get(r) {
+            if q == r {
+                break;
+            }
+            r = q;
+        }
+        p.insert(x, r);
+        r
+    }
+    for (a, b) in &nl.aliases {
+        let (ra, rb) = (find(&mut parent, a.as_str()), find(&mut parent, b.as_str()));
+        parent.entry(ra).or_insert(ra);
+        if ra != rb {
+            parent.insert(rb, ra);
+        }
+    }
+    let names: Vec<&'a str> = parent.keys().copied().collect();
+    let mut classes: BTreeMap<&'a str, Vec<&'a str>> = BTreeMap::new();
+    for n in names {
+        let r = find(&mut parent, n);
+        classes.entry(r).or_default().push(n);
+    }
+    let mut out = BTreeMap::new();
+    for members in classes.values() {
+        let sources: Vec<&'a str> = members
+            .iter()
+            .copied()
+            .filter(|m| driver.contains_key(m) || constants.contains_key(m) || nl.inputs.iter().any(|p| p == m))
+            .collect();
+        let src = match sources.as_slice() {
+            [one] => *one,
+            [] => *members.iter().min().expect("a class has a member"),
+            _ => continue,
+        };
+        for &m in members {
+            if m != src {
+                out.insert(m, src);
+            }
+        }
+    }
+    out
+}
+
+/// [`cone_bdds`]: the manager, each net's BDD, and each variable's name by index.
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) type ConeBdds = (Bdd, Vec<u32>, Vec<String>);
+
+/// The BDD of each of `nets` over a cone's free inputs and register states, as one cycle sees them:
+/// every free input and every register's stored value is a variable. `None` once the BDD passes
+/// `limit` nodes. The variables are named in the returned list by index: a free input by its
+/// variable name ([`Cone::free`]), a register by its [`state_net`].
+#[cfg_attr(not(feature = "abc"), allow(dead_code))]
+pub(crate) fn cone_bdds(c: &Cone, nets: &[String], limit: usize) -> Result<Option<ConeBdds>, String> {
+    let mut bdd = Bdd::new();
+    let mut names: Vec<String> = Vec::new();
+    let mut f: HashMap<String, u32> = HashMap::new();
+    let var = |bdd: &mut Bdd, names: &mut Vec<String>, name: &str| -> u32 {
+        let k = match names.iter().position(|n| n == name) {
+            Some(k) => k,
+            None => {
+                names.push(name.to_string());
+                names.len() - 1
+            }
+        };
+        bdd.var(k as u32)
+    };
+    for (net, v) in &c.free {
+        let x = var(&mut bdd, &mut names, v);
+        f.insert(net.clone(), x);
+    }
+    for r in &c.regs {
+        let x = var(&mut bdd, &mut names, &state_net(r));
+        f.insert(state_net(r), x);
+    }
+    for g in &c.gates {
+        let ins: Vec<u32> = g
+            .ins
+            .iter()
+            .map(|s| match s {
+                Src::Net(n) => f.get(n.as_str()).copied().ok_or_else(|| format!("cone gate `{}` reads `{n}` before it is computed", g.out)),
+                Src::Const(v) => Ok(if *v { bdd.one() } else { bdd.zero() }),
+            })
+            .collect::<Result<_, _>>()?;
+        let out = match &g.logic {
+            Logic::Prim(op) => apply_op(&mut bdd, *op, &ins, &g.pins)?,
+            Logic::Func(func) => func_bdd(&mut bdd, func, &g.pins, &ins),
+        };
+        f.insert(g.out.clone(), out);
+        if bdd.node_count() > limit {
+            return Ok(None);
+        }
+    }
+    let outs = nets
+        .iter()
+        .map(|n| f.get(n.as_str()).copied().ok_or_else(|| format!("net `{n}` is not in the cone")))
+        .collect::<Result<_, _>>()?;
+    Ok(Some((bdd, outs, names)))
+}
+
 /// Shared variable registry: a free net name -> a BDD variable index, consistent
 /// across both designs (same name -> same variable).
 struct Vars {
@@ -380,6 +500,12 @@ fn build(
     // a supply net: its constant, whatever touches it
     if let Some(&v) = d.constants.get(net) {
         return Ok(if v { bdd.one() } else { bdd.zero() });
+    }
+    // another name for a net (`assign`): that net's function
+    if let Some(&src) = d.alias.get(net) {
+        let f = build(src, d, bdd, vars, memo, visiting)?;
+        memo.insert(net.to_string(), f);
+        return Ok(f);
     }
     // a free input: primary input, an undriven net, or a register (flop Q) output
     if d.is_free(net)? {
@@ -642,8 +768,24 @@ impl Reg {
             Some(_) => return Err(format!("{}: clock `{}` is not one pin's rising edge", what(), g.attrs["clocked_on"])),
             None => return Err(format!("{}: its `ff` has no `clocked_on`", what())),
         };
-        let next_state = parse("next_state")?.ok_or_else(|| format!("{}: its `ff` has no `next_state`", what()))?;
         let state = Func::Port(STATE.into());
+        // `next_state` may read the stored value through the group's own variables: an enable
+        // register holds with `(D&DE) | (IQ&!DE)` (sky130 `edfxtp`). IQ is the stored value, IQN
+        // its complement.
+        let next_state = {
+            let e = g.attrs.get("next_state").ok_or_else(|| format!("{}: its `ff` has no `next_state`", what()))?;
+            let f = Func::parse_in(e, |p| inputs.contains(&p) || p == g.iq || p == g.iqn)
+                .ok_or_else(|| format!("{}: `next_state` `{e}` does not parse over its input pins and state variables", what()))?;
+            subst(&f, &|p| {
+                if p == g.iq {
+                    Some(state.clone())
+                } else if p == g.iqn {
+                    Some(Func::Not(Box::new(state.clone())))
+                } else {
+                    None
+                }
+            })
+        };
         let (clear, preset) = (parse("clear")?, parse("preset")?);
         // the value under clear / preset (one of them, or neither), else `normal`
         let forced = |normal: Func| match (&clear, &preset) {
@@ -728,6 +870,13 @@ fn collect(
     if let Some(&v) = d.constants.get(net) {
         done.insert(net.to_string());
         c.gates.push(Gate { out: net.to_string(), logic: Logic::Prim(Op::Buf), pins: vec!["A".into()], ins: vec![Src::Const(v)] });
+        return Ok(());
+    }
+    // another name for a net (`assign`): a buffer of that net, so the name stays readable
+    if let Some(&src) = d.alias.get(net) {
+        collect(src, d, c, done, visiting)?;
+        done.insert(net.to_string());
+        c.gates.push(Gate { out: net.to_string(), logic: Logic::Prim(Op::Buf), pins: vec!["A".into()], ins: vec![Src::Net(src.to_string())] });
         return Ok(());
     }
     if d.is_free(net)? {
@@ -843,6 +992,21 @@ mod tests {
     }
     fn nl(src: &str) -> Netlist {
         crate::netlist::parse(src).unwrap()
+    }
+
+    /// An output that is only an `assign` alias of another port is that port's net. Unresolved, it
+    /// was a free input in both designs, and two different functions behind it compared EQUAL:
+    /// here `f2` is `f1` (AND) in one design and `h` (OR) in the other.
+    #[test]
+    fn an_aliased_output_is_compared_by_its_driver() {
+        let with = |of: &str| {
+            nl(&format!(
+                "module t(a,b,f1,f2,h);\ninput a,b; output f1,f2,h;\n\
+                 AND2 g(.A(a),.B(b),.Z(f1));\nOR2 o(.A(a),.B(b),.Z(h));\nassign f2 = {of};\nendmodule\n"
+            ))
+        };
+        assert!(equivalence(&with("f1"), &with("f1"), &lib()).unwrap().equivalent);
+        assert!(!equivalence(&with("f1"), &with("h"), &lib()).unwrap().equivalent);
     }
 
     #[test]

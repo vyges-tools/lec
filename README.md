@@ -100,7 +100,8 @@ vyges-lec sec — NOT EQUIVALENT ✗  (1 output(s) compared; 1 vs 2 register(s))
 
 - Each register is its cell's Liberty `ff` group: `next_state` is loaded on the rising edge
   of `clocked_on`, and the output pins read the state through their `function`
-  (so scan registers and inverted outputs are covered).
+  (so scan registers and inverted outputs are covered). `next_state` may read the stored
+  value through the group's own variables, as an enable register's `(D&DE) | (IQ&!DE)` does.
 - An asynchronous `clear` / `preset` acts at the clock edge: while active, the output shows
   the forced value and the edge loads it (`clear_preset_var1`/`_var2` when both are active).
 - Every register starts at 0 and is clocked by one primary input, reached through buffers.
@@ -131,7 +132,12 @@ vyges-lec prove — FAILS ✗  `c3` is 1 in cycle 3 (2 register(s)), under:
 Without `--bound` the answer is a proof (every net stays 0 on every input sequence from the
 all-zero register state) or the first net driven to 1, with its cycle and the inputs of every
 cycle up to it, replayed before it is reported. With `--bound N` it is a bounded search:
-finding nothing in cycles 0 to N is reported as exactly that, not as a proof.
+finding nothing in cycles 0 to N is reported as exactly that, not as a proof. A net that is 0
+in every state (a constant tie, say), and any net whose logic reads no register, is decided
+exactly from one cycle's logic before ABC is asked. `--fail-on-diff` exits 3 when a net can be
+1 and 4 when the answer is undecided; without it every verdict exits 0.
+
+In every command an `assign a = b;` is a wire: the name that is not driven reads the net that is.
 
 ## How it works
 
