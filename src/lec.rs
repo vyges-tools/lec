@@ -406,12 +406,12 @@ fn resolve_aliases<'a>(
 pub(crate) type ConeBdds = (Bdd, Vec<u32>, Vec<String>);
 
 /// The BDD of each of `nets` over a cone's free inputs and register states, as one cycle sees them:
-/// every free input and every register's stored value is a variable. `None` once the BDD passes
-/// `limit` nodes. The variables are named in the returned list by index: a free input by its
+/// every free input and every register's stored value is a variable. `None` once the BDD holds
+/// more than `limit` nodes plus memo entries (checked inside each operation). The variables are named in the returned list by index: a free input by its
 /// variable name ([`Cone::free`]), a register by its [`state_net`].
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
 pub(crate) fn cone_bdds(c: &Cone, nets: &[String], limit: usize) -> Result<Option<ConeBdds>, String> {
-    let mut bdd = Bdd::new();
+    let mut bdd = Bdd::with_limit(limit);
     let mut names: Vec<String> = Vec::new();
     let mut f: HashMap<String, u32> = HashMap::new();
     let var = |bdd: &mut Bdd, names: &mut Vec<String>, name: &str| -> u32 {
@@ -446,7 +446,7 @@ pub(crate) fn cone_bdds(c: &Cone, nets: &[String], limit: usize) -> Result<Optio
             Logic::Func(func) => func_bdd(&mut bdd, func, &g.pins, &ins),
         };
         f.insert(g.out.clone(), out);
-        if bdd.node_count() > limit {
+        if bdd.exhausted() {
             return Ok(None);
         }
     }

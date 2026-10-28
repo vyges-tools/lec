@@ -28,6 +28,10 @@ pub struct Bdd {
     nodes: Vec<Node>,
     unique: HashMap<Node, u32>,
     ite_memo: HashMap<(u32, u32, u32), u32>,
+    /// A budget on nodes plus memo entries; once spent, every operation returns at
+    /// once with a meaningless result and `exhausted()` is true.
+    limit: Option<usize>,
+    exhausted: bool,
 }
 
 impl Default for Bdd {
@@ -55,7 +59,24 @@ impl Bdd {
             nodes,
             unique: HashMap::new(),
             ite_memo: HashMap::new(),
+            limit: None,
+            exhausted: false,
         }
+    }
+
+    /// A package that gives up once it holds more than `limit` nodes plus memo
+    /// entries. The budget is checked inside every operation, so one `and` over a
+    /// wide cone cannot grow without bound before the caller looks.
+    pub fn with_limit(limit: usize) -> Bdd {
+        Bdd {
+            limit: Some(limit),
+            ..Bdd::new()
+        }
+    }
+
+    /// The budget was spent: every result since is meaningless.
+    pub fn exhausted(&self) -> bool {
+        self.exhausted
     }
 
     pub fn one(&self) -> u32 {
@@ -78,6 +99,13 @@ impl Bdd {
         let n = Node { var, lo, hi };
         if let Some(&i) = self.unique.get(&n) {
             return i;
+        }
+        if self
+            .limit
+            .is_some_and(|l| self.nodes.len() + self.ite_memo.len() > l)
+        {
+            self.exhausted = true;
+            return FALSE;
         }
         let i = self.nodes.len() as u32;
         self.nodes.push(n);
@@ -110,6 +138,9 @@ impl Bdd {
         if g == TRUE && h == FALSE {
             return f;
         }
+        if self.exhausted {
+            return FALSE;
+        }
         if let Some(&r) = self.ite_memo.get(&(f, g, h)) {
             return r;
         }
@@ -132,7 +163,9 @@ impl Bdd {
         let lo = self.ite(flo, glo, hlo);
         let hi = self.ite(fhi, ghi, hhi);
         let r = self.mk(v, lo, hi);
-        self.ite_memo.insert((f, g, h), r);
+        if !self.exhausted {
+            self.ite_memo.insert((f, g, h), r);
+        }
         r
     }
 
@@ -195,6 +228,37 @@ impl Bdd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// x0..x(n-1) == y0..y(n-1) with every x ordered above every y needs about 2^n
+    /// nodes. Under a budget the build stops inside the operation that crosses it.
+    fn equal_halves(b: &mut Bdd, n: u32) -> u32 {
+        let mut f = b.one();
+        for i in 0..n {
+            let x = b.var(i);
+            let y = b.var(n + i);
+            let e = b.xnor(x, y);
+            f = b.and(f, e);
+        }
+        f
+    }
+
+    #[test]
+    fn a_budget_stops_the_build_inside_an_operation() {
+        let mut b = Bdd::with_limit(1000);
+        equal_halves(&mut b, 24);
+        assert!(b.exhausted());
+        assert!(b.node_count() <= 1001, "{} nodes", b.node_count());
+    }
+
+    #[test]
+    fn a_build_within_its_budget_is_unchanged() {
+        let mut free = Bdd::new();
+        let f = equal_halves(&mut free, 6);
+        let mut b = Bdd::with_limit(1 << 16);
+        let g = equal_halves(&mut b, 6);
+        assert!(!b.exhausted());
+        assert_eq!((f, free.node_count()), (g, b.node_count()));
+    }
 
     #[test]
     fn de_morgan_holds_by_canonicity() {
