@@ -10,9 +10,10 @@ and **property checking** of one (`prove`). Every failure comes with a concrete
 > not only teams who can license a six-figure tool. `vyges-lec` opens up formal
 > equivalence.
 
-> **Stability: experimental (v0.1.0).** A real, canonical-BDD combinational
-> equivalence check with counter-examples; the standard-cell primitive map and the
-> sequential model have honest bounds — see **Current state**.
+> **Stability: stable, actively developed.** Combinational and sequential equivalence and
+> safety-property proofs, each with a replayed counter-example, from two independent engines
+> (an exact in-tree BDD and ABC's SAT-based prover). The modelled scope is stated exactly — see
+> **Current state**.
 
 ## Why this exists
 
@@ -158,15 +159,28 @@ In every command an `assign a = b;` is a wire: the name that is not driven reads
   not by the nets on their pins, so a netlist whose nets were renamed by buffering or
   resizing still lines up with its source.
 
-## Current state (v0.1.0)
+## Current state
 
-**Working & tested:** canonical-ROBDD equivalence of two netlists, De-Morgan / logic
-re-write equivalence, real-bug detection with a concrete counter-example,
-register-boundary (sequential) cutting, and reporting of endpoints present in only
-one design. Text + `--json`, a `--fail-on-diff` CI exit code. The ROBDD package
-(ite-based, memoized, with `sat_one`) is unit-tested in its own right.
+**Working & tested:**
+- `check`: canonical-ROBDD equivalence of two netlists (De-Morgan / logic re-write
+  equivalence, real-bug detection with a concrete counter-example), register-boundary
+  cutting, and reporting of endpoints present in only one design;
+- `--engine abc|bdd|both`: ABC's SAT-based prover for netlists and datapaths too large for a
+  BDD, and `both` to have the two engines check each other;
+- `sec`: sequential equivalence through register correspondence, interpolation and PDR,
+  with a counter-example covering every cycle up to the difference, replayed before it is
+  reported;
+- `prove`: safety properties (`--never NET`) as a PDR proof or a bounded search, with a
+  BDD pre-pass that decides constant and register-free nets exactly;
+- a node budget that the BDD enforces inside every operation, so a cone that would blow up
+  hands over to ABC instead of exhausting memory;
+- text + `--json` output, and `--fail-on-diff` CI exit codes (3 = differs, 4 = undecided).
 
-**Depth reserved (honest):**
+The ROBDD package (ite-based, memoized, with `sat_one`) is unit-tested in its own right.
+`vyges-lec prove` is also the proof engine behind
+[`vyges-formal`](https://github.com/vyges-tools/formal)'s property campaigns.
+
+**Scope (what is modelled, and what is refused):**
 
 - a gate's logic is its output pin's Liberty `function` (so AOI/OAI, multi-output cells
   such as half and full adders, and tie cells are covered); a library with no
