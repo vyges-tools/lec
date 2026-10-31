@@ -18,6 +18,10 @@ vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main",
 # std-only, offline build does not need.
 vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main", optional = true }
 
+[dev-dependencies]
+# the descriptor test reads `--describe` as JSON (already in the lock through vyges-loom)
+serde_json = "1"
+
 [features]
 # The command-line entry built into the library too (`cli_main`), for the suite binaries
 # that link every engine and run the one they are invoked as.

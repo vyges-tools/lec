@@ -110,6 +110,7 @@ dependencies = [
 name = "vyges-lec"
 version = "0.1.51"
 dependencies = [
+ "serde_json",
  "vyges-abc-lib",
  "vyges-events",
  "vyges-loom",

@@ -101,47 +101,60 @@ const DESCRIBE: &str = r#"{
     "optional": [ { "arg": "out", "flag": "-o" }, { "arg": "engine", "flag": "--engine" } ],
     "emits_json": true
   },
-  "commands": [
-    {
-      "name": "check",
-      "summary": "combinational equivalence: registers cut and matched by instance name",
-      "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
-      "optional": [ { "arg": "out", "flag": "-o" }, { "arg": "engine", "flag": "--engine" } ],
-      "assertion": { "id": "logic-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
-    },
-    {
-      "name": "sec",
-      "summary": "sequential equivalence: registers kept as state, primary outputs compared on every input sequence from the all-zero register state",
-      "args_template": ["sec", "{golden}", "{revised}", "--lib", "{lib}"],
-      "optional": [ { "arg": "out", "flag": "-o" } ],
-      "assertion": { "id": "sequentially-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
-    },
-    {
-      "name": "prove",
-      "summary": "property check: each named net stays 0 on every input sequence from the all-zero register state",
-      "args_template": ["prove", "{design}", "--lib", "{lib}"],
-      "optional": [ { "arg": "never", "flag": "--never" }, { "arg": "bound", "flag": "--bound" }, { "arg": "out", "flag": "-o" } ],
-      "assertion": { "id": "property-holds", "field": "verdict", "pass_when": { "in": ["holds", "holds_within"] } }
-    }
-  ],
   "inputs": {
     "type": "object",
     "required": ["golden", "revised", "lib"],
     "properties": {
-      "golden": { "type": "string", "description": "check, sec: path to the golden (reference) gate-level netlist" },
-      "revised": { "type": "string", "description": "check, sec: path to the revised gate-level netlist to compare" },
-      "design": { "type": "string", "description": "prove: path to the gate-level netlist" },
+      "golden": { "type": "string", "description": "path to the golden (reference) gate-level netlist" },
+      "revised": { "type": "string", "description": "path to the revised gate-level netlist to compare" },
       "lib": { "type": "string", "description": "path to the Liberty file (pin directions, cell functions, ff groups)" },
-      "engine": { "type": "string", "enum": ["abc", "bdd", "both"], "description": "check: the engine (abc by default in a build with it, bdd otherwise)" },
-      "never": { "type": "string", "description": "prove: a net that must never be 1 (--never may be given more than once)" },
-      "bound": { "type": "integer", "description": "prove: check cycles 0 to N only (bounded, not a proof)" },
-      "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+      "out": { "type": "string", "description": "write the report to FILE instead of stdout" },
+      "engine": { "type": "string", "enum": ["abc", "bdd", "both"], "description": "the engine (abc by default in a build with it, bdd otherwise)" }
     }
   },
   "consumes": ["netlist", "liberty"],
   "artifacts": [ { "role": "equivalence_report", "field": "report_path" } ],
   "threads": "@THREADS@",
-  "assertion": { "id": "logic-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
+  "assertion": { "id": "logic-equivalent", "field": "equivalent", "pass_when": { "is_true": true } },
+  "tools": [
+    {
+      "name": "lec.sec",
+      "summary": "sequential equivalence: registers kept as state, primary outputs compared on every input sequence from the all-zero register state",
+      "invocation": { "args_template": ["sec", "{golden}", "{revised}", "--lib", "{lib}"], "optional": [{ "arg": "out", "flag": "-o" }], "emits_json": true },
+      "inputs": {
+        "type": "object",
+        "required": ["golden", "revised", "lib"],
+        "properties": {
+          "golden": { "type": "string", "description": "path to the golden (reference) gate-level netlist" },
+          "revised": { "type": "string", "description": "path to the revised gate-level netlist to compare" },
+          "lib": { "type": "string", "description": "path to the Liberty file (pin directions, cell functions, ff groups)" },
+          "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+        }
+      },
+      "assertion": { "id": "sequentially-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
+    },
+    {
+      "name": "lec.prove",
+      "summary": "property check: each named net stays 0 on every input sequence from the all-zero register state",
+      "invocation": {
+        "args_template": ["prove", "{design}", "--lib", "{lib}"],
+        "optional": [{ "arg": "never", "flag": "--never" }, { "arg": "bound", "flag": "--bound" }, { "arg": "out", "flag": "-o" }],
+        "emits_json": true
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["design", "lib"],
+        "properties": {
+          "design": { "type": "string", "description": "path to the gate-level netlist" },
+          "lib": { "type": "string", "description": "path to the Liberty file (pin directions, cell functions, ff groups)" },
+          "never": { "type": "string", "description": "a net that must never be 1 (--never may be given more than once)" },
+          "bound": { "type": "integer", "description": "check cycles 0 to N only (bounded, not a proof)" },
+          "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+        }
+      },
+      "assertion": { "id": "property-holds", "field": "verdict", "pass_when": { "in": ["holds", "holds_within"] } }
+    }
+  ]
 }
 "#;
 
@@ -624,10 +637,50 @@ mod tests {
     #[test]
     fn the_descriptor_describes_every_command() {
         let d = super::describe();
-        for c in super::COMMANDS {
-            assert!(d.contains(&format!("\"name\": \"{c}\"")), "no descriptor entry for `{c}`");
+        // `check` is the main invocation; every other command is a `tools[]` entry `lec.<command>`
+        assert!(d.contains(r#""args_template": ["check","#), "check is not the main invocation");
+        for c in super::COMMANDS.iter().filter(|c| **c != "check") {
+            assert!(d.contains(&format!("\"name\": \"lec.{c}\"")), "no descriptor entry for `{c}`");
         }
         assert!(!d.contains("@THREADS@"), "the threads placeholder was not filled");
         assert!(d.contains("\"parallel\": false"), "{d}");
+    }
+}
+
+#[cfg(test)]
+mod descriptor_args_tests {
+    use super::DESCRIBE;
+    /// Every advertised input reaches the command line, and every command-line token is
+    /// advertised -- for the main operation and each `tools[]` entry. `vyges mcp` builds the
+    /// argv from these and refuses an argument the template would drop; 0.1.51 shipped inputs
+    /// that never arrived (ifp's die area, ppl's layers, fin's rules).
+    #[test]
+    fn every_advertised_input_reaches_the_command_line() {
+        use std::collections::BTreeSet;
+        let d: serde_json::Value = serde_json::from_str(DESCRIBE).expect("descriptor is valid JSON");
+        let mut ops = vec![d.clone()];
+        ops.extend(d["tools"].as_array().cloned().unwrap_or_default());
+        for op in &ops {
+            let inv = &op["invocation"];
+            let mut used: BTreeSet<String> = inv["args_template"]
+                .as_array()
+                .expect("an args_template")
+                .iter()
+                .filter_map(|t| t.as_str())
+                .filter(|t| t.starts_with('{') && t.ends_with('}'))
+                .map(|t| t[1..t.len() - 1].to_string())
+                .collect();
+            if let Some(o) = inv.get("optional") {
+                let o = o.as_array().expect("invocation.optional is an array of {arg, flag}");
+                used.extend(o.iter().map(|x| x["arg"].as_str().expect("an arg").to_string()));
+            }
+            let props: BTreeSet<String> = op["inputs"]["properties"]
+                .as_object()
+                .expect("inputs.properties")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(used, props, "{}: command line vs advertised inputs", op["name"]);
+        }
     }
 }
