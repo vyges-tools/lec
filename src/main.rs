@@ -2,7 +2,7 @@
 //!
 //!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [--engine bdd|abc|both] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
-//!   vyges-lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names instance|net] [--revised-names instance|net] [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
+//!   vyges-lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names instance|net] [--revised-names instance|net] [--ranges RANGES.json] [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [-o OUT] [--json] [--fail-on-diff]
 //!
 //! Proves combinational equivalence of two gate-level netlists. Exit codes:
@@ -42,7 +42,7 @@ usage:
   vyges physical lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names N] [--revised-names N]
-                          [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
+                          [--ranges RANGES.json] [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N]
                           [-o OUT] [--json] [--fail-on-diff]
 
@@ -65,6 +65,12 @@ flags:
   --golden-names N, --revised-names N
                    map: a register by its `instance` (default) or by the `net` on its
                    stored-value output (an RTL elaboration that keeps names on nets only)
+  --ranges FILE    map: each vector's declared range (`vyges physical syn sv-ranges`). The
+                   REVISED netlist's port bits are renumbered from their declared numbering
+                   (`a[8]` of [11:8], as plain Yosys keeps it) to the elaborated one (`a[0]`, as
+                   syn and the reference's synthesize number it), so inputs pair by name. Each
+                   renumbered bit is listed; a bit outside its range, or whose new name another
+                   net has, is listed and left as written
   --write-map FILE map: write the proved pairs as {\"golden name\": \"revised name\"}
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
@@ -149,7 +155,7 @@ const DESCRIBE: &str = r#"{
       "summary": "register map: each golden register paired with the revised register proved to hold the same state, written as a JSON rename map",
       "invocation": {
         "args_template": ["map", "{golden}", "{revised}", "--lib", "{lib}"],
-        "optional": [{ "arg": "golden_names", "flag": "--golden-names" }, { "arg": "revised_names", "flag": "--revised-names" }, { "arg": "write_map", "flag": "--write-map" }, { "arg": "out", "flag": "-o" }],
+        "optional": [{ "arg": "golden_names", "flag": "--golden-names" }, { "arg": "revised_names", "flag": "--revised-names" }, { "arg": "ranges", "flag": "--ranges" }, { "arg": "write_map", "flag": "--write-map" }, { "arg": "out", "flag": "-o" }],
         "emits_json": true
       },
       "inputs": {
@@ -161,6 +167,7 @@ const DESCRIBE: &str = r#"{
           "lib": { "type": "string", "description": "path to the Liberty file (pin directions, cell functions, ff groups)" },
           "golden_names": { "type": "string", "enum": ["instance", "net"], "description": "name a golden register by its instance (default) or by the net on its stored-value output" },
           "revised_names": { "type": "string", "enum": ["instance", "net"], "description": "name a revised register by its instance (default) or by the net on its stored-value output" },
+          "ranges": { "type": "string", "description": "declared vector ranges (syn sv-ranges): the revised netlist's port bits are renumbered from their declared numbering to the elaborated one before inputs are paired by name" },
           "write_map": { "type": "string", "description": "write the proved pairs to FILE as a JSON object, golden name to revised name" },
           "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
         }
@@ -379,7 +386,7 @@ pub fn main() {
         exit(2);
     }
     // positionals: not a flag, not a flag's value
-    let valued = ["--lib", "--engine", "-o", "--never", "--bound", "--golden-names", "--revised-names", "--write-map"];
+    let valued = ["--lib", "--engine", "-o", "--never", "--bound", "--golden-names", "--revised-names", "--ranges", "--write-map"];
     let pos: Vec<&String> = args[1..]
         .iter()
         .enumerate()
@@ -689,12 +696,37 @@ fn naming(args: &[String], flag: &str) -> vyges_lec::map::Naming {
     }
 }
 
+/// `[{a: x, b: y}, ...]` of name pairs.
+fn pairs_as(v: &[(String, String)], a: &str, b: &str) -> String {
+    let rows: Vec<String> = v.iter().map(|(x, y)| format!("{{\"{a}\": {}, \"{b}\": {}}}", json_str(x), json_str(y))).collect();
+    format!("[{}]", rows.join(", "))
+}
+
 /// `map`: the proved register map, its report, `--write-map`, and its exit code (3 with
 /// `--fail-on-diff` when a register of either design is not in a one-to-one pair).
 fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib: &Lib) {
     use vyges_events::{Event, Severity};
     use vyges_lec::map::{self, MapReport, Side};
+    use vyges_loom::sdc_rtl_map::{load_ranges, renumber_ports, PortRenumbering};
     let names = (naming(args, "--golden-names"), naming(args, "--revised-names"));
+    // `--ranges`: the revised netlist's port bits renumbered to the elaborated numbering first
+    let renumbered: Option<PortRenumbering> = opt(args, "--ranges").map(|p| {
+        let ranges = load_ranges(&p).unwrap_or_else(|e| die(&e));
+        renumber_ports(r, &ranges)
+    });
+    if let Some(n) = &renumbered {
+        for (b, d) in &n.out_of_range {
+            let msg = format!("revised port bit {b} lies outside its declared range [{}:{}]: left as written", d.0, d.1);
+            vyges_events::emit(&Event::new("vyges-lec", Severity::Warn, msg).with_code("LEC-MAP-RANGES"));
+        }
+        for (b, t) in &n.name_taken {
+            let msg = format!("revised port bit {b} would be {t}, which another net is: left as written");
+            vyges_events::emit(&Event::new("vyges-lec", Severity::Warn, msg).with_code("LEC-MAP-RANGES"));
+        }
+        let msg = format!("revised: {} port bit(s) renumbered by their declared range", n.translated.len());
+        vyges_events::emit(&Event::new("vyges-lec", Severity::Info, msg).with_code("LEC-MAP-RANGES"));
+    }
+    let r = renumbered.as_ref().map_or(r, |n| &n.netlist);
     let rep: MapReport = map::register_map(g, r, lib, names).unwrap_or_else(|e| die(&e));
     let one = rep.one_to_one();
     let head = format!(
@@ -732,7 +764,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -746,11 +778,30 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             pairs(&rep.follows),
             pairs(&rep.unexplained),
             rep.unattributed,
-            rep.attribution_skipped
+            rep.attribution_skipped,
+            renumbered.as_ref().map_or("null".to_string(), |n| {
+                let range = |d: &(i64, i64)| format!("[{}, {}]", d.0, d.1);
+                let out: Vec<String> = n.out_of_range.iter().map(|(b, d)| format!("{{\"bit\": {}, \"declared\": {}}}", json_str(b), range(d))).collect();
+                format!(
+                    "{{\"translated\": {}, \"out_of_range\": [{}], \"name_taken\": {}}}",
+                    pairs_as(&n.translated, "declared", "elaborated"),
+                    out.join(", "),
+                    pairs_as(&n.name_taken, "bit", "would_be")
+                )
+            })
         );
         with_report_path(&s, opt(args, "-o").as_deref())
     } else {
         let mut s = format!("vyges-lec map — {} {head}\n", if one { "ONE-TO-ONE ✓ " } else { "PARTIAL ✗ " });
+        if let Some(n) = &renumbered {
+            s += &format!("  ranges      {} revised port bit(s) renumbered by their declared range\n", n.translated.len());
+            for (b, d) in &n.out_of_range {
+                s += &format!("  out of range revised {b}  (declared [{}:{}]; left as written)\n", d.0, d.1);
+            }
+            for (b, t) in &n.name_taken {
+                s += &format!("  name taken  revised {b} -> {t}  (another net has it; left as written)\n");
+            }
+        }
         for (k, v) in &rep.mapped {
             s += &format!("  mapped      {k} -> {v}\n");
         }

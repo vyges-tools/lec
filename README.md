@@ -54,7 +54,7 @@ vyges-lec check golden.v revised.v --lib cells.lib --json
 vyges-lec check golden.v revised.v --lib cells.lib --fail-on-diff   # exit 3 if differ
 vyges-lec map   golden.v revised.v --lib cells.lib --write-map names.json   # register map
 # flags: --lib FILE · --engine bdd|abc|both · -o FILE · --json · --fail-on-diff · -h · -V
-#        map: --golden-names instance|net · --revised-names instance|net · --write-map FILE
+#        map: --golden-names instance|net · --revised-names instance|net · --ranges FILE · --write-map FILE
 ```
 
 ```text
@@ -164,6 +164,19 @@ assumed to hold one value, each member's next-state function is built as a BDD, 
 functions differ are split, until nothing splits (register correspondence). Every pair left starts
 at 0 and loads the same next value whenever the pairs agree, so by induction it holds the same
 value in every state the two designs reach.
+
+Inputs are paired by name. An RTL elaboration (syn, and the reference's `synthesize`) numbers a
+vector port's bits from 0 at the right bound of its declaration (`input [11:8] a` becomes `a[0]`..
+`a[3]`); plain Yosys keeps the declared numbers (`a[8]`..`a[11]`). With `--ranges` (the declared
+ranges, as `vyges physical syn sv-ranges` writes them), the REVISED netlist's port bits are
+renumbered from their declared numbering to the elaborated one before pairing, so give the netlist
+that keeps declared numbers as the revised one. Each renumbered bit is listed (`ports_renumbered`
+in the JSON, `LEC-MAP-RANGES`). A bit outside its declared range, or whose new name another net
+already has, is listed and left as written, never moved.
+
+```sh
+vyges-lec map rtl_netlist.v yosys.v --lib cells.lib --golden-names net --ranges ranges.json --write-map names.json
+```
 
 What is not in the map is reported, with why:
 
