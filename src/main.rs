@@ -727,8 +727,12 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         let dup: Vec<String> = rep.duplicated.iter().map(|(k, v)| format!("{}: {}", json_str(k), list(v))).collect();
         let amb: Vec<String> = rep.ambiguous.iter().map(|(a, b)| format!("{{\"golden\": {}, \"revised\": {}}}", list(a), list(b))).collect();
         let mapped = map_json(&rep.mapped).trim_end().replace('\n', "\n  ");
+        let pairs = |v: &[(String, String)]| {
+            let rows: Vec<String> = v.iter().map(|(g, r)| format!("{{\"golden\": {}, \"revised\": {}}}", json_str(g), json_str(r))).collect();
+            format!("[{}]", rows.join(", "))
+        };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -737,7 +741,12 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             flags(&rep.unmatched_golden),
             flags(&rep.unmatched_revised),
             regs(&rep.undecided),
-            regs(&rep.unobserved)
+            regs(&rep.unobserved),
+            pairs(&rep.causes),
+            pairs(&rep.follows),
+            pairs(&rep.unexplained),
+            rep.unattributed,
+            rep.attribution_skipped
         );
         with_report_path(&s, opt(args, "-o").as_deref())
     } else {
@@ -763,6 +772,22 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for x in &rep.unobserved {
             s += &format!("  unobserved  {} {}  (no connected output)\n", side(x.side), x.instance);
+        }
+        if !rep.causes.is_empty() || !rep.follows.is_empty() || !rep.unexplained.is_empty() || rep.attribution_skipped {
+            s += &format!(
+                "  where the difference starts: {} cause(s); {} pair(s) differ only through them; {} pair(s) unexplained; {} register(s) not attributed{}\n",
+                rep.causes.len(),
+                rep.follows.len(),
+                rep.unexplained.len(),
+                rep.unattributed,
+                if rep.attribution_skipped { " (skipped: too many unmatched registers)" } else { "" }
+            );
+            for (g, r) in &rep.causes {
+                s += &format!("  cause       {g} ~ {r}  (next-state logic differs with what it reads assumed equal)\n");
+            }
+            for (g, r) in &rep.unexplained {
+                s += &format!("  unexplained {g} ~ {r}  (differs, and reads a register left unpaired)\n");
+            }
         }
         s
     };

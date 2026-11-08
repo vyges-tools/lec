@@ -49,6 +49,12 @@ pub const CYCLES: usize = 32;
 /// reported undecided.
 pub const BDD_LIMIT: usize = 1 << 20;
 
+/// Unmatched golden x revised register pairs [`attribute`] compares by simulation at most.
+pub const ATTRIBUTION_CAP: usize = 1 << 22;
+
+/// Leftover golden x revised x pair checks [`attribute`] spends pairing what simulation left.
+pub const LEFTOVER_CAP: usize = 1 << 16;
+
 /// Which name a register is known by in the map.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Naming {
@@ -60,7 +66,7 @@ pub enum Naming {
 }
 
 /// Which design a register is in.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Side {
     Golden,
     Revised,
@@ -98,6 +104,20 @@ pub struct MapReport {
     pub revised_registers: usize,
     /// Refinement rounds until nothing split.
     pub rounds: usize,
+    /// Where the difference starts ([`attribute`]): unmatched golden and revised registers paired
+    /// by their simulation, whose next-state logic differs even with every register it reads
+    /// assumed equal. ⛔ For diagnosis only: these pairs are never in the map.
+    pub causes: Vec<(String, String)>,
+    /// Unmatched pairs (paired as for `causes`) whose next-state logic is the same once what they
+    /// read is assumed equal: they differ only through a cause.
+    pub follows: Vec<(String, String)>,
+    /// Unmatched pairs that differ but read a register left unpaired: they may differ only
+    /// through it, so they are not called causes.
+    pub unexplained: Vec<(String, String)>,
+    /// Unmatched registers that could not be paired, so not attributed.
+    pub unattributed: usize,
+    /// The attribution was skipped: more unmatched pairs to compare than [`ATTRIBUTION_CAP`].
+    pub attribution_skipped: bool,
 }
 
 impl MapReport {
@@ -121,7 +141,9 @@ pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Nami
     let mut classes = candidate_classes(&[&gm, &rm], &sigs);
     let candidates = classes.clone();
     let (rounds, undecided) = refine(&[&gm, &rm], &mut classes)?;
-    Ok(report(&[&gm, &rm], &candidates, &classes, &undecided, rounds))
+    let mut rep = report(&[&gm, &rm], &candidates, &classes, &undecided, rounds);
+    attribute(&[&gm, &rm], &sigs, &classes, &mut rep)?;
+    Ok(rep)
 }
 
 /// One design in the sequential model: its cone, the registers in it, and where each gate is.
@@ -362,6 +384,41 @@ fn next_state_bdds(
     nets.iter().map(|n| f.get(n.as_str()).copied().ok_or_else(|| format!("net `{n}` is not in the cone"))).collect::<Result<Vec<_>, _>>().map(Some)
 }
 
+/// The next-state BDD node of each of `members` in one fresh manager, a register's state read as
+/// its class's variable (`class_of[model][state net]`); `None` once the manager is exhausted.
+/// Members with the same node load the same value whenever every class holds one value.
+fn next_nodes(models: &[&Model], members: &[RegId], class_of: &[HashMap<String, usize>]) -> Result<Option<Vec<u32>>, String> {
+    let mut bdd = Bdd::with_limit(BDD_LIMIT);
+    let mut names: HashMap<String, u32> = HashMap::new();
+    let mut var = |bdd: &mut Bdd, name: &str| -> u32 {
+        let n = names.len() as u32;
+        let k = *names.entry(name.to_string()).or_insert(n);
+        bdd.var(k)
+    };
+    let mut node = Vec::with_capacity(members.len());
+    for &(m, k) in members {
+        let co = &class_of[m];
+        let cv = |s: &str| format!("class {}", co.get(s).copied().unwrap_or(usize::MAX));
+        let net = next_net(&models[m].regs[k].instance);
+        match next_state_bdds(models[m], &[net], &mut bdd, &mut var, &cv)? {
+            Some(v) if !bdd.exhausted() => node.push(v[0]),
+            _ => return Ok(None),
+        }
+    }
+    Ok(Some(node))
+}
+
+/// Each register's class, by its state net, per model.
+fn class_index(models: &[&Model], classes: &[Vec<RegId>]) -> Vec<HashMap<String, usize>> {
+    let mut class_of: Vec<HashMap<String, usize>> = vec![HashMap::new(); models.len()];
+    for (ci, cl) in classes.iter().enumerate() {
+        for &(m, k) in cl {
+            class_of[m].insert(state_net(&models[m].regs[k].instance), ci);
+        }
+    }
+    class_of
+}
+
 /// Stage 4: split every class whose members load different next values when every class holds
 /// one value, until nothing splits. Returns the rounds taken and the registers left undecided.
 pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>) -> Result<(usize, Vec<RegId>), String> {
@@ -369,13 +426,7 @@ pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>) -> Result
     let mut rounds = 0;
     loop {
         rounds += 1;
-        // each register's class, by its state net
-        let mut class_of: Vec<HashMap<String, usize>> = vec![HashMap::new(); models.len()];
-        for (ci, cl) in classes.iter().enumerate() {
-            for &(m, k) in cl {
-                class_of[m].insert(state_net(&models[m].regs[k].instance), ci);
-            }
-        }
+        let class_of = class_index(models, classes);
         let mut next: Vec<Vec<RegId>> = Vec::with_capacity(classes.len());
         let mut split = false;
         for cl in classes.iter() {
@@ -383,33 +434,16 @@ pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>) -> Result
                 next.push(cl.clone());
                 continue;
             }
-            let mut bdd = Bdd::with_limit(BDD_LIMIT);
-            let mut names: HashMap<String, u32> = HashMap::new();
-            let mut var = |bdd: &mut Bdd, name: &str| -> u32 {
-                let n = names.len() as u32;
-                let k = *names.entry(name.to_string()).or_insert(n);
-                bdd.var(k)
-            };
-            let mut node: Vec<Option<u32>> = Vec::with_capacity(cl.len());
-            for &(m, k) in cl {
-                let co = &class_of[m];
-                let cv = |s: &str| format!("class {}", co.get(s).copied().unwrap_or(usize::MAX));
-                let net = next_net(&models[m].regs[k].instance);
-                node.push(next_state_bdds(models[m], &[net], &mut bdd, &mut var, &cv)?.map(|v| v[0]));
-                if bdd.exhausted() {
-                    break;
-                }
-            }
-            if bdd.exhausted() || node.iter().any(Option::is_none) {
+            let Some(node) = next_nodes(models, cl, &class_of)? else {
                 undecided.extend(cl.iter().copied());
                 next.extend(cl.iter().map(|&r| vec![r]));
                 split = true;
                 continue;
-            }
+            };
             // members grouped by their next-state node, in order of first appearance
             let mut parts: Vec<(u32, Vec<RegId>)> = Vec::new();
             for (i, &r) in cl.iter().enumerate() {
-                let n = node[i].expect("checked above");
+                let n = node[i];
                 match parts.iter_mut().find(|(x, _)| *x == n) {
                     Some((_, v)) => v.push(r),
                     None => parts.push((n, vec![r])),
@@ -471,6 +505,200 @@ pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Ve
         rep.unobserved.extend(m.unobserved.iter().cloned());
     }
     rep
+}
+
+/// How long two signatures agree: the cycles each run agrees from the start (summed over the 64
+/// runs), then the bits that agree in all.
+fn agreement(a: &[u64], b: &[u64]) -> (u32, u32) {
+    let (mut alive, mut lead, mut same) = (!0u64, 0u32, 0u32);
+    for (x, y) in a.iter().zip(b) {
+        alive &= !(x ^ y);
+        lead += alive.count_ones();
+        same += (!(x ^ y)).count_ones();
+    }
+    (lead, same)
+}
+
+/// Stage 6: where the difference starts. One wrong register makes every register it reaches hold
+/// a different value too, so all of them are unmatched; this names the wrong one.
+///
+/// 1. Pair the unmatched registers by simulation: a golden and a revised register that agree for
+///    the most cycles from the all-zero state, run by run (then on the most bits) are each
+///    other's best partner. A register downstream of the difference agrees with its counterpart
+///    until the difference reaches it, so it pairs with it; mutual best pairs are taken, removed,
+///    and the rest paired again until no pair is mutual and unique.
+/// 2. Registers the simulation left unpaired are paired by what the pairing explains: the pair
+///    that makes the most other pairs follow (step 3), one at a time, while it helps.
+/// 3. Assume every class AND every such pair holds one value, and compare each pair's next-state
+///    functions. A pair that still differs is a CAUSE: its own logic differs. A pair that is then
+///    equal FOLLOWS: it differs only because it reads a register that differs. A pair that
+///    differs but reads a register still unpaired is UNEXPLAINED, never a cause.
+///
+/// 🔑 Every follower differs only through a cause: were every pair equal under the assumption,
+/// all would start at 0 and stay equal by induction, and the registers would have mapped.
+/// ⛔ The pairing is a diagnosis, not a proof: none of these pairs enters the map.
+///
+/// ⚠️ Pinned by the unit tests and by the corpus witness (a gcd netlist with one register's D tied
+/// to its Q names exactly that register, 33 pairs following). NOT pinned, so free to change if a
+/// design shows a better rule: the per-run lead in the score (the bit count alone pairs the
+/// witnesses), repeating the mutual-best matching (one round leaves the rest to step 2), step 2
+/// taking a pair that makes no more pairs follow, and the unexplained verdict (no witness reads a
+/// register left unpaired).
+pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Vec<RegId>], rep: &mut MapReport) -> Result<(), String> {
+    let only = |cl: &Vec<RegId>, side: Side| cl.iter().all(|r| models[r.0].side == side);
+    let gold: Vec<RegId> = classes.iter().filter(|c| only(c, Side::Golden)).flatten().copied().collect();
+    let rev: Vec<RegId> = classes.iter().filter(|c| only(c, Side::Revised)).flatten().copied().collect();
+    if gold.is_empty() || rev.is_empty() {
+        rep.unattributed = gold.len() + rev.len();
+        return Ok(());
+    }
+    if gold.len().saturating_mul(rev.len()) > ATTRIBUTION_CAP {
+        rep.attribution_skipped = true;
+        rep.unattributed = gold.len() + rev.len();
+        return Ok(());
+    }
+    let sig = |r: &RegId| &sigs[r.0][r.1];
+    // per golden x revised: (cycles agreed from the start, summed over the 64 runs; bits agreed
+    // in all). Per run, not per word: a word differs as soon as one run does, and a register
+    // downstream of the difference is reached in different cycles in different runs.
+    let score: Vec<Vec<(u32, u32)>> = gold
+        .iter()
+        .map(|g| rev.iter().map(|r| agreement(sig(g), sig(r))).collect())
+        .collect();
+    let (mut gfree, mut rfree) = (vec![true; gold.len()], vec![true; rev.len()]);
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    loop {
+        // each free register's unique best free partner
+        let best_r = |i: usize, rfree: &[bool]| -> Option<usize> {
+            let mut c: Vec<usize> = (0..rev.len()).filter(|&j| rfree[j]).collect();
+            c.sort_by_key(|&j| std::cmp::Reverse(score[i][j]));
+            match c.as_slice() {
+                [a, b, ..] if score[i][*a] == score[i][*b] => None,
+                [a, ..] => Some(*a),
+                [] => None,
+            }
+        };
+        let best_g = |j: usize, gfree: &[bool]| -> Option<usize> {
+            let mut c: Vec<usize> = (0..gold.len()).filter(|&i| gfree[i]).collect();
+            c.sort_by_key(|&i| std::cmp::Reverse(score[i][j]));
+            match c.as_slice() {
+                [a, b, ..] if score[*a][j] == score[*b][j] => None,
+                [a, ..] => Some(*a),
+                [] => None,
+            }
+        };
+        let found: Vec<(usize, usize)> = (0..gold.len())
+            .filter(|&i| gfree[i])
+            .filter_map(|i| best_r(i, &rfree).filter(|&j| best_g(j, &gfree) == Some(i)).map(|j| (i, j)))
+            .collect();
+        if found.is_empty() {
+            break;
+        }
+        for &(i, j) in &found {
+            gfree[i] = false;
+            rfree[j] = false;
+        }
+        pairs.extend(found);
+    }
+    // 3. what the simulation left unpaired: pair by what the pairing explains, one pair at a time
+    //    (the pair that makes the most pairs follow, if it makes more follow than none)
+    let (lg, lr): (Vec<usize>, Vec<usize>) = ((0..gold.len()).filter(|&i| gfree[i]).collect(), (0..rev.len()).filter(|&j| rfree[j]).collect());
+    if lg.len() * lr.len() * (pairs.len() + 1) <= LEFTOVER_CAP {
+        let mut base = follows(models, classes, &gold, &rev, &pairs)?;
+        loop {
+            let mut best: Option<((usize, usize), usize)> = None;
+            for &i in lg.iter().filter(|&&i| gfree[i]) {
+                for &j in lr.iter().filter(|&&j| rfree[j]) {
+                    let mut trial = pairs.clone();
+                    trial.push((i, j));
+                    let n = follows(models, classes, &gold, &rev, &trial)?;
+                    if n > base && best.is_none_or(|(_, b)| n > b) {
+                        best = Some(((i, j), n));
+                    }
+                }
+            }
+            let Some(((i, j), n)) = best else { break };
+            gfree[i] = false;
+            rfree[j] = false;
+            pairs.push((i, j));
+            base = n;
+        }
+    }
+    // 4. each pair's verdict, every class and pair assumed equal
+    let class_of = class_index(models, &assumed_classes(models, classes, &gold, &rev, &pairs));
+    let unpaired: HashSet<String> = gold
+        .iter()
+        .zip(&gfree)
+        .chain(rev.iter().zip(&rfree))
+        .filter(|(_, f)| **f)
+        .map(|(r, _)| state_net(&models[r.0].regs[r.1].instance))
+        .collect();
+    let name = |r: &RegId| models[r.0].regs[r.1].name.clone();
+    for &(i, j) in &pairs {
+        let pair = (name(&gold[i]), name(&rev[j]));
+        match next_nodes(models, &[gold[i], rev[j]], &class_of)? {
+            Some(n) if n[0] == n[1] => rep.follows.push(pair),
+            // a pair that reads an unpaired register may differ only through it: not a cause
+            _ if [gold[i], rev[j]].iter().any(|r| states_read(models[r.0], r.1).iter().any(|s| unpaired.contains(s))) => {
+                rep.unexplained.push(pair)
+            }
+            // a pair whose BDDs outgrew the budget is not known to follow: listed as a cause
+            _ => rep.causes.push(pair),
+        }
+    }
+    rep.unattributed = gfree.iter().chain(&rfree).filter(|f| **f).count();
+    Ok(())
+}
+
+/// The classes that are not one-sided, every unmatched register alone, and each pair one class.
+fn assumed_classes(models: &[&Model], classes: &[Vec<RegId>], gold: &[RegId], rev: &[RegId], pairs: &[(usize, usize)]) -> Vec<Vec<RegId>> {
+    let paired: HashSet<RegId> = pairs.iter().flat_map(|&(i, j)| [gold[i], rev[j]]).collect();
+    let mut out: Vec<Vec<RegId>> = Vec::new();
+    for cl in classes {
+        let sides: HashSet<Side> = cl.iter().map(|r| models[r.0].side).collect();
+        if sides.len() == 2 {
+            out.push(cl.clone());
+        } else {
+            out.extend(cl.iter().filter(|r| !paired.contains(r)).map(|&r| vec![r]));
+        }
+    }
+    out.extend(pairs.iter().map(|&(i, j)| vec![gold[i], rev[j]]));
+    out
+}
+
+/// How many of `pairs` load the same next value with every class and pair assumed equal.
+fn follows(models: &[&Model], classes: &[Vec<RegId>], gold: &[RegId], rev: &[RegId], pairs: &[(usize, usize)]) -> Result<usize, String> {
+    let class_of = class_index(models, &assumed_classes(models, classes, gold, rev, pairs));
+    let mut n = 0;
+    for &(i, j) in pairs {
+        if matches!(next_nodes(models, &[gold[i], rev[j]], &class_of)?, Some(v) if v[0] == v[1]) {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
+/// The state nets register `k`'s next-state logic reads (the registers it depends on in one cycle).
+fn states_read(model: &Model, k: usize) -> HashSet<String> {
+    let c = &model.cone;
+    let mut out = HashSet::new();
+    let mut seen = vec![false; c.gates.len()];
+    let mut stack: Vec<usize> = model.gate.get(&next_net(&model.regs[k].instance)).copied().into_iter().collect();
+    while let Some(g) = stack.pop() {
+        if std::mem::replace(&mut seen[g], true) {
+            continue;
+        }
+        for src in &c.gates[g].ins {
+            if let Src::Net(n) = src {
+                if model.state.contains(n) {
+                    out.insert(n.clone());
+                } else if let Some(&j) = model.gate.get(n) {
+                    stack.push(j);
+                }
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -544,6 +772,8 @@ mod tests {
         assert_eq!(rep.mapped.get("r0").map(String::as_str), Some("r0"));
         assert!(rep.unmatched_golden.contains_key("r1") && rep.unmatched_revised.contains_key("r1"), "{rep:?}");
         assert!(!rep.one_to_one());
+        assert_eq!(rep.causes, [("r1".to_string(), "r1".to_string())], "{rep:?}");
+        assert!(rep.follows.is_empty(), "{rep:?}");
     }
 
     /// 🔑 The proof, not the simulation, decides. Two registers that agree on every simulated
@@ -579,6 +809,29 @@ mod tests {
         for i in 0..6 {
             assert_eq!(rep.mapped.get(&format!("r{i}")).map(String::as_str), Some(format!("r{i}").as_str()), "{rep:?}");
         }
+    }
+
+    /// 🔑 One wrong register takes the registers it reaches with it, but is named as the one
+    /// cause. A four-stage shift register whose first stage loads `a & b` instead of `a`: every
+    /// stage is unmatched (each holds a different value in some state), and only the first
+    /// stage's logic differs once what each stage reads is assumed equal.
+    #[test]
+    fn the_register_where_the_difference_starts_is_named() {
+        let shift = |first: &str| {
+            nl(&format!(
+                "module t(clk,a,b,y);\ninput clk,a,b; output y;\nwire d0,q0,q1,q2;\n{first}\n\
+                 DFF s0(.CK(clk),.D(d0),.Q(q0));\nDFF s1(.CK(clk),.D(q0),.Q(q1));\n\
+                 DFF s2(.CK(clk),.D(q1),.Q(q2));\nDFF s3(.CK(clk),.D(q2),.Q(y));\nendmodule\n"
+            ))
+        };
+        let rep = map(&shift("BUF g(.A(a),.Y(d0));"), &shift("AND2 g(.A(a),.B(b),.Y(d0));"));
+        assert!(rep.mapped.is_empty(), "{rep:?}");
+        let s = |a: &str| (a.to_string(), a.to_string());
+        assert_eq!(rep.causes, [s("s0")], "{rep:?}");
+        let mut f = rep.follows.clone();
+        f.sort();
+        assert_eq!(f, [s("s1"), s("s2"), s("s3")], "{rep:?}");
+        assert!(rep.unexplained.is_empty() && rep.unattributed == 0, "{rep:?}");
     }
 
     /// A register only the revised design has leaves the map short of one-to-one, even with every

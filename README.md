@@ -177,6 +177,19 @@ What is not in the map is reported, with why:
 - `undecided`: the class's BDDs outgrew the node budget;
 - `unobserved`: a register with no connected output.
 
+**Where the difference starts.** One wrong register makes every register it reaches hold a
+different value too, so all of them are unmatched. `map` then names the wrong one: it pairs the
+unmatched registers by how long they agree in simulation (and, for what that leaves, by which
+pairing explains the most), assumes every pair equal, and compares each pair's next-state logic.
+A pair whose logic still differs is a `cause`; one that is then equal only follows from a cause.
+These pairs are a diagnosis and never enter the map.
+
+```text
+vyges-lec map — PARTIAL ✗  0 of 34 golden and 34 revised register(s) mapped in 2 round(s)
+  where the difference starts: 1 cause(s); 33 pair(s) differ only through them; 0 pair(s) unexplained; 0 register(s) not attributed
+  cause       dpath.a_reg.out_reg[15].qi ~ _536_  (next-state logic differs with what it reads assumed equal)
+```
+
 `--golden-names` / `--revised-names` choose how a register is named in the map: `instance` (the
 default) or `net`, the net on its stored-value output. The sequential model is `sec`'s: one
 rising-edge clock from a primary input through buffers, registers from their Liberty `ff` groups;
