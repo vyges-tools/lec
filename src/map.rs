@@ -538,12 +538,9 @@ fn agreement(a: &[u64], b: &[u64]) -> (u32, u32) {
 /// all would start at 0 and stay equal by induction, and the registers would have mapped.
 /// ⛔ The pairing is a diagnosis, not a proof: none of these pairs enters the map.
 ///
-/// ⚠️ Pinned by the unit tests and by the corpus witness (a gcd netlist with one register's D tied
-/// to its Q names exactly that register, 33 pairs following). NOT pinned, so free to change if a
-/// design shows a better rule: the per-run lead in the score (the bit count alone pairs the
-/// witnesses), repeating the mutual-best matching (one round leaves the rest to step 2), step 2
-/// taking a pair that makes no more pairs follow, and the unexplained verdict (no witness reads a
-/// register left unpaired).
+/// Each rule is pinned by a unit test that states it (`the_register_where_*`, `agreement_*`,
+/// `mutual_best_*`, `leftovers_*`, `a_pair_reading_*`) and by the corpus witness (a gcd netlist
+/// with one register's D tied to its Q names exactly that register, 33 pairs following).
 pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Vec<RegId>], rep: &mut MapReport) -> Result<(), String> {
     let only = |cl: &Vec<RegId>, side: Side| cl.iter().all(|r| models[r.0].side == side);
     let gold: Vec<RegId> = classes.iter().filter(|c| only(c, Side::Golden)).flatten().copied().collect();
@@ -565,64 +562,17 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
         .iter()
         .map(|g| rev.iter().map(|r| agreement(sig(g), sig(r))).collect())
         .collect();
-    let (mut gfree, mut rfree) = (vec![true; gold.len()], vec![true; rev.len()]);
-    let mut pairs: Vec<(usize, usize)> = Vec::new();
-    loop {
-        // each free register's unique best free partner
-        let best_r = |i: usize, rfree: &[bool]| -> Option<usize> {
-            let mut c: Vec<usize> = (0..rev.len()).filter(|&j| rfree[j]).collect();
-            c.sort_by_key(|&j| std::cmp::Reverse(score[i][j]));
-            match c.as_slice() {
-                [a, b, ..] if score[i][*a] == score[i][*b] => None,
-                [a, ..] => Some(*a),
-                [] => None,
-            }
-        };
-        let best_g = |j: usize, gfree: &[bool]| -> Option<usize> {
-            let mut c: Vec<usize> = (0..gold.len()).filter(|&i| gfree[i]).collect();
-            c.sort_by_key(|&i| std::cmp::Reverse(score[i][j]));
-            match c.as_slice() {
-                [a, b, ..] if score[*a][j] == score[*b][j] => None,
-                [a, ..] => Some(*a),
-                [] => None,
-            }
-        };
-        let found: Vec<(usize, usize)> = (0..gold.len())
-            .filter(|&i| gfree[i])
-            .filter_map(|i| best_r(i, &rfree).filter(|&j| best_g(j, &gfree) == Some(i)).map(|j| (i, j)))
-            .collect();
-        if found.is_empty() {
-            break;
-        }
-        for &(i, j) in &found {
-            gfree[i] = false;
-            rfree[j] = false;
-        }
-        pairs.extend(found);
+    let mut pairs = mutual_best(&score);
+    // 3. what the simulation left unpaired: pair by what the pairing explains
+    let (gn, rn) = (gold.len(), rev.len());
+    let left = |pairs: &[(usize, usize)]| (gn - pairs.len()) * (rn - pairs.len());
+    if left(&pairs) * (pairs.len() + 1) <= LEFTOVER_CAP {
+        pair_leftovers(gn, rn, &mut pairs, &mut |p: &[(usize, usize)]| follows(models, classes, &gold, &rev, p))?;
     }
-    // 3. what the simulation left unpaired: pair by what the pairing explains, one pair at a time
-    //    (the pair that makes the most pairs follow, if it makes more follow than none)
-    let (lg, lr): (Vec<usize>, Vec<usize>) = ((0..gold.len()).filter(|&i| gfree[i]).collect(), (0..rev.len()).filter(|&j| rfree[j]).collect());
-    if lg.len() * lr.len() * (pairs.len() + 1) <= LEFTOVER_CAP {
-        let mut base = follows(models, classes, &gold, &rev, &pairs)?;
-        loop {
-            let mut best: Option<((usize, usize), usize)> = None;
-            for &i in lg.iter().filter(|&&i| gfree[i]) {
-                for &j in lr.iter().filter(|&&j| rfree[j]) {
-                    let mut trial = pairs.clone();
-                    trial.push((i, j));
-                    let n = follows(models, classes, &gold, &rev, &trial)?;
-                    if n > base && best.is_none_or(|(_, b)| n > b) {
-                        best = Some(((i, j), n));
-                    }
-                }
-            }
-            let Some(((i, j), n)) = best else { break };
-            gfree[i] = false;
-            rfree[j] = false;
-            pairs.push((i, j));
-            base = n;
-        }
+    let (mut gfree, mut rfree) = (vec![true; gn], vec![true; rn]);
+    for &(i, j) in &pairs {
+        gfree[i] = false;
+        rfree[j] = false;
     }
     // 4. each pair's verdict, every class and pair assumed equal
     let class_of = class_index(models, &assumed_classes(models, classes, &gold, &rev, &pairs));
@@ -648,6 +598,77 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
     }
     rep.unattributed = gfree.iter().chain(&rfree).filter(|f| **f).count();
     Ok(())
+}
+
+/// Step 1 of [`attribute`]: golden `i` and revised `j` pair when each is the other's UNIQUE best
+/// by `score[i][j]` among the registers still free; the pairs found are removed and the rest
+/// matched again, until a round finds none. A tie pairs nothing.
+fn mutual_best(score: &[Vec<(u32, u32)>]) -> Vec<(usize, usize)> {
+    let (gn, rn) = (score.len(), score.first().map_or(0, Vec::len));
+    let (mut gfree, mut rfree) = (vec![true; gn], vec![true; rn]);
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    // the unique best of `cands` by `key`, or none on a tie
+    fn unique_best(cands: Vec<usize>, key: impl Fn(usize) -> (u32, u32)) -> Option<usize> {
+        let mut c = cands;
+        c.sort_by_key(|&x| std::cmp::Reverse(key(x)));
+        match c.as_slice() {
+            [a, b, ..] if key(*a) == key(*b) => None,
+            [a, ..] => Some(*a),
+            [] => None,
+        }
+    }
+    loop {
+        let mut found: Vec<(usize, usize)> = Vec::new();
+        for i in (0..gn).filter(|&i| gfree[i]) {
+            let Some(j) = unique_best((0..rn).filter(|&j| rfree[j]).collect(), |j| score[i][j]) else { continue };
+            if unique_best((0..gn).filter(|&k| gfree[k]).collect(), |k| score[k][j]) == Some(i) {
+                found.push((i, j));
+            }
+        }
+        if found.is_empty() {
+            return pairs;
+        }
+        for &(i, j) in &found {
+            gfree[i] = false;
+            rfree[j] = false;
+        }
+        pairs.extend(found);
+    }
+}
+
+/// How many of a candidate set of pairs follow (see [`follows`]).
+type FollowCount<'a> = dyn FnMut(&[(usize, usize)]) -> Result<usize, String> + 'a;
+
+/// Step 2 of [`attribute`]: among the golden and revised registers no pair holds, add the pair
+/// after which `follows` counts the most pairs following, one pair at a time, and only while that
+/// count GROWS: a pair that explains nothing more is a guess, and is left unpaired.
+fn pair_leftovers(
+    gn: usize,
+    rn: usize,
+    pairs: &mut Vec<(usize, usize)>,
+    follows: &mut FollowCount,
+) -> Result<(), String> {
+    let mut base = follows(pairs)?;
+    loop {
+        let (gfree, rfree): (Vec<usize>, Vec<usize>) = (
+            (0..gn).filter(|i| !pairs.iter().any(|p| p.0 == *i)).collect(),
+            (0..rn).filter(|j| !pairs.iter().any(|p| p.1 == *j)).collect(),
+        );
+        let mut best: Option<((usize, usize), usize)> = None;
+        for &i in &gfree {
+            for &j in &rfree {
+                let mut trial = pairs.clone();
+                trial.push((i, j));
+                let n = follows(&trial)?;
+                if n > base && best.is_none_or(|(_, b)| n > b) {
+                    best = Some(((i, j), n));
+                }
+            }
+        }
+        let Some((p, n)) = best else { return Ok(()) };
+        pairs.push(p);
+        base = n;
+    }
 }
 
 /// The classes that are not one-sided, every unmatched register alone, and each pair one class.
@@ -832,6 +853,59 @@ mod tests {
         f.sort();
         assert_eq!(f, [s("s1"), s("s2"), s("s3")], "{rep:?}");
         assert!(rep.unexplained.is_empty() && rep.unattributed == 0, "{rep:?}");
+    }
+
+    /// The score counts, run by run, the cycles two registers agree FROM THE START, before the
+    /// bits they agree on overall: a register downstream of a difference agrees with its
+    /// counterpart until the difference reaches it, and may agree less often afterwards than an
+    /// unrelated register does. Here `near` agrees for 3 cycles in every run, then never; `far`
+    /// differs from cycle 1 but agrees on more bits; `near` must score higher.
+    #[test]
+    fn agreement_counts_the_lead_before_the_bits() {
+        let g = [0u64, 0, 0, !0, !0, !0, !0, !0];
+        let near = [0u64, 0, 0, 0, 0, 0, 0, 0];
+        let far = [0u64, !0, 0, !0, !0, !0, !0, !0];
+        assert_eq!(agreement(&g, &near), (3 * 64, 3 * 64));
+        assert_eq!(agreement(&g, &far), (64, 7 * 64));
+        assert!(agreement(&g, &near) > agreement(&g, &far));
+    }
+
+    /// Mutual unique best, REPEATED: golden 1's best is revised 0, which golden 0 wins in the
+    /// first round; only once that pair is removed is revised 1 golden 1's unique best.
+    #[test]
+    fn mutual_best_is_repeated_on_what_is_left() {
+        let score = vec![vec![(10, 0), (1, 0)], vec![(9, 0), (5, 0)]];
+        assert_eq!(mutual_best(&score), [(0, 0), (1, 1)]);
+        // and a tie pairs nothing
+        assert!(mutual_best(&[vec![(4, 0), (4, 0)]]).is_empty());
+    }
+
+    /// A leftover pair is taken only when it makes MORE pairs follow. Two leftover registers per
+    /// side: pairing (1, 0) makes one more pair follow and is taken; after it no pairing helps,
+    /// so golden 0 and revised 1 stay unpaired rather than paired by default.
+    #[test]
+    fn leftovers_are_paired_only_while_it_explains_more() {
+        let mut pairs: Vec<(usize, usize)> = Vec::new();
+        let mut follows = |p: &[(usize, usize)]| -> Result<usize, String> { Ok(usize::from(p.contains(&(1, 0)))) };
+        pair_leftovers(2, 2, &mut pairs, &mut follows).unwrap();
+        assert_eq!(pairs, [(1, 0)]);
+    }
+
+    /// A pair that differs but reads a register left unpaired may differ only through it, so it
+    /// is UNEXPLAINED, never a cause. The golden design XORs a second shift stage with a register
+    /// the revised design lacks (`u`, rarely 1): stage 1 differs, but because it reads `u`.
+    #[test]
+    fn a_pair_reading_an_unpaired_register_is_unexplained() {
+        let g = nl("module t(clk,a,b,c,y);\ninput clk,a,b,c; output y;\nwire q0,u,d1,ab,abc;\n\
+             DFF s0(.CK(clk),.D(a),.Q(q0));\nAND2 x(.A(a),.B(b),.Y(ab));\nAND2 z(.A(ab),.B(c),.Y(abc));\n\
+             DFF u0(.CK(clk),.D(abc),.Q(u));\nXOR2 m(.A(q0),.B(u),.Y(d1));\nDFF s1(.CK(clk),.D(d1),.Q(y));\nendmodule\n");
+        let r = nl("module t(clk,a,b,c,y);\ninput clk,a,b,c; output y;\nwire q0;\n\
+             DFF s0(.CK(clk),.D(a),.Q(q0));\nDFF s1(.CK(clk),.D(q0),.Q(y));\nendmodule\n");
+        let rep = map(&g, &r);
+        assert_eq!(rep.mapped.get("s0").map(String::as_str), Some("s0"), "{rep:?}");
+        assert_eq!(rep.unexplained, [("s1".to_string(), "s1".to_string())], "{rep:?}");
+        assert!(rep.causes.is_empty(), "{rep:?}");
+        assert_eq!(rep.unattributed, 1, "{rep:?}");
     }
 
     /// A register only the revised design has leaves the map short of one-to-one, even with every
