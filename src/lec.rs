@@ -119,7 +119,7 @@ fn logic_of(inst: &Inst, cell: &Cell, out_pin: &str) -> Result<(Logic, Vec<Strin
 }
 
 /// A `function` over BDDs, `ins[k]` standing for `pins[k]`.
-fn func_bdd(bdd: &mut Bdd, f: &Func, pins: &[String], ins: &[u32]) -> u32 {
+pub(crate) fn func_bdd(bdd: &mut Bdd, f: &Func, pins: &[String], ins: &[u32]) -> u32 {
     match f {
         Func::Port(p) => ins[pins.iter().position(|x| x == p).expect("logic_of keeps every named pin")],
         Func::Not(a) => {
@@ -235,6 +235,16 @@ impl<'a> Design<'a> {
         let constants: BTreeMap<&str, bool> = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
         let alias = resolve_aliases(nl, &driver, &constants);
         Design { nl, lib, driver, unknown, constants, alias, sequential: false }
+    }
+
+    /// The netlist this view reads.
+    pub(crate) fn netlist(&self) -> &'a Netlist {
+        self.nl
+    }
+
+    /// The Liberty this view reads.
+    pub(crate) fn liberty(&self) -> &'a Lib {
+        self.lib
     }
 
     /// The design with its registers kept as state (the sequential model, [`seq_cone`]).
@@ -542,7 +552,7 @@ fn build(
     Ok(f)
 }
 
-fn apply_op(bdd: &mut Bdd, op: Op, ins: &[u32], pins: &[String]) -> Result<u32, String> {
+pub(crate) fn apply_op(bdd: &mut Bdd, op: Op, ins: &[u32], pins: &[String]) -> Result<u32, String> {
     let need = |n: usize| -> Result<(), String> {
         if ins.len() == n {
             Ok(())

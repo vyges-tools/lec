@@ -2,6 +2,7 @@
 //!
 //!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [--engine bdd|abc|both] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+//!   vyges-lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names instance|net] [--revised-names instance|net] [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [-o OUT] [--json] [--fail-on-diff]
 //!
 //! Proves combinational equivalence of two gate-level netlists. Exit codes:
@@ -40,6 +41,8 @@ vyges physical lec — logic equivalence (combinational, sequential) and propert
 usage:
   vyges physical lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
+  vyges physical lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names N] [--revised-names N]
+                          [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N]
                           [-o OUT] [--json] [--fail-on-diff]
 
@@ -47,6 +50,9 @@ commands:
   check            combinational: registers cut and matched by instance name
   sec              sequential: registers kept as state, primary outputs compared on every
                    input sequence from the all-zero register state (one clock; needs --features abc)
+  map              register map: each golden register paired with the revised register
+                   proved to hold the same state (register correspondence from the all-zero
+                   state, one clock); --write-map writes the pairs as a JSON rename map
   prove            property: each --never NET stays 0 on every input sequence from the all-zero
                    register state; --bound N checks cycles 0..N only (needs --features abc)
 
@@ -56,16 +62,21 @@ flags:
                         endpoint (the default in a build with --features abc, as released)
                    bdd: exact BDDs, lists every differing endpoint (the default without it)
                    both: run both and fail if they disagree; reports the bdd result
+  --golden-names N, --revised-names N
+                   map: a register by its `instance` (default) or by the `net` on its
+                   stored-value output (an RTL elaboration that keeps names on nets only)
+  --write-map FILE map: write the proved pairs as {\"golden name\": \"revised name\"}
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
-  --fail-on-diff   exit 3 if the designs are not equivalent (prove: a net can be 1),
+  --fail-on-diff   exit 3 if the designs are not equivalent (prove: a net can be 1;
+                   map: a register of either design is not in a one-to-one pair),
                    4 if undecided (CI gate); without it a verdict exits 0
   --describe       print a machine-readable JSON description of every command
   -h, --help · -V, --version
 ";
 
 /// Every command `main` dispatches; the descriptor describes each one (a test holds them together).
-const COMMANDS: [&str; 3] = ["check", "sec", "prove"];
+const COMMANDS: [&str; 4] = ["check", "sec", "map", "prove"];
 
 /// The thread block's place in [`DESCRIBE`], filled from loom so every engine words it the same.
 const THREADS_TOKEN: &str = "\"@THREADS@\"";
@@ -132,6 +143,29 @@ const DESCRIBE: &str = r#"{
         }
       },
       "assertion": { "id": "sequentially-equivalent", "field": "equivalent", "pass_when": { "is_true": true } }
+    },
+    {
+      "name": "lec.map",
+      "summary": "register map: each golden register paired with the revised register proved to hold the same state, written as a JSON rename map",
+      "invocation": {
+        "args_template": ["map", "{golden}", "{revised}", "--lib", "{lib}"],
+        "optional": [{ "arg": "golden_names", "flag": "--golden-names" }, { "arg": "revised_names", "flag": "--revised-names" }, { "arg": "write_map", "flag": "--write-map" }, { "arg": "out", "flag": "-o" }],
+        "emits_json": true
+      },
+      "inputs": {
+        "type": "object",
+        "required": ["golden", "revised", "lib"],
+        "properties": {
+          "golden": { "type": "string", "description": "path to the golden gate-level netlist (the names the map is keyed by)" },
+          "revised": { "type": "string", "description": "path to the revised gate-level netlist" },
+          "lib": { "type": "string", "description": "path to the Liberty file (pin directions, cell functions, ff groups)" },
+          "golden_names": { "type": "string", "enum": ["instance", "net"], "description": "name a golden register by its instance (default) or by the net on its stored-value output" },
+          "revised_names": { "type": "string", "enum": ["instance", "net"], "description": "name a revised register by its instance (default) or by the net on its stored-value output" },
+          "write_map": { "type": "string", "description": "write the proved pairs to FILE as a JSON object, golden name to revised name" },
+          "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
+        }
+      },
+      "assertion": { "id": "registers-one-to-one", "field": "one_to_one", "pass_when": { "is_true": true } }
     },
     {
       "name": "lec.prove",
@@ -345,7 +379,7 @@ pub fn main() {
         exit(2);
     }
     // positionals: not a flag, not a flag's value
-    let valued = ["--lib", "--engine", "-o", "--never", "--bound"];
+    let valued = ["--lib", "--engine", "-o", "--never", "--bound", "--golden-names", "--revised-names", "--write-map"];
     let pos: Vec<&String> = args[1..]
         .iter()
         .enumerate()
@@ -393,6 +427,10 @@ pub fn main() {
 
     if cmd == "sec" {
         sec(&args, &g, &r, &lib);
+        return;
+    }
+    if cmd == "map" {
+        register_map(&args, &g, &r, &lib);
         return;
     }
     let engine = opt(&args, "--engine").unwrap_or_else(|| DEFAULT_ENGINE.into());
@@ -610,6 +648,141 @@ fn sec(_: &[String], _: &netlist::Netlist, _: &netlist::Netlist, _: &Lib) {
     exit(2);
 }
 
+/// A JSON string literal.
+fn json_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            c if (c as u32) < 0x20 => o.push_str(&format!("\\u{:04x}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
+/// `{"a": "b", ...}`, one pair per line, keys in order: what `sdc diff --map` reads.
+fn map_json(m: &std::collections::BTreeMap<String, String>) -> String {
+    let rows: Vec<String> = m.iter().map(|(k, v)| format!("  {}: {}", json_str(k), json_str(v))).collect();
+    if rows.is_empty() {
+        "{}\n".to_string()
+    } else {
+        format!("{{\n{}\n}}\n", rows.join(",\n"))
+    }
+}
+
+fn naming(args: &[String], flag: &str) -> vyges_lec::map::Naming {
+    use vyges_lec::map::Naming;
+    match opt(args, flag).as_deref() {
+        None | Some("instance") => Naming::Instance,
+        Some("net") => Naming::Net,
+        Some(other) => {
+            diag!("error: {flag} wants `instance` or `net`, got {other:?}\n{USAGE}");
+            exit(2);
+        }
+    }
+}
+
+/// `map`: the proved register map, its report, `--write-map`, and its exit code (3 with
+/// `--fail-on-diff` when a register of either design is not in a one-to-one pair).
+fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib: &Lib) {
+    use vyges_events::{Event, Severity};
+    use vyges_lec::map::{self, MapReport, Side};
+    let names = (naming(args, "--golden-names"), naming(args, "--revised-names"));
+    let rep: MapReport = map::register_map(g, r, lib, names).unwrap_or_else(|e| die(&e));
+    let one = rep.one_to_one();
+    let head = format!(
+        "{} of {} golden and {} revised register(s) mapped in {} round(s)",
+        rep.mapped.len(),
+        rep.golden_registers,
+        rep.revised_registers,
+        rep.rounds
+    );
+    let (code, sev) = if one { ("LEC-MAPPED", Severity::Info) } else { ("LEC-UNMAPPED", Severity::Warn) };
+    vyges_events::emit(&Event::new("vyges-lec", sev, format!("MAP {head}")).with_code(code));
+    if let Some(p) = opt(args, "--write-map") {
+        if let Err(e) = std::fs::write(&p, map_json(&rep.mapped)) {
+            die(&format!("{p}: {e}"));
+        }
+        eprintln!("wrote {p}");
+    }
+    let side = |s: Side| if s == Side::Golden { "golden" } else { "revised" };
+    let json = args.iter().any(|a| a == "--json");
+    let text = if json {
+        let list = |v: &[String]| format!("[{}]", v.iter().map(|x| json_str(x)).collect::<Vec<_>>().join(", "));
+        let flags = |m: &std::collections::BTreeMap<String, bool>| {
+            let rows: Vec<String> = m.iter().map(|(k, v)| format!("{}: {{\"disproved\": {v}}}", json_str(k))).collect();
+            format!("{{{}}}", rows.join(", "))
+        };
+        let regs = |v: &[map::RegName]| {
+            let rows: Vec<String> = v.iter().map(|x| format!("{{\"design\": \"{}\", \"instance\": {}}}", side(x.side), json_str(&x.instance))).collect();
+            format!("[{}]", rows.join(", "))
+        };
+        let dup: Vec<String> = rep.duplicated.iter().map(|(k, v)| format!("{}: {}", json_str(k), list(v))).collect();
+        let amb: Vec<String> = rep.ambiguous.iter().map(|(a, b)| format!("{{\"golden\": {}, \"revised\": {}}}", list(a), list(b))).collect();
+        let mapped = map_json(&rep.mapped).trim_end().replace('\n', "\n  ");
+        let s = format!(
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {}\n}}\n",
+            rep.golden_registers,
+            rep.revised_registers,
+            rep.rounds,
+            dup.join(", "),
+            amb.join(", "),
+            flags(&rep.unmatched_golden),
+            flags(&rep.unmatched_revised),
+            regs(&rep.undecided),
+            regs(&rep.unobserved)
+        );
+        with_report_path(&s, opt(args, "-o").as_deref())
+    } else {
+        let mut s = format!("vyges-lec map — {} {head}\n", if one { "ONE-TO-ONE ✓ " } else { "PARTIAL ✗ " });
+        for (k, v) in &rep.mapped {
+            s += &format!("  mapped      {k} -> {v}\n");
+        }
+        for (k, v) in &rep.duplicated {
+            s += &format!("  duplicated  {k} -> {}\n", v.join(" "));
+        }
+        for (a, b) in &rep.ambiguous {
+            s += &format!("  ambiguous   {} -> {}\n", a.join(" "), b.join(" "));
+        }
+        let why = |d: bool| if d { "candidate disproved" } else { "no candidate" };
+        for (k, d) in &rep.unmatched_golden {
+            s += &format!("  unmatched   golden  {k}  ({})\n", why(*d));
+        }
+        for (k, d) in &rep.unmatched_revised {
+            s += &format!("  unmatched   revised {k}  ({})\n", why(*d));
+        }
+        for x in &rep.undecided {
+            s += &format!("  undecided   {} {}\n", side(x.side), x.instance);
+        }
+        for x in &rep.unobserved {
+            s += &format!("  unobserved  {} {}  (no connected output)\n", side(x.side), x.instance);
+        }
+        s
+    };
+    match opt(args, "-o") {
+        Some(p) => {
+            if let Err(e) = std::fs::write(&p, &text) {
+                die(&format!("{p}: {e}"));
+            }
+            eprintln!("wrote {p}");
+            if json {
+                print!("{text}");
+            }
+        }
+        None => print!("{text}"),
+    }
+    if args.iter().any(|a| a == "--fail-on-diff") && !one {
+        exit(3);
+    }
+}
+
 /// `check`'s engine when `--engine` is not given: ABC when the build has it. The BDD engine is exact
 /// but did not finish a real core (picorv32, >300 s) that ABC proves in a fraction of a second; a
 /// build without ABC has only the BDD engine.
@@ -630,6 +803,20 @@ mod tests {
         assert_eq!(super::DEFAULT_ENGINE, "abc");
         #[cfg(not(feature = "abc"))]
         assert_eq!(super::DEFAULT_ENGINE, "bdd");
+    }
+
+    /// The map file is a JSON object `sdc diff --map` can read: names with quotes and backslashes
+    /// are escaped, keys in order, an empty map is `{}`.
+    #[test]
+    fn the_map_file_is_json() {
+        let mut m = std::collections::BTreeMap::new();
+        assert_eq!(super::map_json(&m), "{}\n");
+        m.insert("b\\x".to_string(), "u\"2".to_string());
+        m.insert("a[0]".to_string(), "u1".to_string());
+        let v: serde_json::Value = serde_json::from_str(&super::map_json(&m)).expect("valid JSON");
+        assert_eq!(v["a[0]"], "u1");
+        assert_eq!(v["b\\x"], "u\"2");
+        assert!(super::map_json(&m).find("a[0]") < super::map_json(&m).find("b\\"));
     }
 
     /// Every command `main` dispatches has its own entry in the descriptor, and the thread block

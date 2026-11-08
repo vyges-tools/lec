@@ -26,6 +26,9 @@ pub use vyges_loom::{liberty, netlist};
 pub mod bdd;
 pub mod lec;
 
+/// Register map: which register of one netlist holds the same state as which of another, proved.
+pub mod map;
+
 /// The same check through ABC (`--features abc`): a second, SAT-based engine over the same model.
 #[cfg(feature = "abc")]
 pub mod abc;

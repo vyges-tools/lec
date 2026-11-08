@@ -52,7 +52,9 @@ cargo build --release                  # std-only: the in-tree BDD engine, `chec
 vyges-lec check golden.v revised.v --lib cells.lib                  # -> verdict
 vyges-lec check golden.v revised.v --lib cells.lib --json
 vyges-lec check golden.v revised.v --lib cells.lib --fail-on-diff   # exit 3 if differ
+vyges-lec map   golden.v revised.v --lib cells.lib --write-map names.json   # register map
 # flags: --lib FILE · --engine bdd|abc|both · -o FILE · --json · --fail-on-diff · -h · -V
+#        map: --golden-names instance|net · --revised-names instance|net · --write-map FILE
 ```
 
 ```text
@@ -140,6 +142,47 @@ exactly from one cycle's logic before ABC is asked. `--fail-on-diff` exits 3 whe
 
 In every command an `assign a = b;` is a wire: the name that is not driven reads the net that is.
 
+## Register map (`map`)
+
+`map` pairs each register of one netlist with the register of another that holds the same
+value, and writes the pairs as a rename map. A constraint file written against one netlist (an
+RTL elaboration that keeps register names on nets, a netlist before repair) can then be compared
+with one written against the other: `vyges physical sdc diff --map names.json`.
+
+```sh
+vyges-lec map rtl_netlist.v impl.v --lib cells.lib --golden-names net --write-map names.json
+```
+```text
+vyges-lec map — ONE-TO-ONE ✓  34 of 34 golden and 34 revised register(s) mapped in 1 round(s)
+  mapped      ctrl.state.out_reg[0].qi -> _552_
+  ...
+```
+
+A pair is proved, never taken from a name. Both designs are simulated from the all-zero state on
+the same random inputs; registers that never differ are candidates. Then every candidate class is
+assumed to hold one value, each member's next-state function is built as a BDD, and members whose
+functions differ are split, until nothing splits (register correspondence). Every pair left starts
+at 0 and loads the same next value whenever the pairs agree, so by induction it holds the same
+value in every state the two designs reach.
+
+What is not in the map is reported, with why:
+
+- `unmatched`: no register of the other design holds its value (`no candidate`: simulation
+  already told them apart; `candidate disproved`: the proof did). A register whose logic was
+  changed takes the registers it feeds with it, since they then hold different values too;
+- `duplicated` (one golden register, several revised copies) and `ambiguous` (several golden
+  registers in one class): one name per name is not decided by guessing;
+- a register stored inverted, or a state re-encoded (a one-hot FSM against a binary one), does
+  not map;
+- `undecided`: the class's BDDs outgrew the node budget;
+- `unobserved`: a register with no connected output.
+
+`--golden-names` / `--revised-names` choose how a register is named in the map: `instance` (the
+default) or `net`, the net on its stored-value output. The sequential model is `sec`'s: one
+rising-edge clock from a primary input through buffers, registers from their Liberty `ff` groups;
+a design outside it is an error. `--fail-on-diff` exits 3 unless every register of both designs is
+in a one-to-one pair. `map` needs no ABC: it is built in every configuration.
+
 ## How it works
 
 - Each design's endpoints — primary outputs and flop data pins — are built into a
@@ -170,6 +213,7 @@ In every command an `assign a = b;` is a wire: the name that is not driven reads
 - `sec`: sequential equivalence through register correspondence, interpolation and PDR,
   with a counter-example covering every cycle up to the difference, replayed before it is
   reported;
+- `map`: a register map proved by register correspondence, written as a rename map;
 - `prove`: safety properties (`--never NET`) as a PDR proof or a bounded search, with a
   BDD pre-pass that decides constant and register-free nets exactly;
 - a node budget that the BDD enforces inside every operation, so a cone that would blow up
