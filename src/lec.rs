@@ -284,13 +284,38 @@ impl<'a> Design<'a> {
         self.lib.cells.get(&inst.cell).filter(|c| c.is_seq).map(|_| (inst.name.as_str(), pin))
     }
 
-    /// The name of free input `net`, shared by both designs: a register output is `inst/pin`, so a
-    /// register matches by its INSTANCE name whatever its output net is called (repair renames it
-    /// when it buffers an output port); any other free input is its net.
-    fn var_of(&self, net: &str) -> String {
-        match self.seq_driver(net) {
-            Some((inst, pin)) => format!("{inst}/{pin}"),
-            None => net.to_string(),
+    /// The variable free input `net` reads, shared by both designs, and whether it reads it
+    /// inverted. A register output is `inst/pin`, so a register matches by its INSTANCE name
+    /// whatever its output net is called (repair renames it when it buffers an output port); any
+    /// other free input is its net.
+    ///
+    /// ⛔ A register is ONE value. Its outputs are read through its Liberty `ff` group: a pin whose
+    /// function is the stored value (`IQ`) is the variable `inst/<that pin>`, and a pin whose
+    /// function is its complement (`IQN`, or `!IQ`) is that same variable inverted. With each pin
+    /// its own variable, a netlist reading `QN` against one inverting `Q` was reported different
+    /// under the impossible assignment Q=1 QN=1. A cell with no pin of the stored value, or an
+    /// output with another function (or none), keeps `inst/<pin>` as before.
+    fn cut_var(&self, net: &str) -> (String, bool) {
+        let Some((inst, pin)) = self.seq_driver(net) else { return (net.to_string(), false) };
+        let plain = (format!("{inst}/{pin}"), false);
+        let Some(cell) = self.driver.get(net).and_then(|&(i, _)| self.lib.cells.get(&self.nl.insts[i].cell)) else { return plain };
+        let Some(g) = cell.seq_group.as_ref() else { return plain };
+        // Some(false): the pin shows the stored value; Some(true): its complement
+        let polarity = |p: &str| -> Option<bool> {
+            let f = cell.pins.get(p).filter(|x| x.direction == Dir::Out)?.function.as_deref()?;
+            match Func::parse_in(f, |x| x == g.iq || x == g.iqn)? {
+                Func::Port(x) => Some(x == g.iqn),
+                Func::Not(a) => match *a {
+                    Func::Port(x) => Some(x == g.iq),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        let Some(inverted) = polarity(pin) else { return plain };
+        match cell.pins.keys().find(|p| polarity(p) == Some(false)) {
+            Some(q) => (format!("{inst}/{q}"), inverted),
+            None => plain,
         }
     }
 
@@ -519,8 +544,10 @@ fn build(
     }
     // a free input: primary input, an undriven net, or a register (flop Q) output
     if d.is_free(net)? {
-        let idx = vars.get(&d.var_of(net));
+        let (v, inverted) = d.cut_var(net);
+        let idx = vars.get(&v);
         let f = bdd.var(idx);
+        let f = if inverted { bdd.not(f) } else { f };
         memo.insert(net.to_string(), f);
         return Ok(f);
     }
@@ -890,7 +917,16 @@ fn collect(
         return Ok(());
     }
     if d.is_free(net)? {
-        c.free.insert(net.to_string(), d.var_of(net));
+        let (v, inverted) = d.cut_var(net);
+        if inverted {
+            // the complement of a register's value: an inverter over a cut net of the value (a
+            // space cannot occur in a netlist name, so the cut net collides with none)
+            let cut = format!("{net} <cut>");
+            c.free.insert(cut.clone(), v);
+            c.gates.push(Gate { out: net.to_string(), logic: Logic::Prim(Op::Not), pins: vec!["A".into()], ins: vec![Src::Net(cut)] });
+        } else {
+            c.free.insert(net.to_string(), v);
+        }
         done.insert(net.to_string());
         return Ok(());
     }
@@ -1161,6 +1197,31 @@ mod tests {
         let mut at: Vec<&str> = rep.mismatches.iter().map(|m| m.endpoint.as_str()).collect();
         at.sort();
         assert_eq!(at, ["ra/D", "rb/D"]);
+    }
+
+    /// A register is one value: `QN` is `!Q` of the same register, never a variable of its own.
+    /// One netlist reads the complement from `QN`, the other inverts `Q`: equivalent (it was
+    /// reported different under Q=1 QN=1). Reading `Q` where the other reads `QN` is a real
+    /// difference, and a register with no `function` on its outputs keeps one variable per pin.
+    #[test]
+    fn qn_is_the_complement_of_q() {
+        let l = Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/seq.lib")).expect("seq.lib");
+        let qn = nl("module t(clk,d,y);\ninput clk,d; output y;\nwire q;\n\
+             SDF r(.CK(clk),.D(d),.SCD(d),.SCE(d),.Q(q),.QN(y));\nendmodule\n");
+        let inv = nl("module t(clk,d,y);\ninput clk,d; output y;\nwire q;\n\
+             SDF r(.CK(clk),.D(d),.SCD(d),.SCE(d),.Q(q));\nINV i(.A(q),.Y(y));\nendmodule\n");
+        let rep = equivalence(&qn, &inv, &l).unwrap();
+        assert!(rep.equivalent, "{:?}", rep.mismatches);
+        let plain = nl("module t(clk,d,y);\ninput clk,d; output y;\n\
+             SDF r(.CK(clk),.D(d),.SCD(d),.SCE(d),.Q(y));\nendmodule\n");
+        let rep = equivalence(&qn, &plain, &l).unwrap();
+        assert_eq!(rep.mismatches.iter().map(|m| m.endpoint.as_str()).collect::<Vec<_>>(), ["y"]);
+        // the complement written `!IQ` rather than `IQN`
+        let neg = nl("module t(clk,d,y);\ninput clk,d; output y;\nwire q;\n\
+             DFQN r(.CK(clk),.D(d),.Q(q),.QN(y));\nendmodule\n");
+        let neg_inv = nl("module t(clk,d,y);\ninput clk,d; output y;\nwire q;\n\
+             DFQN r(.CK(clk),.D(d),.Q(q));\nINV i(.A(q),.Y(y));\nendmodule\n");
+        assert!(equivalence(&neg, &neg_inv, &l).unwrap().equivalent);
     }
 
     #[test]

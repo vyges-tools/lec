@@ -514,6 +514,22 @@ mod tests {
         assert_ne!(value(&g, endpoint, counterexample), value(&r, endpoint, counterexample), "{counterexample:?}");
     }
 
+    /// ABC reads a register as one value too: `QN` is an inverter over the cut of `Q` (as the BDD
+    /// engine's `qn_is_the_complement_of_q`), so reading `QN` equals inverting `Q`, and reading `Q`
+    /// in its place differs.
+    #[test]
+    fn qn_is_the_complement_of_q() {
+        let l = Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/seq.lib")).expect("seq.lib");
+        let qn = nl("module t(clk,d,y);\ninput clk,d; output y;\nwire q;\n\
+             SDF r(.CK(clk),.D(d),.SCD(d),.SCE(d),.Q(q),.QN(y));\nendmodule\n");
+        let inv = nl("module t(clk,d,y);\ninput clk,d; output y;\nwire q;\n\
+             SDF r(.CK(clk),.D(d),.SCD(d),.SCE(d),.Q(q));\nINV i(.A(q),.Y(y));\nendmodule\n");
+        assert!(equivalence(&qn, &inv, &l).unwrap().equivalent());
+        let plain = nl("module t(clk,d,y);\ninput clk,d; output y;\n\
+             SDF r(.CK(clk),.D(d),.SCD(d),.SCE(d),.Q(y));\nendmodule\n");
+        assert!(!equivalence(&qn, &plain, &l).unwrap().equivalent());
+    }
+
     #[test]
     fn sequential_designs_are_cut_at_registers() {
         let g = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d;\n\
