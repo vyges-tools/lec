@@ -231,6 +231,8 @@ The ROBDD package (ite-based, memoized, with `sat_one`) is unit-tested in its ow
   `function` attributes falls back to a **name-prefix primitive map**. A function that
   does not parse, an unrecognized cell, or a cell missing from the Liberty that touches a
   compared cone is a hard error (never a silent wrong answer). UDPs are not read;
+- in `check` a register is one variable, named after its stored-value pin (`inst/Q`); an output
+  whose Liberty function is the complement (`IQN`, `!IQ`) reads it inverted;
 - `check` matches **registers by instance name** (no retiming, no state re-encoding); `sec`
   does not need them to match, and models one rising-edge clock from an all-zero state;
 - the `bdd` engine is a single **monolithic BDD** with a static variable order:
