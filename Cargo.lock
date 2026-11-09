@@ -147,13 +147,13 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vyges-abc-lib"
-version = "0.1.53"
-source = "git+https://github.com/vyges-tools/abc-lib?branch=main#a3e18862c742e4fabfae696a591413eb49f74343"
+version = "0.1.54"
+source = "git+https://github.com/vyges-tools/abc-lib?branch=main#ac62e917333a081f0be606ec713fe6ce19cf97cd"
 
 [[package]]
 name = "vyges-events"
-version = "0.1.53"
-source = "git+https://github.com/vyges-tools/events?branch=main#1fc532e533e9ad9232d42b541eff9718d03cd680"
+version = "0.1.54"
+source = "git+https://github.com/vyges-tools/events?branch=main#a1cf6c92afceb947965bdf1144104049bc14aaa9"
 dependencies = [
  "serde",
  "serde_json",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "vyges-lec"
-version = "0.1.53"
+version = "0.1.54"
 dependencies = [
  "serde_json",
  "vyges-abc-lib",
@@ -171,8 +171,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.53"
-source = "git+https://github.com/vyges-tools/loom?branch=main#4e6a44ee818ab151eb2394bfa7714ff107216abb"
+version = "0.1.54"
+source = "git+https://github.com/vyges-tools/loom?branch=main#8a38c94ac2c8816cb77e8e131b13ce10062149c0"
 dependencies = [
  "miniz_oxide",
  "regex",
