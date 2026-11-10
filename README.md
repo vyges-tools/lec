@@ -1,7 +1,5 @@
 # vyges-lec
 
-**[Download Loom](https://vyges.com/products/vyges-cli/#install)** · install the free [Vyges CLI](https://vyges.com/products/vyges-cli/), then `vyges install physical`
-
 Formal checks on gate-level **netlists**, with a **Liberty** for the cell functions:
 **logic equivalence** of two netlists — combinational (`check`) and sequential (`sec`) —
 and **property checking** of one (`prove`). Every failure comes with a concrete
