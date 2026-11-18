@@ -213,6 +213,21 @@ pub(crate) struct Design<'a> {
     /// Registers are state, not cut points: a register output is a gate over the register's
     /// stored value ([`seq_cone`]) instead of a free input.
     sequential: bool,
+    /// The sequential model with every state element outside it (a latch, a memory macro, a bank,
+    /// a `statetable`: [`outside_edge_model`]) cut as `check` cuts every register ([`is_cut`]):
+    /// its output a free input named by [`cut_var`], so it pairs by instance name. Only the
+    /// register map asks for it ([`Design::register_model`]); `sec` and `prove` refuse them.
+    ///
+    /// [`is_cut`]: Design::is_cut
+    /// [`cut_var`]: Design::cut_var
+    cut_outside: bool,
+}
+
+/// A state element the one-clock-edge register model ([`Reg`]) cannot hold: a sequential cell
+/// whose state is not one `ff` group (a `latch`, which is level-sensitive; a memory macro,
+/// sequential only by its clock pin; an `ff_bank`, `latch_bank` or `statetable`).
+pub(crate) fn outside_edge_model(cell: &Cell) -> bool {
+    cell.is_seq && cell.seq_group.as_ref().is_none_or(|g| g.latch)
 }
 
 impl<'a> Design<'a> {
@@ -234,7 +249,7 @@ impl<'a> Design<'a> {
         }
         let constants: BTreeMap<&str, bool> = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
         let alias = resolve_aliases(nl, &driver, &constants);
-        Design { nl, lib, driver, unknown, constants, alias, sequential: false }
+        Design { nl, lib, driver, unknown, constants, alias, sequential: false, cut_outside: false }
     }
 
     /// The netlist this view reads.
@@ -253,12 +268,37 @@ impl<'a> Design<'a> {
         Design { sequential: true, ..Design::new(nl, lib) }
     }
 
+    /// The register map's model ([`crate::map`]): [`Design::sequential`] for every `ff`, and every
+    /// state element outside it ([`outside_edge_model`]) CUT exactly as `check` cuts a register,
+    /// one model in both commands.
+    ///
+    /// ⛔ A latch is level-sensitive and a memory macro has no `ff` group: the one-clock-edge
+    /// model of [`Reg`] holds neither, and a clock-gate enable latch and SRAM macros are in nearly
+    /// every real core. `check` already treats them as every register: an output is the free
+    /// variable `inst/<pin>` ([`Design::cut_var`]), shared by name with the other design. The map
+    /// takes that same assumption (two such cells of one instance name hold one value) and lists
+    /// each cell it cut, so the assumption is in the report, never silent.
+    pub(crate) fn register_model(nl: &'a Netlist, lib: &'a Lib) -> Design<'a> {
+        Design { cut_outside: true, ..Design::sequential(nl, lib) }
+    }
+
+    /// Is `net` an output of a state element this model cuts: any register in the combinational
+    /// model, a latch or memory in the register map's model ([`Design::register_model`]), nothing
+    /// in `sec`?
+    fn is_cut(&self, net: &str) -> bool {
+        let Some(&(i, _)) = self.driver.get(net) else { return false };
+        match self.lib.cells.get(&self.nl.insts[i].cell).filter(|c| c.is_seq) {
+            Some(cell) => !self.sequential || (self.cut_outside && outside_edge_model(cell)),
+            None => false,
+        }
+    }
+
     /// Is `net` a free input of the model (a primary input, a register output, or undriven)?
     /// ⛔ An "undriven" net that touches an instance of a cell missing from the Liberty is an
     /// error, not a free input: that instance may well drive it, and treating it as free in both
     /// designs would compare it equal whatever the cell computes.
     fn is_free(&self, net: &str) -> Result<bool, String> {
-        if self.nl.inputs.iter().any(|p| p == net) || (!self.sequential && self.is_seq_driver(net)) {
+        if self.nl.inputs.iter().any(|p| p == net) || self.is_cut(net) {
             return Ok(true);
         }
         if self.driver.contains_key(net) {
@@ -271,10 +311,6 @@ impl<'a> Design<'a> {
             )),
             None => Ok(true),
         }
-    }
-
-    fn is_seq_driver(&self, net: &str) -> bool {
-        self.seq_driver(net).is_some()
     }
 
     /// The register (instance, output pin) driving `net`, if a sequential cell drives it.
@@ -1222,6 +1258,29 @@ mod tests {
         let neg_inv = nl("module t(clk,d,y);\ninput clk,d; output y;\nwire q;\n\
              DFQN r(.CK(clk),.D(d),.Q(q));\nINV i(.A(q),.Y(y));\nendmodule\n");
         assert!(equivalence(&neg, &neg_inv, &l).unwrap().equivalent);
+    }
+
+    /// 🔑 ONE model for `check` and `map` of state the one-edge register model cannot hold: a
+    /// latch's or a memory macro's output is the same free variable (`inst/<stored-value pin>`,
+    /// or `inst/<pin>` for a cell with no `ff` group) in the combinational model and in the
+    /// register map's model ([`Design::register_model`]). `sec` and `prove`
+    /// ([`Design::sequential`]) still refuse both.
+    #[test]
+    fn a_latch_or_memory_is_one_cut_variable_in_check_and_in_the_register_map() {
+        let l = Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/seq.lib")).expect("seq.lib");
+        let n = nl("module t(clk,en,y);\ninput clk,en; output y;\nwire e,m,x,d,q;\n\
+             LAT lt(.G(clk),.D(en),.Q(e));\nRAM1 mem(.CK(clk),.D(en),.Q(m));\nAND2 a0(.A(e),.B(m),.Y(x));\n\
+             AND2 a(.A(x),.B(q),.Y(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nBUF b(.A(q),.Y(y));\nendmodule\n");
+        let comb = cone(&Design::new(&n, &l), &["d".to_string()]).unwrap();
+        let regs = seq_cone(&Design::register_model(&n, &l), &["q".to_string()]).unwrap();
+        assert_eq!(comb.free.get("e").map(String::as_str), Some("lt/Q"));
+        assert_eq!(comb.free.get("m").map(String::as_str), Some("mem/Q"));
+        for net in ["e", "m"] {
+            assert_eq!(regs.free.get(net), comb.free.get(net), "the map cuts `{net}`'s cell as check does");
+        }
+        assert_eq!(regs.regs, ["r"], "neither the latch nor the memory is a register of the map");
+        let e = seq_cone(&Design::sequential(&n, &l), &["q".to_string()]).err().unwrap_or_default();
+        assert!(e.contains("is not modelled") || e.contains("no single `ff` group"), "sec still refuses them: {e}");
     }
 
     #[test]

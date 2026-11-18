@@ -188,7 +188,10 @@ What is not in the map is reported, with why:
 - a register stored inverted, or a state re-encoded (a one-hot FSM against a binary one), does
   not map;
 - `undecided`: the class's BDDs outgrew the node budget;
-- `unobserved`: a register with no connected output.
+- `unobserved`: a register with no connected output;
+- `cut`: a latch (a clock-gate enable latch, say) or a memory macro is not a register of the map.
+  It is cut as `check` cuts every register: its outputs are free inputs shared by instance name,
+  so the map holds under `check`'s own assumption that two such cells of one name hold one value.
 
 **Where the difference starts.** One wrong register makes every register it reaches hold a
 different value too, so all of them are unmatched. `map` then names the wrong one: it pairs the

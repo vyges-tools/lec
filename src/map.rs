@@ -31,13 +31,17 @@
 //! - a class with several registers of one design (`duplicated` or `ambiguous`): the map gives one
 //!   name per name, and choosing one would be a guess;
 //! - a register stored inverted (its counterpart holds the complement): not matched by this model;
+//! - a LATCH or a MEMORY macro (`cut`; any state that is not one `ff` group): not a register of
+//!   the map. It is cut as `check` cuts it, its outputs free inputs named by instance
+//!   ([`Design::register_model`]), so the map holds under `check`'s own assumption that two such
+//!   cells of one name hold one value;
 //! - a register whose next-state BDD outgrew [`BDD_LIMIT`] (`undecided`): its class is split
 //!   into single registers, which only weakens what the others may assume, so the rest stays sound.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::bdd::Bdd;
-use crate::lec::{apply_op, func_bdd, next_net, seq_cone, state_net, Cone, Design, Logic, Op, Src};
+use crate::lec::{apply_op, func_bdd, next_net, outside_edge_model, seq_cone, state_net, Cone, Design, Logic, Op, Src};
 use crate::liberty::{Dir, Lib};
 use crate::netlist::Netlist;
 use vyges_loom::liberty_func::Func;
@@ -100,6 +104,9 @@ pub struct MapReport {
     pub undecided: Vec<RegName>,
     /// Registers with no connected output: nothing reads them, so nothing to map.
     pub unobserved: Vec<RegName>,
+    /// Latches and memories cut as `check` cuts them (an output is a free input shared by instance
+    /// name), not mapped: the map holds under the assumption that same-named cells hold one value.
+    pub cut: Vec<RegName>,
     pub golden_registers: usize,
     pub revised_registers: usize,
     /// Refinement rounds until nothing split.
@@ -135,7 +142,7 @@ pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Nami
     if lib.cells.is_empty() {
         return Err("no cells in the Liberty".into());
     }
-    let (g, r) = (Design::sequential(golden, lib), Design::sequential(revised, lib));
+    let (g, r) = (Design::register_model(golden, lib), Design::register_model(revised, lib));
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
     let sigs = simulate(&[&gm, &rm])?;
     let mut classes = candidate_classes(&[&gm, &rm], &sigs);
@@ -157,6 +164,8 @@ pub(crate) struct Model {
     /// Every register's state net ([`state_net`]).
     state: HashSet<String>,
     unobserved: Vec<RegName>,
+    /// Latches and memories the model cut ([`Design::register_model`]), in netlist order.
+    cut: Vec<RegName>,
 }
 
 /// Stage 1: the cone of every register's outputs, with each register's next-state gate.
@@ -165,8 +174,13 @@ pub(crate) fn model(d: &Design, side: Side, naming: Naming) -> Result<Model, Str
     let mut endpoints = Vec::new();
     let mut name_of: HashMap<&str, String> = HashMap::new();
     let mut unobserved = Vec::new();
+    let mut cut = Vec::new();
     for inst in &nl.insts {
         let Some(cell) = lib.cells.get(&inst.cell).filter(|c| c.is_seq) else { continue };
+        if outside_edge_model(cell) {
+            cut.push(RegName { side, instance: inst.name.clone(), name: inst.name.clone() });
+            continue;
+        }
         let outs: Vec<(&str, &str)> = inst
             .conns
             .iter()
@@ -196,7 +210,7 @@ pub(crate) fn model(d: &Design, side: Side, naming: Naming) -> Result<Model, Str
         .collect();
     let gate = cone.gates.iter().enumerate().map(|(k, g)| (g.out.clone(), k)).collect();
     let state = cone.regs.iter().map(|r| state_net(r)).collect();
-    Ok(Model { side, cone, regs, gate, state, unobserved })
+    Ok(Model { side, cone, regs, gate, state, unobserved, cut })
 }
 
 /// A register across both models: (model index, register index).
@@ -503,6 +517,7 @@ pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Ve
     rep.undecided = undecided.iter().map(|r| models[r.0].regs[r.1].clone()).collect();
     for m in models {
         rep.unobserved.extend(m.unobserved.iter().cloned());
+        rep.cut.extend(m.cut.iter().cloned());
     }
     rep
 }
@@ -744,6 +759,37 @@ mod tests {
              AND2 a(.A(en),.B({q0}),.Y(c));\nXOR2 x1(.A(c),.B({q1}),.Y(d1));\nDFF {r1}(.CK(clk),.D(d1),.Q({q1}));\n\
              AND2 o(.A({q0}),.B({q1}),.Y(y));\nendmodule\n"
         ))
+    }
+
+    /// 🔑 A latch or a memory macro is cut in the map exactly as `check` cuts it: each output is
+    /// the free variable `inst/<pin>`, shared by INSTANCE name across the designs, whatever its
+    /// output net is called. A clock-gate enable latch, then an SRAM macro (CoralNPU has both)
+    /// used to stop the whole map ("a latch is not modelled", "no single `ff` group") while
+    /// `check` ran the same netlists. With them cut, the renamed register reading them maps by
+    /// proof and each cut cell is listed, never silently assumed. The same cell under another
+    /// instance name is another free input, so the register reading it is NOT mapped: the
+    /// pairing is `check`'s, by name, no more.
+    #[test]
+    fn a_latch_or_memory_is_cut_and_paired_by_instance_name_as_check_does() {
+        let with = |latch: &str, ram: &str, e: &str, m: &str, r: &str, d: &str, q: &str| {
+            nl(&format!(
+                "module t(clk,en,y);\ninput clk,en; output y;\nwire {e},{m},x,{d},{q};\n\
+                 LAT {latch}(.G(clk),.D(en),.Q({e}));\nRAM1 {ram}(.CK(clk),.D(en),.Q({m}));\n\
+                 XOR2 x0(.A({e}),.B({m}),.Y(x));\nXOR2 x1(.A(x),.B({q}),.Y({d}));\n\
+                 DFF {r}(.CK(clk),.D({d}),.Q({q}));\nBUF b(.A({q}),.Y(y));\nendmodule\n"
+            ))
+        };
+        let golden = with("cg_lt", "mem", "e", "m", "r0", "d0", "q0");
+        let rep = map(&golden, &with("cg_lt", "mem", "n5", "n8", "u9", "n6", "n7"));
+        assert_eq!(rep.mapped.get("r0").map(String::as_str), Some("u9"), "{rep:?}");
+        assert!(rep.one_to_one(), "{rep:?}");
+        let cut: Vec<(Side, &str)> = rep.cut.iter().map(|x| (x.side, x.instance.as_str())).collect();
+        assert_eq!(cut, [(Side::Golden, "cg_lt"), (Side::Golden, "mem"), (Side::Revised, "cg_lt"), (Side::Revised, "mem")]);
+        for (latch, ram) in [("other_lt", "mem"), ("cg_lt", "other_mem")] {
+            let rep = map(&golden, &with(latch, ram, "n5", "n8", "u9", "n6", "n7"));
+            assert!(rep.mapped.is_empty(), "{latch}/{ram}: a cell of another name is another input: {rep:?}");
+            assert!(rep.unmatched_golden.contains_key("r0") && rep.unmatched_revised.contains_key("u9"), "{rep:?}");
+        }
     }
 
     /// Two registers renamed (instances AND their nets) map to each other, by proof: the names

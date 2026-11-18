@@ -772,7 +772,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -782,6 +782,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             flags(&rep.unmatched_revised),
             regs(&rep.undecided),
             regs(&rep.unobserved),
+            regs(&rep.cut),
             pairs(&rep.causes),
             pairs(&rep.follows),
             pairs(&rep.unexplained),
@@ -831,6 +832,9 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for x in &rep.unobserved {
             s += &format!("  unobserved  {} {}  (no connected output)\n", side(x.side), x.instance);
+        }
+        for x in &rep.cut {
+            s += &format!("  cut         {} {}  (a latch or memory, cut as check cuts it: paired by instance name, not proved)\n", side(x.side), x.instance);
         }
         if !rep.causes.is_empty() || !rep.follows.is_empty() || !rep.unexplained.is_empty() || rep.attribution_skipped {
             s += &format!(
