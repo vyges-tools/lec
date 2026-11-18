@@ -10,8 +10,9 @@
 //!
 //! 1. [`model`]: each design in the sequential model of [`crate::sec`] (registers are state, one
 //!    clock, every register starting at 0, asynchronous clear and preset acting at the edge).
-//! 2. [`simulate`]: both designs from the all-zero state on the SAME random inputs (each primary
-//!    input by name), 64 runs at once for [`CYCLES`] cycles. A register's signature is its state
+//! 2. [`simulate`]: both designs from the all-zero state on the SAME inputs (each primary input
+//!    by name: random, except the asynchronous-reset inputs, held active and then inactive,
+//!    [`Stimulus`]), 64 runs at once for [`CYCLES`] cycles. A register's signature is its state
 //!    in every run and cycle.
 //! 3. [`candidate_classes`]: registers with one signature form a class, whichever design they
 //!    are in. Two registers that ever differed in simulation are never assumed equal.
@@ -47,7 +48,11 @@ use crate::netlist::Netlist;
 use vyges_loom::liberty_func::Func;
 
 /// Simulated clock cycles; each cycle runs 64 input sequences at once (one per bit).
-pub const CYCLES: usize = 32;
+pub const CYCLES: usize = 128;
+
+/// The first cycles of the simulation hold every asynchronous-reset input ACTIVE; after them
+/// it is held inactive ([`Stimulus`]).
+pub const RESET_CYCLES: usize = 2;
 
 /// Nodes (plus memo entries) one class's next-state BDDs may take before its registers are
 /// reported undecided.
@@ -107,6 +112,9 @@ pub struct MapReport {
     /// Latches and memories cut as `check` cuts them (an output is a free input shared by instance
     /// name), not mapped: the map holds under the assumption that same-named cells hold one value.
     pub cut: Vec<RegName>,
+    /// The asynchronous-reset inputs the simulation held, each with its inactive value
+    /// ([`Stimulus`]).
+    pub reset_inputs: Vec<(String, bool)>,
     pub golden_registers: usize,
     pub revised_registers: usize,
     /// Refinement rounds until nothing split.
@@ -144,12 +152,14 @@ pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Nami
     }
     let (g, r) = (Design::register_model(golden, lib), Design::register_model(revised, lib));
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
-    let sigs = simulate(&[&gm, &rm])?;
+    let stim = Stimulus::of(&[&g, &r]);
+    let sigs = simulate(&[&gm, &rm], &stim)?;
     let mut classes = candidate_classes(&[&gm, &rm], &sigs);
     let candidates = classes.clone();
     let (rounds, undecided) = refine(&[&gm, &rm], &mut classes)?;
     let mut rep = report(&[&gm, &rm], &candidates, &classes, &undecided, rounds);
     attribute(&[&gm, &rm], &sigs, &classes, &mut rep)?;
+    rep.reset_inputs = stim.held.into_iter().collect();
     Ok(rep)
 }
 
@@ -216,6 +226,54 @@ pub(crate) fn model(d: &Design, side: Side, naming: Naming) -> Result<Model, Str
 /// A register across both models: (model index, register index).
 type RegId = (usize, usize);
 
+/// What the simulation drives, the same in every design: each input a random word per cycle,
+/// except the asynchronous-reset inputs (`held`, input -> its inactive value), which are ACTIVE
+/// for [`RESET_CYCLES`] and inactive after.
+///
+/// 🔑 Why: driven at random, a reset input asserts in about half the cycles, and a core behind
+/// a reset synchronizer stays in reset: CoralNPU's registers kept the all-zero signature in 32
+/// cycles, 119,516 of them in one candidate class that no BDD budget held. The stimulus only
+/// proposes candidates; every pair is still proved by `refine`, so it cannot make the map wrong.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Stimulus {
+    pub held: BTreeMap<String, bool>,
+}
+
+impl Stimulus {
+    /// The inputs both designs agree are asynchronous-reset inputs with one inactive value
+    /// ([`Design::reset_inputs`]); one detected in a single design is held too, as the stimulus
+    /// must be the same in both; two designs disagreeing on the inactive value hold neither.
+    pub(crate) fn of(designs: &[&Design]) -> Stimulus {
+        let mut held: BTreeMap<String, bool> = BTreeMap::new();
+        let mut clash = Vec::new();
+        for d in designs {
+            for (k, v) in d.reset_inputs() {
+                match held.get(&k) {
+                    Some(&w) if w != v => clash.push(k),
+                    _ => {
+                        held.insert(k, v);
+                    }
+                }
+            }
+        }
+        for k in clash {
+            held.remove(&k);
+        }
+        Stimulus { held }
+    }
+
+    /// Input `name`'s word in `cycle`.
+    pub(crate) fn word(&self, name: &str, cycle: usize) -> u64 {
+        match self.held.get(name) {
+            Some(&inactive) => {
+                let v = if cycle < RESET_CYCLES { !inactive } else { inactive };
+                if v { !0 } else { 0 }
+            }
+            None => input_word(name, cycle),
+        }
+    }
+}
+
 /// One 64-bit word of input `name` in `cycle`: the same in every design, so two designs see the
 /// same input sequences (splitmix64 over an FNV-1a hash of the name).
 fn input_word(name: &str, cycle: usize) -> u64 {
@@ -271,7 +329,7 @@ fn prim_word(op: Op, pins: &[String], x: &[u64]) -> Result<u64, String> {
 
 /// Stage 2: each register's state in 64 runs over [`CYCLES`] cycles from the all-zero state,
 /// every design on the same inputs. `sigs[m][k]` is model `m`'s register `k`.
-pub(crate) fn simulate(models: &[&Model]) -> Result<Vec<Vec<Vec<u64>>>, String> {
+pub(crate) fn simulate(models: &[&Model], stim: &Stimulus) -> Result<Vec<Vec<Vec<u64>>>, String> {
     let mut out = Vec::new();
     for m in models {
         let c = &m.cone;
@@ -284,7 +342,7 @@ pub(crate) fn simulate(models: &[&Model]) -> Result<Vec<Vec<Vec<u64>>>, String> 
             val.clear();
             // free inputs first, then the states over them (see `next_state_bdds`)
             for (net, var) in &c.free {
-                val.insert(net.as_str(), input_word(var, cycle));
+                val.insert(net.as_str(), stim.word(var, cycle));
             }
             for (k, s) in states.iter().enumerate() {
                 val.insert(s.as_str(), state[k]);
@@ -790,6 +848,46 @@ mod tests {
             assert!(rep.mapped.is_empty(), "{latch}/{ram}: a cell of another name is another input: {rep:?}");
             assert!(rep.unmatched_golden.contains_key("r0") && rep.unmatched_revised.contains_key("u9"), "{rep:?}");
         }
+    }
+
+    /// 🔑 An asynchronous-reset input is found from the Liberty, not its name: forward through
+    /// buffers and inverters only, every pin it reaches is a register's `clear` / `preset` pin,
+    /// and the value that holds them all inactive is the pin's inactive level through the path's
+    /// parity. `rst_n` (to `RESET_B`, clear `!RESET_B`) is inactive at 1; `arst` through an
+    /// inverter to `RESET_B` is inactive at 0. An input that also reaches a data pin (`en`), one
+    /// that passes other logic (`gated`), and the clock are not reset inputs.
+    #[test]
+    fn async_reset_inputs_are_found_from_clear_and_preset_pins() {
+        let n = nl("module t(clk,rst_n,arst,en,gated,d,q0,q1,q2,q3);\ninput clk,rst_n,arst,en,gated,d; output q0,q1,q2,q3;\nwire b,na,x;\n\
+             BUF bb(.A(rst_n),.Y(b));\nDFR r0(.CK(clk),.D(d),.RESET_B(b),.Q(q0));\n\
+             INV ia(.A(arst),.Y(na));\nDFR r1(.CK(clk),.D(d),.RESET_B(na),.Q(q1));\n\
+             DFS r2(.CK(clk),.D(en),.SET_B(en),.Q(q2));\n\
+             AND2 g(.A(gated),.B(d),.Y(x));\nDFR r3(.CK(clk),.D(d),.RESET_B(x),.Q(q3));\nendmodule\n");
+        let l = lib();
+        let d = Design::sequential(&n, &l);
+        let found: Vec<(String, bool)> = d.reset_inputs().into_iter().collect();
+        assert_eq!(found, [("arst".to_string(), false), ("rst_n".to_string(), true)]);
+    }
+
+    /// The stimulus is the same in both designs: a held reset input is ACTIVE for
+    /// [`RESET_CYCLES`] and inactive after, every other input random per name and cycle; an
+    /// input two designs hold at different inactive values is not held at all.
+    #[test]
+    fn the_stimulus_holds_reset_inputs_active_then_inactive() {
+        let st = Stimulus { held: [("rst_n".to_string(), true)].into_iter().collect() };
+        for c in 0..RESET_CYCLES {
+            assert_eq!(st.word("rst_n", c), 0, "active (low) in cycle {c}");
+        }
+        for c in RESET_CYCLES..CYCLES {
+            assert_eq!(st.word("rst_n", c), !0, "inactive in cycle {c}");
+        }
+        assert_eq!(st.word("en", 7), input_word("en", 7));
+        let l = lib();
+        let low = nl("module t(clk,r,d,q);\ninput clk,r,d; output q;\nDFR u(.CK(clk),.D(d),.RESET_B(r),.Q(q));\nendmodule\n");
+        let high = nl("module t(clk,r,d,q);\ninput clk,r,d; output q;\nwire n;\nINV i(.A(r),.Y(n));\nDFR u(.CK(clk),.D(d),.RESET_B(n),.Q(q));\nendmodule\n");
+        let (a, b) = (Design::sequential(&low, &l), Design::sequential(&high, &l));
+        assert_eq!(Stimulus::of(&[&a, &a]).held.get("r"), Some(&true));
+        assert!(Stimulus::of(&[&a, &b]).held.is_empty(), "the designs disagree: not held");
     }
 
     /// A gated-clock design: `r` on `clk` gated by `gate` (the netlist text making `gclk`), with

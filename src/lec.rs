@@ -548,6 +548,88 @@ impl<'a> Design<'a> {
         Ok((root, gates))
     }
 
+    /// The primary inputs that only ever reach registers' asynchronous clear or preset pins, each
+    /// with the value that holds every one of them INACTIVE (the register map's stimulus,
+    /// [`crate::map`]; never a modelling assumption).
+    ///
+    /// 🔑 Detected from the Liberty and the netlist, never from a name: from the input, forward
+    /// through buffers and inverters only (a cell whose function is one input pin, or its
+    /// negation), every pin reached must be a pin of a register's `ff` group's `clear` or
+    /// `preset`, and that expression must be the pin or its negation (active high or low). The
+    /// inactive value at the input is the pin's inactive level through the path's parity, and all
+    /// pins must agree. Anything else reached (a data, clock or enable pin, other logic, a latch, a
+    /// memory, a primary output, a pin with a compound clear) disqualifies the input.
+    pub(crate) fn reset_inputs(&self) -> BTreeMap<String, bool> {
+        let mut readers: HashMap<&str, Vec<(usize, &str)>> = HashMap::new();
+        for (i, inst) in self.nl.insts.iter().enumerate() {
+            let Some(cell) = self.lib.cells.get(&inst.cell) else { continue };
+            for (pin, net) in &inst.conns {
+                if cell.pins.get(pin).map(|p| p.direction) == Some(Dir::In) {
+                    let net = self.alias.get(net.as_str()).copied().unwrap_or(net.as_str());
+                    readers.entry(net).or_default().push((i, pin.as_str()));
+                }
+            }
+        }
+        let outputs: BTreeSet<&str> = self.nl.outputs.iter().map(|o| self.alias.get(o.as_str()).copied().unwrap_or(o.as_str())).collect();
+        let mut out = BTreeMap::new();
+        'input: for pi in &self.nl.inputs {
+            let mut inactive: Option<bool> = None;
+            let mut seen = BTreeSet::new();
+            let mut stack: Vec<(&str, bool)> = vec![(pi.as_str(), false)];
+            while let Some((net, flip)) = stack.pop() {
+                if !seen.insert((net, flip)) {
+                    continue;
+                }
+                if outputs.contains(net) {
+                    continue 'input;
+                }
+                for &(i, pin) in readers.get(net).map(Vec::as_slice).unwrap_or(&[]) {
+                    let inst = &self.nl.insts[i];
+                    let cell = &self.lib.cells[&inst.cell];
+                    if cell.is_seq {
+                        let Some(g) = cell.seq_group.as_ref().filter(|g| !g.latch) else { continue 'input };
+                        let ins: Vec<&str> = cell.pins.iter().filter(|(_, x)| x.direction == Dir::In).map(|(n, _)| n.as_str()).collect();
+                        let mut level = None;
+                        for key in ["clear", "preset"] {
+                            let Some(e) = g.attrs.get(key) else { continue };
+                            match Func::parse_in(e, |x| ins.contains(&x)) {
+                                Some(Func::Port(p)) if p == pin => level = Some(true),
+                                Some(Func::Not(b)) if matches!(&*b, Func::Port(p) if p == pin) => level = Some(false),
+                                Some(f) if f.ports().contains(&pin) => continue 'input,
+                                _ => {}
+                            }
+                        }
+                        // the input's value that holds this pin inactive
+                        let Some(active) = level else { continue 'input };
+                        let v = !active ^ flip;
+                        if *inactive.get_or_insert(v) != v {
+                            continue 'input;
+                        }
+                        continue;
+                    }
+                    let Some(out_pin) = cell.pins.iter().find(|(_, x)| x.direction == Dir::Out).map(|(n, _)| n.as_str()) else { continue 'input };
+                    let flip2 = match logic_of(inst, cell, out_pin) {
+                        Ok((Logic::Func(Func::Port(p)), _)) if p == pin => flip,
+                        Ok((Logic::Func(Func::Not(b)), _)) if matches!(&*b, Func::Port(p) if p == pin) => !flip,
+                        Ok((Logic::Prim(Op::Buf), pins)) if pins.len() == 1 => flip,
+                        Ok((Logic::Prim(Op::Not), pins)) if pins.len() == 1 => !flip,
+                        _ => continue 'input,
+                    };
+                    if cell.pins.iter().filter(|(_, x)| x.direction == Dir::Out).count() != 1 {
+                        continue 'input;
+                    }
+                    if let Some(n) = net_of(inst, out_pin) {
+                        stack.push((self.alias.get(n).copied().unwrap_or(n), flip2));
+                    }
+                }
+            }
+            if let Some(v) = inactive {
+                out.insert(pi.clone(), v);
+            }
+        }
+        out
+    }
+
     /// The latch whose stored value (not its complement) drives `net`, by instance index.
     fn enable_latch(&self, net: &str) -> Option<usize> {
         let &(i, out) = self.driver.get(net)?;
