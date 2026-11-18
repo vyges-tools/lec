@@ -501,6 +501,10 @@ pub(crate) enum Key {
 /// class's memory well under the box budget whatever its size.
 pub const CANON_LIMIT: usize = 1 << 28;
 
+/// Builds member `i` of a class into the given manager, numbering variables through the given
+/// name map; `None` when the manager is exhausted.
+pub(crate) type BuildMember<'a> = dyn FnMut(usize, &mut Bdd, &mut dyn FnMut(&mut Bdd, &str) -> u32) -> Result<Option<u32>, String> + 'a;
+
 /// [`next_keys`] over any member builder, so the chunk rule is testable on its own.
 ///
 /// 🔑 The chunk rule: members are built in order into one manager of `limit`; when a member
@@ -512,7 +516,7 @@ pub const CANON_LIMIT: usize = 1 << 28;
 pub(crate) fn chunked_keys(
     n: usize,
     limit: usize,
-    build: &mut dyn FnMut(usize, &mut Bdd, &mut dyn FnMut(&mut Bdd, &str) -> u32) -> Result<Option<u32>, String>,
+    build: &mut BuildMember<'_>,
 ) -> Result<(Vec<Option<Key>>, usize), String> {
     let mut names: HashMap<String, u32> = HashMap::new();
     let mut keys: Vec<Option<Key>> = vec![None; n];
