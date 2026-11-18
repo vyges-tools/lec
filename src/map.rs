@@ -792,6 +792,86 @@ mod tests {
         }
     }
 
+    /// A gated-clock design: `r` on `clk` gated by `gate` (the netlist text making `gclk`), with
+    /// data `d`, against a plain enable register `u` on `clk` behind a hold mux selected by `en`.
+    fn gated(gate: &str) -> (Netlist, Netlist) {
+        let g = nl(&format!(
+            "module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire le,gclk,s;\n{gate}\nDFF r(.CK(gclk),.D(d),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n"
+        ));
+        let m = nl("module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire n,s;\n\
+             MUX2 m(.A0(s),.A1(d),.S(en),.Y(n));\nDFF u(.CK(clk),.D(n),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n");
+        (g, m)
+    }
+    const LATCH_AND: &str = "LATN l(.G(clk),.D(en),.Q(le));\nAND2 g(.A(clk),.B(le),.Y(gclk));";
+
+    /// 🔑 The standard clock gate: an enable latch transparent while the clock is LOW, ANDed with
+    /// the clock. At the clock's rising edge the latch holds its D, and the gated clock rises iff
+    /// it is 1, so the register loads `en ? D : state`: the same state as an enable register
+    /// behind a hold mux, MAPPED by proof. The library clock-gate cell
+    /// (`clock_gating_integrated_cell : latch_posedge*`, its non-clock inputs ORed) is the same
+    /// gate; with test enable `se` held 0 it maps the same way, and with `se` free it is
+    /// `en | se`, which the mux on `en` alone is not.
+    #[test]
+    fn a_register_behind_the_standard_clock_gate_loads_under_its_enable() {
+        let (g, m) = gated(LATCH_AND);
+        let rep = map(&g, &m);
+        assert_eq!(rep.mapped.get("r").map(String::as_str), Some("u"), "{rep:?}");
+        assert!(rep.one_to_one(), "{rep:?}");
+        assert_eq!(rep.cut.iter().map(|x| x.instance.as_str()).collect::<Vec<_>>(), ["l"]);
+        let (g, _) = gated("ICG c(.CK(clk),.E(en),.SE(1'b0),.GCK(gclk));");
+        assert_eq!(map(&g, &m).mapped.get("r").map(String::as_str), Some("u"));
+        let (g, _) = gated("ICG c(.CK(clk),.E(en),.SE(se),.GCK(gclk));");
+        assert!(map(&g, &m).mapped.is_empty(), "the test enable gates the clock too");
+        // the enable is not ignored: an ungated register never maps to the hold register
+        let plain = nl("module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire s;\n\
+             DFF r(.CK(clk),.D(d),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n");
+        assert!(map(&plain, &m).mapped.is_empty());
+    }
+
+    /// Two gates in a row (an outer gate whose output clocks the inner gate's latch) as a chain
+    /// of ANDs against one AND3 of the clock and both latches: one gate, `en1 & en2`. A latch on
+    /// a gated clock that the register's gate does not also gate may open while the gated clock
+    /// is high, and is refused.
+    #[test]
+    fn nested_clock_gates_are_one_enable_and_an_unsafe_latch_is_refused() {
+        let outer = "LATN l1(.G(clk),.D(en),.Q(e1));\nAND2 g1(.A(clk),.B(e1),.Y(c1));\nLATN l2(.G(c1),.D(se),.Q(e2));";
+        let with = |gate: &str| {
+            nl(&format!(
+                "module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire e1,e2,c1,gclk,s;\n{outer}\n{gate}\n\
+                 DFF r(.CK(gclk),.D(d),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n"
+            ))
+        };
+        let chain = with("AND2 g2(.A(c1),.B(e2),.Y(gclk));");
+        let and3 = with("AND3 g2(.A(clk),.B(e1),.C(e2),.Y(gclk));");
+        let rep = map(&chain, &and3);
+        assert_eq!(rep.mapped.get("r").map(String::as_str), Some("r"), "{rep:?}");
+        let mux = nl("module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire k,n,s;\n\
+             AND2 a(.A(en),.B(se),.Y(k));\nMUX2 m(.A0(s),.A1(d),.S(k),.Y(n));\nDFF u(.CK(clk),.D(n),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n");
+        assert_eq!(map(&chain, &mux).mapped.get("r").map(String::as_str), Some("u"));
+        let unsafe_ = with("AND2 g2(.A(clk),.B(e2),.Y(gclk));");
+        let e = register_map(&unsafe_, &and3, &lib(), (Naming::Instance, Naming::Instance)).unwrap_err();
+        assert!(e.contains("may open while the gated clock is high"), "{e}");
+    }
+
+    /// ⛔ Anything else on a clock path is refused, by name: a latch open on the HIGH phase (it
+    /// would pass a new enable while the clock is high: a glitch), an inverter, other logic, a
+    /// clock-gate cell latched on the falling edge.
+    #[test]
+    fn any_other_clock_structure_is_refused_by_name() {
+        let (_, m) = gated(LATCH_AND);
+        for (gate, says) in [
+            ("LAT l(.G(clk),.D(en),.Q(le));\nAND2 g(.A(clk),.B(le),.Y(gclk));", "not while its clock is low"),
+            ("INV g(.A(clk),.Y(gclk));", "an inverter"),
+            ("OR2 g(.A(clk),.B(en),.Y(gclk));", "not an AND"),
+            ("AND2 g(.A(clk),.B(en),.Y(gclk));", "an AND of two clocks"),
+            ("ICGN c(.CK(clk),.E(en),.GCK(gclk));", "latch_negedge"),
+        ] {
+            let (g, _) = gated(gate);
+            let e = register_map(&g, &m, &lib(), (Naming::Instance, Naming::Instance)).unwrap_err();
+            assert!(e.contains(says), "{gate}: {e}");
+        }
+    }
+
     /// Two registers renamed (instances AND their nets) map to each other, by proof: the names
     /// share nothing.
     #[test]

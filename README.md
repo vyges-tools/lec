@@ -189,6 +189,11 @@ What is not in the map is reported, with why:
   not map;
 - `undecided`: the class's BDDs outgrew the node budget;
 - `unobserved`: a register with no connected output;
+- clock gates: `map` models the standard clock gate, an enable latch transparent while the clock
+  is low ANDed with the clock (nested gates too), or a `latch_posedge` clock-gate cell. A register
+  behind it loads its next value when the latched enable is 1 and holds otherwise. Any other
+  structure on a clock path (an inverter, other logic, a high-phase latch) is refused with a
+  message naming it; `sec` and `prove` refuse every gated clock;
 - `cut`: a latch (a clock-gate enable latch, say) or a memory macro is not a register of the map.
   It is cut as `check` cuts every register: its outputs are free inputs shared by instance name,
   so the map holds under `check`'s own assumption that two such cells of one name hold one value.

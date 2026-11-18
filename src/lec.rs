@@ -230,6 +230,39 @@ pub(crate) fn outside_edge_model(cell: &Cell) -> bool {
     cell.is_seq && cell.seq_group.as_ref().is_none_or(|g| g.latch)
 }
 
+/// A cell whose one state group is a `latch`.
+fn is_latch(cell: &Cell) -> bool {
+    cell.seq_group.as_ref().is_some_and(|g| g.latch)
+}
+
+/// Is `logic` the AND of all of `pins`, each once (an AND primitive, or a `function` that is an
+/// AND tree of the pins)?
+fn is_and_of(logic: &Logic, pins: &[String]) -> bool {
+    fn leaves<'f>(f: &'f Func, out: &mut Vec<&'f str>) -> bool {
+        match f {
+            Func::Port(p) => {
+                out.push(p);
+                true
+            }
+            Func::And(a, b) => leaves(a, out) && leaves(b, out),
+            _ => false,
+        }
+    }
+    match logic {
+        Logic::Prim(op) => *op == Op::And && pins.len() >= 2,
+        Logic::Func(f) => {
+            let mut v = Vec::new();
+            if !leaves(f, &mut v) || v.len() < 2 {
+                return false;
+            }
+            v.sort_unstable();
+            let n = v.len();
+            v.dedup();
+            v.len() == n && v.len() == pins.len() && pins.iter().all(|p| v.contains(&p.as_str()))
+        }
+    }
+}
+
 impl<'a> Design<'a> {
     pub(crate) fn new(nl: &'a Netlist, lib: &'a Lib) -> Design<'a> {
         let mut driver = BTreeMap::new();
@@ -389,6 +422,165 @@ impl<'a> Design<'a> {
                 inst.name
             ))
         }
+    }
+
+    /// The register map's clock model ([`Design::register_model`] only): the primary input a
+    /// register's clock pin reaches, and the clock gates on the way (instance indices). A gate is
+    /// one of exactly two structures, both the standard integrated clock gate:
+    ///
+    /// - an AND (a cell whose logic is the AND of its inputs) of ONE clock and the stored-value
+    ///   outputs of enable latches, each latch transparent while its own clock is LOW (`enable`
+    ///   `!<pin>`), its clock on the same root and gated by nothing this gate does not also gate;
+    /// - a library clock-gate cell whose `clock_gating_integrated_cell` is `latch_posedge`
+    ///   (`_precontrol` / `_postcontrol`): its `clock : true` pin is the clock and its other
+    ///   inputs (enable and test enable) are ORed into the latched enable.
+    ///
+    /// 🔑 Why a register behind such gates loads `en ? next : state` at the root's rising edge:
+    /// the root is low just before the edge, every gated clock on it is then low too, so every
+    /// enable latch is transparent and holds its D at the edge; the gated clock rises with the
+    /// root iff every latch holds 1. During the high phase a latch whose own clock is gated off may
+    /// open, but the gate's other enable is then 0, so the output cannot glitch.
+    ///
+    /// ⛔ Anything else on a clock path (an inverter, other logic, an AND of two clocks, a latch
+    /// open on the high phase, a register output, a negedge clock-gate cell) is refused with a
+    /// message naming it. `sec` and `prove` keep [`Design::clock_root`]: they refuse every gate.
+    pub(crate) fn clock_path(&self, inst: &Inst, pin: &str) -> Result<(String, Vec<usize>), String> {
+        let net = match src_of(inst, pin)? {
+            Src::Net(n) => n,
+            Src::Const(_) => return Err(format!("register `{}`: clock pin `{pin}` is tied to a constant", inst.name)),
+        };
+        let (root, mut gates) = self.trace_clock(&inst.name, &net, &mut BTreeSet::new())?;
+        let mut seen = BTreeSet::new();
+        gates.retain(|g| seen.insert(*g));
+        Ok((root, gates))
+    }
+
+    fn trace_clock(&self, reg: &str, net: &str, seen: &mut BTreeSet<String>) -> Result<(String, Vec<usize>), String> {
+        let net = self.alias.get(net).copied().unwrap_or(net);
+        if self.nl.inputs.iter().any(|p| p == net) {
+            return Ok((net.to_string(), Vec::new()));
+        }
+        if !seen.insert(net.to_string()) {
+            return Err(format!("register `{reg}`: its clock path loops at `{net}`"));
+        }
+        let Some(&(i, out)) = self.driver.get(net) else {
+            return Err(format!("register `{reg}`: its clock reaches net `{net}`, which is neither a primary input nor driven"));
+        };
+        let b = &self.nl.insts[i];
+        let cell = &self.lib.cells[&b.cell];
+        let refuse = |what: &str| {
+            format!(
+                "register `{reg}`: its clock passes {what} (`{}`, {}) at net `{net}`; only buffers and the standard clock gate (a low-phase enable latch ANDed with the clock, or a latch_posedge clock-gate cell) are modelled",
+                b.name, b.cell
+            )
+        };
+        let src = |p: &str| -> Result<String, String> {
+            match src_of(b, p)? {
+                Src::Net(n) => Ok(self.alias.get(n.as_str()).map(|s| s.to_string()).unwrap_or(n)),
+                Src::Const(_) => Err(refuse(&format!("a gate with input `{p}` tied to a constant"))),
+            }
+        };
+        if let Some(kind) = &cell.clock_gating {
+            if !matches!(kind.as_str(), "latch_posedge" | "latch_posedge_precontrol" | "latch_posedge_postcontrol") {
+                return Err(refuse(&format!("a clock-gate cell of type `{kind}`")));
+            }
+            let Some(ck) = cell.clock_pin.as_deref() else { return Err(refuse("a clock-gate cell with no clock pin")) };
+            let (root, mut gates) = self.trace_clock(reg, &src(ck)?, seen)?;
+            gates.push(i);
+            return Ok((root, gates));
+        }
+        if cell.is_seq {
+            return Err(refuse(if is_latch(cell) { "a latch output" } else { "a register output (a generated clock)" }));
+        }
+        let (logic, pins) = logic_of(b, cell, out)?;
+        match &logic {
+            Logic::Func(Func::Port(p)) => return self.trace_clock(reg, &src(p)?, seen),
+            Logic::Prim(Op::Buf) if pins.len() == 1 => return self.trace_clock(reg, &src(&pins[0])?, seen),
+            Logic::Func(Func::Not(_)) | Logic::Prim(Op::Not) => return Err(refuse("an inverter")),
+            _ if !is_and_of(&logic, &pins) => return Err(refuse("a logic gate that is not an AND")),
+            _ => {}
+        }
+        // an AND: one clock, the rest enable latches
+        let (mut clock, mut latches) = (None, Vec::new());
+        for p in &pins {
+            let n = src(p)?;
+            match self.enable_latch(&n) {
+                Some(l) => latches.push(l),
+                None if clock.is_none() => clock = Some(n),
+                None => return Err(refuse("an AND of two clocks (or of a clock and logic)")),
+            }
+        }
+        let Some(clock) = clock else { return Err(refuse("an AND of enable latches with no clock")) };
+        let (root, mut gates) = self.trace_clock(reg, &clock, seen)?;
+        let mut allowed: BTreeSet<usize> = gates.iter().copied().collect();
+        allowed.extend(latches.iter().copied());
+        for &l in &latches {
+            let li = &self.nl.insts[l];
+            let lc = &self.lib.cells[&li.cell];
+            let g = lc.seq_group.as_ref().expect("enable_latch checks the group");
+            let ins: Vec<&str> = lc.pins.iter().filter(|(_, x)| x.direction == Dir::In).map(|(n, _)| n.as_str()).collect();
+            let en = g.attrs.get("enable").map(String::as_str).unwrap_or("");
+            let Some(Func::Not(e)) = Func::parse_in(en, |x| ins.contains(&x)) else {
+                return Err(format!(
+                    "register `{reg}`: clock-gate latch `{}` ({}) is transparent on `{en}`, not while its clock is low; only a low-phase enable latch gates a clock",
+                    li.name, li.cell
+                ));
+            };
+            let Func::Port(ep) = *e else {
+                return Err(format!("register `{reg}`: clock-gate latch `{}` ({}) has enable `{en}`, not one pin's low phase", li.name, li.cell));
+            };
+            let lnet = match src_of(li, &ep)? {
+                Src::Net(n) => n,
+                Src::Const(_) => return Err(format!("register `{reg}`: clock-gate latch `{}`: its enable pin is tied to a constant", li.name)),
+            };
+            let (lroot, lgates) = self.trace_clock(reg, &lnet, &mut BTreeSet::new())?;
+            if lroot != root {
+                return Err(format!("register `{reg}`: clock-gate latch `{}` is clocked by `{lroot}`, the gate by `{root}`", li.name));
+            }
+            if let Some(x) = lgates.iter().find(|x| !allowed.contains(x)) {
+                return Err(format!(
+                    "register `{reg}`: clock-gate latch `{}` is gated by `{}`, which does not gate its clock gate: it may open while the gated clock is high",
+                    li.name, self.nl.insts[*x].name
+                ));
+            }
+            gates.push(l);
+        }
+        Ok((root, gates))
+    }
+
+    /// The latch whose stored value (not its complement) drives `net`, by instance index.
+    fn enable_latch(&self, net: &str) -> Option<usize> {
+        let &(i, out) = self.driver.get(net)?;
+        let cell = self.lib.cells.get(&self.nl.insts[i].cell)?;
+        let g = cell.seq_group.as_ref().filter(|g| g.latch)?;
+        (cell.pins.get(out)?.function.as_deref().map(str::trim) == Some(g.iq.as_str())).then_some(i)
+    }
+
+    /// The enable clock gate `gate` (an instance index from [`Design::clock_path`]) latches: a
+    /// latch's `data_in`, a clock-gate cell's enable inputs ORed. As a `function` over its pins,
+    /// with the pins it reads and their sources.
+    pub(crate) fn gate_enable(&self, gate: usize) -> Result<(Func, Vec<String>, Vec<Src>), String> {
+        let b = &self.nl.insts[gate];
+        let cell = &self.lib.cells[&b.cell];
+        let ins: Vec<&str> = cell.pins.iter().filter(|(_, x)| x.direction == Dir::In).map(|(n, _)| n.as_str()).collect();
+        let f = match cell.seq_group.as_ref().filter(|g| g.latch && cell.clock_gating.is_none()) {
+            Some(g) => {
+                let d = g.attrs.get("data_in").ok_or_else(|| format!("clock-gate latch `{}` ({}): no `data_in`", b.name, b.cell))?;
+                Func::parse_in(d, |x| ins.contains(&x))
+                    .ok_or_else(|| format!("clock-gate latch `{}` ({}): `data_in` `{d}` does not parse over its input pins", b.name, b.cell))?
+            }
+            None => ins
+                .iter()
+                .filter(|p| cell.clock_pin.as_deref() != Some(**p))
+                .map(|p| Func::Port(p.to_string()))
+                .reduce(|a, x| Func::Or(Box::new(a), Box::new(x)))
+                .ok_or_else(|| format!("clock-gate cell `{}` ({}): no enable input", b.name, b.cell))?,
+        };
+        let mut pins: Vec<String> = f.ports().into_iter().map(str::to_string).collect();
+        pins.sort();
+        pins.dedup();
+        let srcs = pins.iter().map(|p| src_of(b, p)).collect::<Result<_, _>>()?;
+        Ok((f, pins, srcs))
     }
 
     /// Endpoints to compare, as (key, net): primary outputs by port name, flop data pins
@@ -743,6 +935,15 @@ pub(crate) fn next_net(inst: &str) -> String {
 /// The stored value in a register's expressions: a name no pin can have.
 const STATE: &str = "<state>";
 
+/// In a gated register's expressions, `<gate> <net>` reads the net `<net>` (a clock gate's
+/// enable, [`gate_net`]) rather than a pin: a name no pin can have.
+const GATE: &str = "<gate> ";
+
+/// The signal holding what clock gate `inst` latches (its enable at the clock edge).
+pub(crate) fn gate_net(inst: &str) -> String {
+    format!("{inst} <enable>")
+}
+
 /// Collect the cone of `endpoints` with exactly `build`'s rules: the same free-input test, the
 /// same cell-to-primitive map, the same input pins, the same errors.
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]
@@ -771,8 +972,37 @@ pub(crate) fn seq_cone(d: &Design, endpoints: &[String]) -> Result<Cone, String>
     while k < c.regs.len() {
         let inst = &d.nl.insts[index[c.regs[k].as_str()]];
         k += 1;
-        let reg = Reg::of(inst, &d.lib.cells[&inst.cell])?;
-        c.clocks.insert(d.clock_root(inst, &reg.clock)?);
+        let cell = &d.lib.cells[&inst.cell];
+        let mut reg = Reg::of(inst, cell, None)?;
+        if d.cut_outside {
+            // the register map: a register behind clock gates loads `en ? next : state`, `en` the
+            // AND of what each gate latches ([`Design::clock_path`])
+            let (root, gates) = d.clock_path(inst, &reg.clock)?;
+            c.clocks.insert(root);
+            let mut en: Option<Func> = None;
+            for g in gates {
+                let net = gate_net(&d.nl.insts[g].name);
+                if done.insert(net.clone()) {
+                    let (f, pins, ins) = d.gate_enable(g)?;
+                    for src in &ins {
+                        if let Src::Net(n) = src {
+                            collect(n, d, &mut c, &mut done, &mut BTreeSet::new())?;
+                        }
+                    }
+                    c.gates.push(Gate { out: net.clone(), logic: Logic::Func(f), pins, ins });
+                }
+                let p = Func::Port(format!("{GATE}{net}"));
+                en = Some(match en {
+                    Some(e) => Func::And(Box::new(e), Box::new(p)),
+                    None => p,
+                });
+            }
+            if en.is_some() {
+                reg = Reg::of(inst, cell, en.as_ref())?;
+            }
+        } else {
+            c.clocks.insert(d.clock_root(inst, &reg.clock)?);
+        }
         let (pins, ins) = reg.reads(inst, &reg.next)?;
         for src in &ins {
             if let Src::Net(n) = src {
@@ -820,7 +1050,9 @@ fn subst(f: &Func, by: &dyn Fn(&str) -> Option<Func>) -> Func {
 }
 
 impl Reg {
-    fn of(inst: &Inst, cell: &Cell) -> Result<Reg, String> {
+    /// `gate`: the clock-gate enable (over [`GATE`] names) a gated register loads under; it holds
+    /// its state otherwise. Clear and preset still act: they do not wait for the clock.
+    fn of(inst: &Inst, cell: &Cell, gate: Option<&Func>) -> Result<Reg, String> {
         let what = || format!("register `{}` ({})", inst.name, inst.cell);
         let g = cell.seq_group.as_ref().ok_or_else(|| format!("{}: no single `ff` group to model (a bank or a `statetable`)", what()))?;
         if g.latch {
@@ -849,7 +1081,7 @@ impl Reg {
             let e = g.attrs.get("next_state").ok_or_else(|| format!("{}: its `ff` has no `next_state`", what()))?;
             let f = Func::parse_in(e, |p| inputs.contains(&p) || p == g.iq || p == g.iqn)
                 .ok_or_else(|| format!("{}: `next_state` `{e}` does not parse over its input pins and state variables", what()))?;
-            subst(&f, &|p| {
+            let f = subst(&f, &|p| {
                 if p == g.iq {
                     Some(state.clone())
                 } else if p == g.iqn {
@@ -857,7 +1089,11 @@ impl Reg {
                 } else {
                     None
                 }
-            })
+            });
+            match gate {
+                Some(en) => ite(en, f, state.clone()),
+                None => f,
+            }
         };
         let (clear, preset) = (parse("clear")?, parse("preset")?);
         // the value under clear / preset (one of them, or neither), else `normal`
@@ -923,7 +1159,11 @@ impl Reg {
         pins.dedup();
         let ins = pins
             .iter()
-            .map(|p| if p == STATE { Ok(Src::Net(state_net(&inst.name))) } else { src_of(inst, p) })
+            .map(|p| match p.strip_prefix(GATE) {
+                _ if p == STATE => Ok(Src::Net(state_net(&inst.name))),
+                Some(net) => Ok(Src::Net(net.to_string())),
+                None => src_of(inst, p),
+            })
             .collect::<Result<_, _>>()?;
         Ok((pins, ins))
     }
@@ -981,7 +1221,7 @@ fn collect(
         if !c.regs.contains(&inst.name) {
             c.regs.push(inst.name.clone());
         }
-        let reg = Reg::of(inst, cell)?;
+        let reg = Reg::of(inst, cell, None)?;
         let f = reg.output(inst, cell, out_pin)?;
         let (pins, ins) = reg.reads(inst, &f)?;
         for src in &ins {
