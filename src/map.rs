@@ -50,6 +50,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use rustc_hash::{FxHashMap, FxHashSet};
+
 use crate::bdd::Bdd;
 use crate::lec::{apply_op, func_bdd, gate_of, next_net, outside_edge_model, seq_cone, state_net, Cone, Design, Logic, Op, Src};
 use crate::liberty::{Dir, Lib};
@@ -192,9 +194,9 @@ pub(crate) struct Model {
     /// Registers in cone order (`cone.regs`), each with its map name.
     regs: Vec<RegName>,
     /// Gate index by the net it drives.
-    gate: HashMap<String, usize>,
+    gate: FxHashMap<String, usize>,
     /// Every register's state net ([`state_net`]).
-    state: HashSet<String>,
+    state: FxHashSet<String>,
     unobserved: Vec<RegName>,
     /// Latches and memories the model cut ([`Design::register_model`]), in netlist order.
     cut: Vec<RegName>,
@@ -496,7 +498,7 @@ fn next_state_bdds(
             }
         }
     }
-    let mut f: HashMap<&str, u32> = HashMap::new();
+    let mut f: FxHashMap<&str, u32> = FxHashMap::default();
     for (k, g) in c.gates.iter().enumerate().filter(|(k, _)| need[*k]) {
         let mut ins = Vec::with_capacity(g.ins.len());
         for s in &g.ins {
@@ -568,7 +570,7 @@ pub(crate) fn chunked_keys(
     limit: usize,
     build: &mut BuildMember<'_>,
 ) -> Result<(Vec<Option<Key>>, usize), String> {
-    let mut names: HashMap<String, u32> = HashMap::new();
+    let mut names: FxHashMap<String, u32> = FxHashMap::default();
     let mut keys: Vec<Option<Key>> = vec![None; n];
     let mut bdd = Bdd::with_limit(limit);
     let (mut managers, mut kept) = (1, 0usize);
@@ -647,10 +649,10 @@ fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[ClassOf]) -> Res
 
 /// Each register's class, by its state net, per model.
 /// A register's class and its polarity in it, by its state net.
-type ClassOf = HashMap<String, (usize, bool)>;
+type ClassOf = FxHashMap<String, (usize, bool)>;
 
 fn class_index(models: &[&Model], classes: &[Vec<RegId>], inv: &dyn Fn(RegId) -> bool) -> Vec<ClassOf> {
-    let mut class_of: Vec<ClassOf> = vec![HashMap::new(); models.len()];
+    let mut class_of: Vec<ClassOf> = vec![FxHashMap::default(); models.len()];
     for (ci, cl) in classes.iter().enumerate() {
         for &(m, k) in cl {
             class_of[m].insert(state_net(&models[m].regs[k].instance), (ci, inv((m, k))));

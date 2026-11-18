@@ -11,7 +11,7 @@
 //! wrappers, all memoized. `sat_one` extracts a satisfying assignment (a
 //! counter-example) when two functions differ.
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 const FALSE: u32 = 0;
 const TRUE: u32 = 1;
@@ -26,8 +26,10 @@ struct Node {
 
 pub struct Bdd {
     nodes: Vec<Node>,
-    unique: HashMap<Node, u32>,
-    ite_memo: HashMap<(u32, u32, u32), u32>,
+    // ⛔ FxHash (deterministic, no random seed): these tables are only looked up, never iterated,
+    // so no output depends on their order; SipHash was over half the time of a large map.
+    unique: FxHashMap<Node, u32>,
+    ite_memo: FxHashMap<(u32, u32, u32), u32>,
     /// A budget on nodes plus memo entries; once spent, every operation returns at
     /// once with a meaningless result and `exhausted()` is true.
     limit: Option<usize>,
@@ -57,8 +59,8 @@ impl Bdd {
         ];
         Bdd {
             nodes,
-            unique: HashMap::new(),
-            ite_memo: HashMap::new(),
+            unique: FxHashMap::default(),
+            ite_memo: FxHashMap::default(),
             limit: None,
             exhausted: false,
         }
@@ -232,7 +234,7 @@ impl Bdd {
         if Self::is_term(f) {
             return vec![f];
         }
-        let mut id: HashMap<u32, u32> = HashMap::from([(FALSE, FALSE), (TRUE, TRUE)]);
+        let mut id: FxHashMap<u32, u32> = [(FALSE, FALSE), (TRUE, TRUE)].into_iter().collect();
         let mut out = Vec::new();
         let mut stack = vec![(f, false)];
         while let Some((n, expanded)) = stack.pop() {

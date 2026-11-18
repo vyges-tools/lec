@@ -8,7 +8,7 @@ authors = ["Vyges <https://vyges.com/contact>"]
 homepage = "https://vyges.com"
 repository = "https://github.com/vyges-tools/lec"
 
-# No third-party deps (builds/tests offline) — the ROBDD package is in-tree. The
+# Few third-party deps (builds/tests offline) — the ROBDD package is in-tree. The
 # netlist / Liberty parsers come from the shared vyges-loom foundation.
 [dependencies]
 vyges-loom = { git = "https://github.com/vyges-tools/loom", branch = "main" }
@@ -17,6 +17,9 @@ vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main",
 # The ABC engine (`--engine abc|both`). Optional: it links a prebuilt ABC archive, which the default
 # std-only, offline build does not need.
 vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main", optional = true }
+# FxHash for the BDD tables and the register map's lookup tables: deterministic (no random seed), and
+# those tables are only looked up, never iterated. Pinned exactly; no dependencies of its own.
+rustc-hash = { version = "=2.1.1", default-features = false, features = ["std"] }
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
 # (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and
