@@ -223,6 +223,35 @@ impl Bdd {
     pub fn node_count(&self) -> usize {
         self.nodes.len()
     }
+
+    /// `f` as a manager-independent value: its reduced graph listed bottom up (lo before hi), each
+    /// node as `(variable, lo, hi)` with the terminals 0 and 1 and the other nodes numbered 2, 3,
+    /// ... in that order. Over one variable numbering, two managers give the same list iff the
+    /// functions are equal (a ROBDD over a fixed order is canonical).
+    pub fn canonical(&self, f: u32) -> Vec<u32> {
+        if Self::is_term(f) {
+            return vec![f];
+        }
+        let mut id: HashMap<u32, u32> = HashMap::from([(FALSE, FALSE), (TRUE, TRUE)]);
+        let mut out = Vec::new();
+        let mut stack = vec![(f, false)];
+        while let Some((n, expanded)) = stack.pop() {
+            if id.contains_key(&n) {
+                continue;
+            }
+            let Node { var, lo, hi } = self.nodes[n as usize];
+            if expanded {
+                let k = id.len() as u32;
+                out.extend([var, id[&lo], id[&hi]]);
+                id.insert(n, k);
+            } else {
+                stack.push((n, true));
+                stack.push((hi, false));
+                stack.push((lo, false));
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

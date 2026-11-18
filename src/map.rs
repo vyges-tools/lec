@@ -36,8 +36,10 @@
 //!   the map. It is cut as `check` cuts it, its outputs free inputs named by instance
 //!   ([`Design::register_model`]), so the map holds under `check`'s own assumption that two such
 //!   cells of one name hold one value;
-//! - a register whose next-state BDD outgrew [`BDD_LIMIT`] (`undecided`): its class is split
-//!   into single registers, which only weakens what the others may assume, so the rest stays sound.
+//! - a register whose next-state BDD outgrew a fresh manager of [`BDD_LIMIT`] alone, or whose
+//!   class's canonical keys passed [`CANON_LIMIT`] (`undecided`): it stands alone, which only
+//!   weakens what the others may assume, so the rest stays sound. A class too big for ONE
+//!   manager is built in chunks ([`chunked_keys`]) and still refined exactly.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
@@ -54,8 +56,8 @@ pub const CYCLES: usize = 128;
 /// it is held inactive ([`Stimulus`]).
 pub const RESET_CYCLES: usize = 2;
 
-/// Nodes (plus memo entries) one class's next-state BDDs may take before its registers are
-/// reported undecided.
+/// Nodes (plus memo entries) one BDD manager may take; a class that outgrows it continues in a
+/// fresh manager ([`chunked_keys`]).
 pub const BDD_LIMIT: usize = 1 << 20;
 
 /// Unmatched golden x revised register pairs [`attribute`] compares by simulation at most.
@@ -456,28 +458,103 @@ fn next_state_bdds(
     nets.iter().map(|n| f.get(n.as_str()).copied().ok_or_else(|| format!("net `{n}` is not in the cone"))).collect::<Result<Vec<_>, _>>().map(Some)
 }
 
-/// The next-state BDD node of each of `members` in one fresh manager, a register's state read as
-/// its class's variable (`class_of[model][state net]`); `None` once the manager is exhausted.
-/// Members with the same node load the same value whenever every class holds one value.
-fn next_nodes(models: &[&Model], members: &[RegId], class_of: &[HashMap<String, usize>]) -> Result<Option<Vec<u32>>, String> {
-    let mut bdd = Bdd::with_limit(BDD_LIMIT);
+
+/// What a class member's next-state function is compared by: its node, while the whole class
+/// fits one manager; its [`Bdd::canonical`] list once the class needed several.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Key {
+    Node(u32),
+    Canon(Vec<u32>),
+}
+
+/// The `u32` entries of canonical lists one class may keep (1 GiB) before its remaining members
+/// are reported undecided: with one manager of [`BDD_LIMIT`] alive at a time, this bounds a
+/// class's memory well under the box budget whatever its size.
+pub const CANON_LIMIT: usize = 1 << 28;
+
+/// [`next_keys`] over any member builder, so the chunk rule is testable on its own.
+///
+/// 🔑 The chunk rule: members are built in order into one manager of `limit`; when a member
+/// overflows it, the members already built are listed canonically, a fresh manager is started
+/// and the member is built again there. A member that overflows a fresh manager ALONE is
+/// undecided (`None`). Every manager numbers variables through ONE map of names shared by all
+/// chunks, so a canonical list means the same function in every chunk; a class that never
+/// overflowed keeps plain nodes. Returns the keys and the number of managers used.
+pub(crate) fn chunked_keys(
+    n: usize,
+    limit: usize,
+    build: &mut dyn FnMut(usize, &mut Bdd, &mut dyn FnMut(&mut Bdd, &str) -> u32) -> Result<Option<u32>, String>,
+) -> Result<(Vec<Option<Key>>, usize), String> {
     let mut names: HashMap<String, u32> = HashMap::new();
-    let mut var = |bdd: &mut Bdd, name: &str| -> u32 {
-        let n = names.len() as u32;
-        let k = *names.entry(name.to_string()).or_insert(n);
-        bdd.var(k)
+    let mut keys: Vec<Option<Key>> = vec![None; n];
+    let mut bdd = Bdd::with_limit(limit);
+    let (mut managers, mut kept) = (1, 0usize);
+    let mut chunk: Vec<(usize, u32)> = Vec::new();
+    let flush = |bdd: &Bdd, chunk: &mut Vec<(usize, u32)>, keys: &mut Vec<Option<Key>>, kept: &mut usize| {
+        for (i, node) in chunk.drain(..) {
+            if *kept > CANON_LIMIT {
+                continue;
+            }
+            let c = bdd.canonical(node);
+            *kept += c.len();
+            keys[i] = Some(Key::Canon(c));
+        }
     };
-    let mut node = Vec::with_capacity(members.len());
-    for &(m, k) in members {
+    let mut i = 0;
+    while i < n {
+        let got = {
+            let mut var = |bdd: &mut Bdd, name: &str| -> u32 {
+                let next = names.len() as u32;
+                let k = *names.entry(name.to_string()).or_insert(next);
+                bdd.var(k)
+            };
+            build(i, &mut bdd, &mut var)?
+        };
+        match got {
+            Some(node) if !bdd.exhausted() => {
+                chunk.push((i, node));
+                i += 1;
+            }
+            _ => {
+                if chunk.is_empty() {
+                    i += 1; // alone in a fresh manager: undecided
+                } else {
+                    flush(&bdd, &mut chunk, &mut keys, &mut kept);
+                }
+                bdd = Bdd::with_limit(limit);
+                managers += 1;
+            }
+        }
+    }
+    if managers == 1 {
+        for (i, node) in chunk {
+            keys[i] = Some(Key::Node(node));
+        }
+    } else {
+        flush(&bdd, &mut chunk, &mut keys, &mut kept);
+    }
+    Ok((keys, managers))
+}
+
+/// The next-state key of each of `members` ([`chunked_keys`]), a register's state read as its
+/// class's variable (`class_of[model][state net]`); `None` for a member undecided within the
+/// budget. Members with the same key load the same value whenever every class holds one value.
+fn next_keys(models: &[&Model], members: &[RegId], class_of: &[HashMap<String, usize>], limit: usize) -> Result<Vec<Option<Key>>, String> {
+    let mut build = |i: usize, bdd: &mut Bdd, var: &mut dyn FnMut(&mut Bdd, &str) -> u32| -> Result<Option<u32>, String> {
+        let (m, k) = members[i];
         let co = &class_of[m];
         let cv = |s: &str| format!("class {}", co.get(s).copied().unwrap_or(usize::MAX));
         let net = next_net(&models[m].regs[k].instance);
-        match next_state_bdds(models[m], &[net], &mut bdd, &mut var, &cv)? {
-            Some(v) if !bdd.exhausted() => node.push(v[0]),
-            _ => return Ok(None),
-        }
-    }
-    Ok(Some(node))
+        Ok(next_state_bdds(models[m], &[net], bdd, var, &cv)?.map(|v| v[0]))
+    };
+    Ok(chunked_keys(members.len(), limit, &mut build)?.0)
+}
+
+/// `a` and `b` load the same next value with every class holding one value: proved, not
+/// undecided within the budget.
+fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[HashMap<String, usize>]) -> Result<bool, String> {
+    let k = next_keys(models, &[a, b], class_of, BDD_LIMIT)?;
+    Ok(matches!((&k[0], &k[1]), (Some(x), Some(y)) if x == y))
 }
 
 /// Each register's class, by its state net, per model.
@@ -494,6 +571,11 @@ fn class_index(models: &[&Model], classes: &[Vec<RegId>]) -> Vec<HashMap<String,
 /// Stage 4: split every class whose members load different next values when every class holds
 /// one value, until nothing splits. Returns the rounds taken and the registers left undecided.
 pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>) -> Result<(usize, Vec<RegId>), String> {
+    refine_within(models, classes, BDD_LIMIT)
+}
+
+/// [`refine`] with each manager limited to `limit` nodes plus memo entries.
+pub(crate) fn refine_within(models: &[&Model], classes: &mut Vec<Vec<RegId>>, limit: usize) -> Result<(usize, Vec<RegId>), String> {
     let mut undecided: Vec<RegId> = Vec::new();
     let mut rounds = 0;
     loop {
@@ -506,23 +588,28 @@ pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>) -> Result
                 next.push(cl.clone());
                 continue;
             }
-            let Some(node) = next_nodes(models, cl, &class_of)? else {
-                undecided.extend(cl.iter().copied());
-                next.extend(cl.iter().map(|&r| vec![r]));
-                split = true;
-                continue;
-            };
-            // members grouped by their next-state node, in order of first appearance
-            let mut parts: Vec<(u32, Vec<RegId>)> = Vec::new();
+            let keys = next_keys(models, cl, &class_of, limit)?;
+            // members grouped by their next-state key, in order of first appearance; a member
+            // undecided within the budget stands alone
+            let mut parts: Vec<Vec<RegId>> = Vec::new();
+            let mut at: HashMap<&Key, usize> = HashMap::new();
             for (i, &r) in cl.iter().enumerate() {
-                let n = node[i];
-                match parts.iter_mut().find(|(x, _)| *x == n) {
-                    Some((_, v)) => v.push(r),
-                    None => parts.push((n, vec![r])),
+                match &keys[i] {
+                    Some(key) => match at.get(key) {
+                        Some(&p) => parts[p].push(r),
+                        None => {
+                            at.insert(key, parts.len());
+                            parts.push(vec![r]);
+                        }
+                    },
+                    None => {
+                        undecided.push(r);
+                        parts.push(vec![r]);
+                    }
                 }
             }
             split |= parts.len() > 1;
-            next.extend(parts.into_iter().map(|(_, v)| v));
+            next.extend(parts);
         }
         *classes = next;
         if !split {
@@ -659,8 +746,8 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
     let name = |r: &RegId| models[r.0].regs[r.1].name.clone();
     for &(i, j) in &pairs {
         let pair = (name(&gold[i]), name(&rev[j]));
-        match next_nodes(models, &[gold[i], rev[j]], &class_of)? {
-            Some(n) if n[0] == n[1] => rep.follows.push(pair),
+        match same_next(models, gold[i], rev[j], &class_of)? {
+            true => rep.follows.push(pair),
             // a pair that reads an unpaired register may differ only through it: not a cause
             _ if [gold[i], rev[j]].iter().any(|r| states_read(models[r.0], r.1).iter().any(|s| unpaired.contains(s))) => {
                 rep.unexplained.push(pair)
@@ -765,7 +852,7 @@ fn follows(models: &[&Model], classes: &[Vec<RegId>], gold: &[RegId], rev: &[Reg
     let class_of = class_index(models, &assumed_classes(models, classes, gold, rev, pairs));
     let mut n = 0;
     for &(i, j) in pairs {
-        if matches!(next_nodes(models, &[gold[i], rev[j]], &class_of)?, Some(v) if v[0] == v[1]) {
+        if same_next(models, gold[i], rev[j], &class_of)? {
             n += 1;
         }
     }
@@ -888,6 +975,82 @@ mod tests {
         let (a, b) = (Design::sequential(&low, &l), Design::sequential(&high, &l));
         assert_eq!(Stimulus::of(&[&a, &a]).held.get("r"), Some(&true));
         assert!(Stimulus::of(&[&a, &b]).held.is_empty(), "the designs disagree: not held");
+    }
+
+    /// 🔑 An overflowing class is built in chunks (L6 b): members go into one manager until one
+    /// overflows it; the members built so far are listed canonically and a fresh manager starts.
+    /// Every manager numbers variables through ONE name map, so equal functions give equal keys
+    /// across chunks and different functions different keys; a member that overflows a fresh
+    /// manager alone is undecided (`None`). A class that fits keeps plain nodes.
+    #[test]
+    fn an_overflowing_class_is_built_in_chunks_over_one_variable_order() {
+        // member i: the AND of its inputs, built in the order given (`b a` and `a b` are one
+        // function); `wide` is too big for any manager of the small limit
+        let funs: Vec<Vec<&str>> = vec![vec!["a", "b"], vec!["c", "d"], vec!["b", "a"], vec!["a", "c"], vec!["wide"], vec!["d", "c"]];
+        let mut build = |i: usize, bdd: &mut Bdd, var: &mut dyn FnMut(&mut Bdd, &str) -> u32| -> Result<Option<u32>, String> {
+            if funs[i] == ["wide"] {
+                let mut f = bdd.zero();
+                for k in 0..40 {
+                    let (x, y) = (var(bdd, &format!("w{k}")), var(bdd, &format!("v{k}")));
+                    let t = bdd.and(x, y);
+                    f = bdd.xor(f, t);
+                }
+                return Ok(Some(f));
+            }
+            let mut f = bdd.one();
+            for n in &funs[i] {
+                let v = var(bdd, n);
+                f = bdd.and(f, v);
+            }
+            Ok(Some(f))
+        };
+        let (keys, managers) = chunked_keys(funs.len(), 16, &mut build).unwrap();
+        assert!(managers > 2, "the small limit forces several chunks, got {managers}");
+        assert!(keys.iter().all(|k| !matches!(k, Some(Key::Node(_)))), "chunked keys are canonical");
+        assert_eq!(keys[4], None, "too big for a fresh manager: undecided");
+        assert_eq!(keys[0], keys[2], "one function in two chunks, one key");
+        assert_eq!(keys[1], keys[5]);
+        assert_ne!(keys[0], keys[1]);
+        assert_ne!(keys[0], keys[3]);
+        assert!(keys.iter().enumerate().all(|(i, k)| i == 4 || k.is_some()));
+        let (keys, managers) = chunked_keys(4, BDD_LIMIT, &mut build).unwrap();
+        assert_eq!(managers, 1);
+        assert!(matches!(keys[0], Some(Key::Node(_))));
+        assert_eq!(keys[0], keys[2]);
+        assert_ne!(keys[0], keys[1]);
+    }
+
+    /// The chunked refinement proves the same classes as one manager: a class too big for one
+    /// small manager is no longer undecided, it splits exactly as it does under the full budget.
+    #[test]
+    fn chunked_refinement_proves_what_one_manager_proves() {
+        let l = lib();
+        let g = nl("module t(clk,a,b,q);\ninput clk,a,b; output q;\nwire x,y,s0,s1,s2;\n\
+             AND2 g0(.A(a),.B(b),.Y(x));\nDFF r0(.CK(clk),.D(x),.Q(s0));\nDFF r1(.CK(clk),.D(s0),.Q(s1));\n\
+             XOR2 g1(.A(s1),.B(a),.Y(y));\nDFF r2(.CK(clk),.D(y),.Q(s2));\nBUF o(.A(s2),.Y(q));\nendmodule\n");
+        let r = nl("module t(clk,a,b,q);\ninput clk,a,b; output q;\nwire x,y,s0,s1,s2;\n\
+             AND2 h0(.A(b),.B(a),.Y(x));\nDFF u0(.CK(clk),.D(x),.Q(s0));\nDFF u1(.CK(clk),.D(s0),.Q(s1));\n\
+             XOR2 h1(.A(a),.B(s1),.Y(y));\nDFF u2(.CK(clk),.D(y),.Q(s2));\nBUF o(.A(s2),.Y(q));\nendmodule\n");
+        let (gd, rd) = (Design::register_model(&g, &l), Design::register_model(&r, &l));
+        let (gm, rm) = (model(&gd, Side::Golden, Naming::Instance).unwrap(), model(&rd, Side::Revised, Naming::Instance).unwrap());
+        let models = [&gm, &rm];
+        // every register in ONE candidate class: refinement alone must separate them
+        let all: Vec<RegId> = (0..2).flat_map(|m| (0..models[m].regs.len()).map(move |k| (m, k))).collect();
+        let sorted = |mut c: Vec<Vec<RegId>>| {
+            c.iter_mut().for_each(|x| x.sort());
+            c.sort();
+            c
+        };
+        let mut full = vec![all.clone()];
+        let (_, u) = refine(&models, &mut full).unwrap();
+        assert!(u.is_empty());
+        let mut small = vec![all];
+        // 8 nodes plus memo entries: each member fits a manager alone, the class does not (7 makes
+        // a member undecided; with the old rule, any overflow undecided the whole class)
+        let (_, u) = refine_within(&models, &mut small, 8).unwrap();
+        assert!(u.is_empty(), "chunks, not undecided: {u:?}");
+        assert_eq!(sorted(small), sorted(full.clone()));
+        assert_eq!(full.iter().filter(|c| c.len() == 2).count(), 3, "r0=u0, r1=u1, r2=u2");
     }
 
     /// A gated-clock design: `r` on `clk` gated by `gate` (the netlist text making `gclk`), with

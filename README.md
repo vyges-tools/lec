@@ -187,7 +187,9 @@ What is not in the map is reported, with why:
   registers in one class): one name per name is not decided by guessing;
 - a register stored inverted, or a state re-encoded (a one-hot FSM against a binary one), does
   not map;
-- `undecided`: the class's BDDs outgrew the node budget;
+- `undecided`: a register whose next-state BDD outgrew the node budget on its own (a class too
+  big for one BDD manager is built in chunks, each member compared by its canonical diagram over
+  one variable order, and refined exactly);
 - `unobserved`: a register with no connected output;
 - clock gates: `map` models the standard clock gate, an enable latch transparent while the clock
   is low ANDed with the clock (nested gates too), or a `latch_posedge` clock-gate cell. A register
