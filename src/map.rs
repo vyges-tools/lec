@@ -135,6 +135,10 @@ pub struct MapReport {
     /// The asynchronous-reset inputs the simulation held, each with its inactive value
     /// ([`Stimulus`]).
     pub reset_inputs: Vec<(String, bool)>,
+    /// Inputs the simulation held constant (`--hold`, [`SimHolds`]): input, value.
+    pub holds: Vec<(String, bool)>,
+    /// Inputs given as resets (`--reset`): input, inactive value. Also in `reset_inputs`.
+    pub resets_given: Vec<(String, bool)>,
     /// Clock gates whose enable the simulation drove at random ([`simulate`]), by instance.
     pub free_enables: Vec<String>,
     pub golden_registers: usize,
@@ -170,12 +174,45 @@ impl MapReport {
 /// The register map of `golden` to `revised`: the thin sequence of the stages the module doc
 /// names, in its order.
 pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Naming, Naming)) -> Result<MapReport, String> {
+    register_map_with(golden, revised, lib, names, &SimHolds::default())
+}
+
+/// What the user fixes in the candidate-class simulation (`lec map --hold`, `--reset`), by
+/// primary-input name, in both designs: `hold` an input at a constant, `reset` an input as an
+/// asynchronous reset with its INACTIVE value (active for [`RESET_CYCLES`], then inactive, as
+/// [`Design::reset_inputs`] finds them).
+///
+/// ⛔ Simulation ONLY. A hold proposes candidates; it is never an assumption of the proof:
+/// `refine` and [`next_state_bdds`] read every primary input as a free variable whatever is held,
+/// so a pair that holds only under a held input is still split. The report lists the holds
+/// (`holds`, `resets_given`), so a result is never read without them.
+#[derive(Debug, Clone, Default)]
+pub struct SimHolds {
+    pub hold: BTreeMap<String, bool>,
+    pub reset: BTreeMap<String, bool>,
+}
+
+/// [`register_map`] with the simulation holds `holds` ([`SimHolds`]). A name that is not a
+/// primary input of both designs, or that is both held and a reset, is refused.
+pub fn register_map_with(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Naming, Naming), holds: &SimHolds) -> Result<MapReport, String> {
     if lib.cells.is_empty() {
         return Err("no cells in the Liberty".into());
     }
+    for (flag, set) in [("--hold", &holds.hold), ("--reset", &holds.reset)] {
+        for n in set.keys() {
+            for (side, nl) in [("golden", golden), ("revised", revised)] {
+                if !nl.inputs.iter().any(|p| p == n) {
+                    return Err(format!("{flag} {n}: `{n}` is not a primary input of the {side} netlist"));
+                }
+            }
+            if flag == "--hold" && holds.reset.contains_key(n) {
+                return Err(format!("`{n}` is given both --hold and --reset"));
+            }
+        }
+    }
     let (g, r) = (Design::register_model(golden, lib), Design::register_model(revised, lib));
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
-    let stim = Stimulus::of(&[&g, &r]);
+    let stim = Stimulus::of(&[&g, &r]).with(holds);
     let (sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim)?;
     let (mut classes, inv) = candidate_classes(&[&gm, &rm], &sigs);
     let candidates = classes.clone();
@@ -183,6 +220,8 @@ pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Nami
     let mut rep = report(&[&gm, &rm], &candidates, &classes, &inv, &undecided, rounds);
     attribute(&[&gm, &rm], &sigs, &classes, &inv, &mut rep)?;
     rep.reset_inputs = stim.held.into_iter().collect();
+    rep.holds = stim.fixed.into_iter().collect();
+    rep.resets_given = holds.reset.clone().into_iter().collect();
     rep.free_enables = freed.iter().flatten().filter_map(|n| gate_of(n).map(str::to_string)).collect::<BTreeSet<_>>().into_iter().collect();
     Ok(rep)
 }
@@ -261,6 +300,8 @@ type RegId = (usize, usize);
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Stimulus {
     pub held: BTreeMap<String, bool>,
+    /// Inputs held constant throughout (`--hold`): input -> value.
+    pub fixed: BTreeMap<String, bool>,
 }
 
 impl Stimulus {
@@ -283,11 +324,25 @@ impl Stimulus {
         for k in clash {
             held.remove(&k);
         }
-        Stimulus { held }
+        Stimulus { held, fixed: BTreeMap::new() }
+    }
+
+    /// The user's holds on top ([`SimHolds`]): a given reset replaces whatever was detected for
+    /// that input; a held input is constant and no longer a reset.
+    pub(crate) fn with(mut self, holds: &SimHolds) -> Stimulus {
+        self.held.extend(holds.reset.iter().map(|(k, v)| (k.clone(), *v)));
+        for (k, v) in &holds.hold {
+            self.held.remove(k);
+            self.fixed.insert(k.clone(), *v);
+        }
+        self
     }
 
     /// Input `name`'s word in `cycle`.
     pub(crate) fn word(&self, name: &str, cycle: usize) -> u64 {
+        if let Some(&v) = self.fixed.get(name) {
+            return if v { !0 } else { 0 };
+        }
         match self.held.get(name) {
             Some(&inactive) => {
                 let v = if cycle < RESET_CYCLES { !inactive } else { inactive };
@@ -1077,7 +1132,7 @@ mod tests {
     /// input two designs hold at different inactive values is not held at all.
     #[test]
     fn the_stimulus_holds_reset_inputs_active_then_inactive() {
-        let st = Stimulus { held: [("rst_n".to_string(), true)].into_iter().collect() };
+        let st = Stimulus { held: [("rst_n".to_string(), true)].into_iter().collect(), ..Default::default() };
         for c in 0..RESET_CYCLES {
             assert_eq!(st.word("rst_n", c), 0, "active (low) in cycle {c}");
         }
@@ -1268,6 +1323,41 @@ mod tests {
         let plain = nl("module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire s;\n\
              DFF r(.CK(clk),.D(d),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n");
         assert!(map(&plain, &m).mapped.is_empty());
+    }
+
+    /// ⛔ `--hold` / `--reset` act on the candidate simulation ONLY. A held input is constant and a
+    /// given reset is active for [`RESET_CYCLES`] then inactive, in both designs; the proof keeps
+    /// every input free. Here `u` loads `d` only while the test enable `te` is 0: held at 0, `r`
+    /// and `u` simulate alike, yet `refine` (te free) splits them, so nothing maps. A name that is
+    /// not a primary input of both designs is refused, naming it; the report lists the holds.
+    #[test]
+    fn simulation_holds_shape_candidates_and_never_the_proof() {
+        let holds = SimHolds {
+            hold: [("te".to_string(), false)].into_iter().collect(),
+            reset: [("rst_n".to_string(), true)].into_iter().collect(),
+        };
+        let st = Stimulus::default().with(&holds);
+        for c in 0..CYCLES {
+            assert_eq!(st.word("te", c), 0, "held in cycle {c}");
+            assert_eq!(st.word("rst_n", c), if c < RESET_CYCLES { 0 } else { !0 }, "reset in cycle {c}");
+        }
+        let g = nl("module t(clk,rst_n,te,si,d,q);\ninput clk,rst_n,te,si,d; output q;\n\
+             DFR r(.CK(clk),.D(d),.RESET_B(rst_n),.Q(q));\nendmodule\n");
+        let m = nl("module t(clk,rst_n,te,si,d,q);\ninput clk,rst_n,te,si,d; output q;\nwire n;\n\
+             MUX2 x(.A0(d),.A1(si),.S(te),.Y(n));\nDFR u(.CK(clk),.D(n),.RESET_B(rst_n),.Q(q));\nendmodule\n");
+        let l = lib();
+        let (gd, md) = (Design::register_model(&g, &l), Design::register_model(&m, &l));
+        let (gm, mm) = (model(&gd, Side::Golden, Naming::Instance).unwrap(), model(&md, Side::Revised, Naming::Instance).unwrap());
+        let held = Stimulus::of(&[&gd, &md]).with(&holds);
+        let (sigs, _) = simulate_freeing_stuck_enables(&[&gm, &mm], &held).unwrap();
+        assert_eq!(sigs[0][0], sigs[1][0], "held, r and u are candidates");
+        let rep = register_map_with(&g, &m, &l, (Naming::Instance, Naming::Instance), &holds).unwrap();
+        assert!(rep.mapped.is_empty(), "the proof keeps te free: {rep:?}");
+        assert_eq!(rep.holds, [("te".to_string(), false)]);
+        assert_eq!(rep.resets_given, [("rst_n".to_string(), true)]);
+        let bad = SimHolds { hold: [("tee".to_string(), false)].into_iter().collect(), ..Default::default() };
+        let e = register_map_with(&g, &m, &l, (Naming::Instance, Naming::Instance), &bad).unwrap_err();
+        assert!(e.contains("`tee` is not a primary input"), "{e}");
     }
 
     /// 🔑 A clock-gate enable that NEVER asserts in simulation is freed for the candidates only.

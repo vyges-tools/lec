@@ -2,7 +2,7 @@
 //!
 //!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [--engine bdd|abc|both] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
-//!   vyges-lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names instance|net] [--revised-names instance|net] [--ranges RANGES.json] [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
+//!   vyges-lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names instance|net] [--revised-names instance|net] [--ranges RANGES.json] [--hold NET=0|1]... [--reset NET=0|1]... [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [-o OUT] [--json] [--fail-on-diff]
 //!
 //! Proves combinational equivalence of two gate-level netlists. Exit codes:
@@ -42,7 +42,8 @@ usage:
   vyges physical lec check GOLDEN.v REVISED.v --lib L.lib [--engine E] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names N] [--revised-names N]
-                          [--ranges RANGES.json] [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
+                          [--ranges RANGES.json] [--hold NET=0|1]... [--reset NET=0|1]...
+                          [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N]
                           [-o OUT] [--json] [--fail-on-diff]
 
@@ -71,6 +72,11 @@ flags:
                    syn and the reference's synthesize number it), so inputs pair by name. Each
                    renumbered bit is listed; a bit outside its range, or whose new name another
                    net has, is listed and left as written
+  --hold NET=V     map, repeatable: hold primary input NET at V (0 or 1) in BOTH designs during
+                   the candidate simulation only; the proof keeps NET free. Listed in the report
+  --reset NET=V    map, repeatable: treat primary input NET as an asynchronous reset whose
+                   INACTIVE value is V: active for the first cycles of the candidate simulation,
+                   then V; the proof keeps NET free. Listed in the report
   --write-map FILE map: write the proved pairs as {\"golden name\": \"revised name\"}
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
@@ -155,7 +161,7 @@ const DESCRIBE: &str = r#"{
       "summary": "register map: each golden register paired with the revised register proved to hold the same state, written as a JSON rename map",
       "invocation": {
         "args_template": ["map", "{golden}", "{revised}", "--lib", "{lib}"],
-        "optional": [{ "arg": "golden_names", "flag": "--golden-names" }, { "arg": "revised_names", "flag": "--revised-names" }, { "arg": "ranges", "flag": "--ranges" }, { "arg": "write_map", "flag": "--write-map" }, { "arg": "out", "flag": "-o" }],
+        "optional": [{ "arg": "golden_names", "flag": "--golden-names" }, { "arg": "revised_names", "flag": "--revised-names" }, { "arg": "ranges", "flag": "--ranges" }, { "arg": "hold", "flag": "--hold" }, { "arg": "reset", "flag": "--reset" }, { "arg": "write_map", "flag": "--write-map" }, { "arg": "out", "flag": "-o" }],
         "emits_json": true
       },
       "inputs": {
@@ -168,6 +174,8 @@ const DESCRIBE: &str = r#"{
           "golden_names": { "type": "string", "enum": ["instance", "net"], "description": "name a golden register by its instance (default) or by the net on its stored-value output" },
           "revised_names": { "type": "string", "enum": ["instance", "net"], "description": "name a revised register by its instance (default) or by the net on its stored-value output" },
           "ranges": { "type": "string", "description": "declared vector ranges (syn sv-ranges): the revised netlist's port bits are renumbered from their declared numbering to the elaborated one before inputs are paired by name" },
+          "hold": { "type": "string", "description": "NET=0|1: hold a primary input constant in both designs during the candidate simulation only (the proof keeps it free); repeatable" },
+          "reset": { "type": "string", "description": "NET=0|1: treat a primary input as an asynchronous reset with this inactive value, active first, during the candidate simulation only; repeatable" },
           "write_map": { "type": "string", "description": "write the proved pairs to FILE as a JSON object, golden name to revised name" },
           "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
         }
@@ -198,6 +206,32 @@ const DESCRIBE: &str = r#"{
   ]
 }
 "#;
+
+/// Every value of a repeatable `NAME NET=0|1` option, as NET -> value; a malformed one exits 2.
+fn net_values(args: &[String], name: &str) -> std::collections::BTreeMap<String, bool> {
+    let mut out = std::collections::BTreeMap::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != name {
+            continue;
+        }
+        let v = args.get(i + 1).map(String::as_str).unwrap_or("");
+        let parsed = v.rsplit_once('=').and_then(|(n, b)| match b {
+            "0" => Some((n, false)),
+            "1" => Some((n, true)),
+            _ => None,
+        });
+        match parsed {
+            Some((n, b)) if !n.is_empty() => {
+                out.insert(n.to_string(), b);
+            }
+            _ => {
+                diag!("error: {name} expects NET=0 or NET=1, got {v:?}");
+                exit(2);
+            }
+        }
+    }
+    out
+}
 
 fn opt(args: &[String], name: &str) -> Option<String> {
     args.iter()
@@ -394,7 +428,7 @@ pub fn main() {
         exit(2);
     }
     // positionals: not a flag, not a flag's value
-    let valued = ["--lib", "--engine", "-o", "--never", "--bound", "--golden-names", "--revised-names", "--ranges", "--write-map"];
+    let valued = ["--lib", "--engine", "-o", "--never", "--bound", "--golden-names", "--revised-names", "--ranges", "--write-map", "--hold", "--reset"];
     let pos: Vec<&String> = args[1..]
         .iter()
         .enumerate()
@@ -735,7 +769,8 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         vyges_events::emit(&Event::new("vyges-lec", Severity::Info, msg).with_code("LEC-MAP-RANGES"));
     }
     let r = renumbered.as_ref().map_or(r, |n| &n.netlist);
-    let rep: MapReport = map::register_map(g, r, lib, names).unwrap_or_else(|e| die(&e));
+    let holds = map::SimHolds { hold: net_values(args, "--hold"), reset: net_values(args, "--reset") };
+    let rep: MapReport = map::register_map_with(g, r, lib, names, &holds).unwrap_or_else(|e| die(&e));
     let one = rep.one_to_one();
     let head = format!(
         "{} of {} golden and {} revised register(s) mapped{} in {} round(s)",
@@ -774,7 +809,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -787,6 +822,14 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             regs(&rep.cut),
             {
                 let rows: Vec<String> = rep.reset_inputs.iter().map(|(n, v)| format!("{{\"input\": {}, \"inactive\": {}}}", json_str(n), u8::from(*v))).collect();
+                format!("[{}]", rows.join(", "))
+            },
+            {
+                let rows: Vec<String> = rep.holds.iter().map(|(n, v)| format!("{{\"input\": {}, \"value\": {}}}", json_str(n), u8::from(*v))).collect();
+                format!("[{}]", rows.join(", "))
+            },
+            {
+                let rows: Vec<String> = rep.resets_given.iter().map(|(n, v)| format!("{{\"input\": {}, \"inactive\": {}}}", json_str(n), u8::from(*v))).collect();
                 format!("[{}]", rows.join(", "))
             },
             {
@@ -848,6 +891,12 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for (n, v) in &rep.reset_inputs {
             s += &format!("  reset input {n}  (simulation holds it active {RESET} cycle(s), then at {})\n", u8::from(*v), RESET = map::RESET_CYCLES);
+        }
+        for (n, v) in &rep.holds {
+            s += &format!("  hold        {n} = {}  (--hold: candidate simulation only; the proof keeps it free)\n", u8::from(*v));
+        }
+        for (n, v) in &rep.resets_given {
+            s += &format!("  reset given {n}, inactive {}  (--reset: candidate simulation only)\n", u8::from(*v));
         }
         for g in &rep.free_enables {
             s += &format!("  free enable {g}  (simulation drives this clock gate's enable at random; the proof uses the real one)\n");

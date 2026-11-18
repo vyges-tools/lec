@@ -164,6 +164,10 @@ the Liberty, is held active for the first cycles and inactive after, so a design
 and a clock-gate enable that never asserts is driven at random and the simulation rerun, so a
 core whose clock is enabled only by a register sequence still moves: listed as `free_enables`,
 the proof uses the real enable);
+`--hold NET=0|1` and `--reset NET=0|1` (repeatable) fix a primary input in that simulation, in both
+designs: held constant, or treated as a reset with the given inactive value (active first). They
+shape the candidates only: the proof keeps every input free, and the report lists them (`holds`,
+`resets_given`). An unknown input name is refused.
 registers that never differ, or always differ, are candidates. Then every candidate class is
 assumed to hold one value, each member's next-state function is built as a BDD, and members whose
 functions differ are split, until nothing splits (register correspondence). Every pair left starts
