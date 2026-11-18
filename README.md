@@ -241,6 +241,11 @@ in a one-to-one pair. `map` needs no ABC: it is built in every configuration.
   between registers. Registers are matched by **instance name** (`inst/Q`, `inst/D`),
   not by the nets on their pins, so a netlist whose nets were renamed by buffering or
   resizing still lines up with its source.
+- Each flop's **clock, clear and preset** are endpoints too (`inst/CK`, `inst/CLR`,
+  `inst/PRE`): the Liberty `clocked_on`, `clear` and `preset` expressions over what drives the
+  pins, in the same cut model (a clock-gate latch or cell output is a free input by instance
+  name). A clock gate whose enable is dropped differs at `inst/CK`; a flop with no clear
+  compares the constant 0, so it still matches one whose clear is tied inactive.
 
 ## Current state
 

@@ -221,7 +221,17 @@ pub(crate) struct Design<'a> {
     /// [`is_cut`]: Design::is_cut
     /// [`cut_var`]: Design::cut_var
     cut_outside: bool,
+    /// Instance name -> its index, for the register pin endpoints ([`Design::pin_endpoint`]).
+    inst_at: HashMap<&'a str, usize>,
 }
+
+/// The register pin endpoints `check` compares beside D (gap L7): the function driving each `ff`
+/// register's clock (`CK`, its `clocked_on`), clear (`CLR`) and preset (`PRE`), keyed
+/// `inst/<kind>` and read through the virtual net `inst <kind>` ([`Design::pin_endpoint`]).
+pub(crate) const PIN_KINDS: [&str; 3] = ["CK", "CLR", "PRE"];
+
+/// One register pin endpoint as a gate: its logic, the pins it reads, and their sources.
+type PinGate = (Logic, Vec<String>, Vec<Src>);
 
 /// A state element the one-clock-edge register model ([`Reg`]) cannot hold: a sequential cell
 /// whose state is not one `ff` group (a `latch`, which is level-sensitive; a memory macro,
@@ -282,7 +292,8 @@ impl<'a> Design<'a> {
         }
         let constants: BTreeMap<&str, bool> = nl.constants.iter().map(|(n, v)| (n.as_str(), *v)).collect();
         let alias = resolve_aliases(nl, &driver, &constants);
-        Design { nl, lib, driver, unknown, constants, alias, sequential: false, cut_outside: false }
+        let inst_at = nl.insts.iter().enumerate().map(|(i, inst)| (inst.name.as_str(), i)).collect();
+        Design { nl, lib, driver, unknown, constants, alias, sequential: false, cut_outside: false, inst_at }
     }
 
     /// The netlist this view reads.
@@ -666,7 +677,17 @@ impl<'a> Design<'a> {
     }
 
     /// Endpoints to compare, as (key, net): primary outputs by port name, flop data pins
-    /// (setup-constrained) as `inst/pin` — matched by the register, not by its data net.
+    /// (setup-constrained) as `inst/pin` — matched by the register, not by its data net — and,
+    /// for every `ff` register, its clock, clear and preset functions as `inst/CK`, `inst/CLR`,
+    /// `inst/PRE` ([`PIN_KINDS`]).
+    ///
+    /// 🔑 Gap L7: with D alone, a clock gate whose enable is dropped (the gate's AND made a buffer)
+    /// compared equal, because nothing read what drives a clock pin. The clock, clear and preset
+    /// pins are compared like D, in the same cut model: a function of primary inputs and cut
+    /// points (a clock-gate latch or cell output is the free variable `inst/<pin>`). A register
+    /// with no `clear` (or `preset`) compares the constant 0, so a flop with a tied-off reset pin
+    /// still matches one without. A register stored inverted must have clear and preset swapped:
+    /// its clear is the other design's preset (the renamed check's `invnorm` flip swaps the pins).
     fn endpoints(&self) -> BTreeMap<String, String> {
         let mut e: BTreeMap<String, String> = self.nl.outputs.iter().map(|o| (o.clone(), o.clone())).collect();
         for inst in &self.nl.insts {
@@ -679,10 +700,45 @@ impl<'a> Design<'a> {
                             }
                         }
                     }
+                    if cell.seq_group.as_ref().is_some_and(|g| !g.latch) {
+                        for kind in PIN_KINDS {
+                            e.entry(format!("{}/{kind}", inst.name)).or_insert_with(|| format!("{} <{kind}>", inst.name));
+                        }
+                    }
                 }
             }
         }
         e
+    }
+
+    /// The register pin endpoint virtual net `net` (`inst <CK>`, `inst <CLR>`, `inst <PRE>`) as one
+    /// gate: the `ff` group's `clocked_on`, `clear` or `preset` over the pins it reads (the
+    /// constant 0 when the group has none). `None` for any other net. (A space cannot occur in a
+    /// netlist name, so the virtual net collides with none.)
+    fn pin_endpoint(&self, net: &str) -> Option<Result<PinGate, String>> {
+        let (name, rest) = net.rsplit_once(' ')?;
+        let kind = rest.strip_prefix('<')?.strip_suffix('>')?;
+        let key = match kind {
+            "CK" => "clocked_on",
+            "CLR" => "clear",
+            "PRE" => "preset",
+            _ => return None,
+        };
+        let inst = &self.nl.insts[*self.inst_at.get(name)?];
+        let cell = self.lib.cells.get(&inst.cell)?;
+        let g = cell.seq_group.as_ref().filter(|g| !g.latch)?;
+        let Some(expr) = g.attrs.get(key) else {
+            return Some(Ok((Logic::Prim(Op::Buf), vec!["A".into()], vec![Src::Const(false)])));
+        };
+        let inputs: Vec<&str> = cell.pins.iter().filter(|(_, p)| p.direction == Dir::In).map(|(n, _)| n.as_str()).collect();
+        let Some(f) = Func::parse_in(expr, |p| inputs.contains(&p)) else {
+            return Some(Err(format!("register `{}` ({}): `{key}` `{expr}` does not parse over its input pins", inst.name, inst.cell)));
+        };
+        let mut pins: Vec<String> = f.ports().into_iter().map(str::to_string).collect();
+        pins.sort();
+        pins.dedup();
+        let ins: Result<Vec<Src>, String> = pins.iter().map(|p| src_of(inst, p)).collect();
+        Some(ins.map(|ins| (Logic::Func(f), pins, ins)))
     }
 }
 
@@ -840,6 +896,23 @@ fn build(
     visiting: &mut BTreeSet<String>,
 ) -> Result<u32, String> {
     if let Some(&f) = memo.get(net) {
+        return Ok(f);
+    }
+    // a register's clock / clear / preset endpoint (gap L7): its `ff` expression over its pins
+    if let Some(g) = d.pin_endpoint(net) {
+        let (logic, pins, ins) = g?;
+        let mut child = Vec::new();
+        for src in &ins {
+            child.push(match src {
+                Src::Net(n) => build(n, d, bdd, vars, memo, visiting)?,
+                Src::Const(v) => if *v { bdd.one() } else { bdd.zero() },
+            });
+        }
+        let f = match &logic {
+            Logic::Prim(op) => apply_op(bdd, *op, &child, &pins)?,
+            Logic::Func(func) => func_bdd(bdd, func, &pins, &child),
+        };
+        memo.insert(net.to_string(), f);
         return Ok(f);
     }
     // a supply net: its constant, whatever touches it
@@ -1261,6 +1334,18 @@ fn collect(
     if done.contains(net) {
         return Ok(());
     }
+    // a register's clock / clear / preset endpoint (gap L7), as `build` reads it
+    if let Some(g) = d.pin_endpoint(net) {
+        let (logic, pins, ins) = g?;
+        for src in &ins {
+            if let Src::Net(n) = src {
+                collect(n, d, c, done, visiting)?;
+            }
+        }
+        done.insert(net.to_string());
+        c.gates.push(Gate { out: net.to_string(), logic, pins, ins });
+        return Ok(());
+    }
     // a supply net: a buffer of its constant, as `build` reads it
     if let Some(&v) = d.constants.get(net) {
         done.insert(net.to_string());
@@ -1546,7 +1631,7 @@ mod tests {
              AND2 g(.A(a),.B(net9),.Z(d2));\nDFF r(.CK(clk),.D(d2),.Q(net9));\nBUF ob(.A(net9),.Y(q));\nendmodule\n");
         let rep = equivalence(&g, &r, &lib()).unwrap();
         assert!(rep.equivalent, "{:?} {:?} {:?}", rep.mismatches, rep.only_in_golden, rep.only_in_revised);
-        assert_eq!(rep.compared, 2, "q and r/D");
+        assert_eq!(rep.compared, 5, "q, r/D and (gap L7) r/CK, r/CLR, r/PRE");
         let two = |da: &str, db: &str| {
             nl(&format!("module t(a,b,clk,x,y);\ninput a,b,clk; output x,y;\n\
                  DFF ra(.CK(clk),.D({da}),.Q(x));\nDFF rb(.CK(clk),.D({db}),.Q(y));\nendmodule\n"))
@@ -1587,6 +1672,50 @@ mod tests {
     /// or `inst/<pin>` for a cell with no `ff` group) in the combinational model and in the
     /// register map's model ([`Design::register_model`]). `sec` and `prove`
     /// ([`Design::sequential`]) still refuse both.
+    /// Gap L7. `check` compares each `ff` register's clock, clear and preset (`inst/CK`,
+    /// `inst/CLR`, `inst/PRE`) like its D: the function driving the pin, over primary inputs and
+    /// cut points. (1) A clock gate whose enable is dropped (the low-phase latch's AND made a
+    /// buffer) differs at `ff/CK`; with D alone it compared equal. (2) A register flipped to store
+    /// its complement (D and Q inverted around it) must swap clear and preset: flipped with the
+    /// swap it matches a netlist storing the complement natively; without the swap only `r/CLR`
+    /// and `r/PRE` differ. (3) A flop with no clear compares the constant 0 against one whose
+    /// clear is tied inactive.
+    #[test]
+    fn clock_clear_and_preset_pins_are_compared_like_d() {
+        let l = Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/seq.lib")).expect("seq.lib");
+        let at = |g: &Netlist, r: &Netlist| -> Vec<String> {
+            let rep = equivalence(g, r, &l).unwrap();
+            assert!(rep.only_in_golden.is_empty() && rep.only_in_revised.is_empty(), "{rep:?}");
+            rep.mismatches.iter().map(|m| m.endpoint.clone()).collect()
+        };
+        let gate = |g: &str| {
+            nl(&format!("module t(ck,e,d,q);\ninput ck,e,d; output q;\nwire el,gck;\nLATN lt(.G(ck),.D(e),.Q(el));\n{g}\nDFF ff(.CK(gck),.D(d),.Q(q));\nendmodule\n"))
+        };
+        let gold = gate("AND2 cg(.A(ck),.B(el),.Y(gck));");
+        assert!(at(&gold, &gate("AND2 cg(.A(el),.B(ck),.Y(gck));")).is_empty());
+        assert_eq!(at(&gold, &gate("BUF cg(.A(ck),.Y(gck));")), ["ff/CK"]);
+        assert_eq!(at(&gold, &gate("AND2 cg(.A(ck),.B(e),.Y(gck));")), ["ff/CK"], "the enable read around its latch");
+
+        // the register stores !d: D and Q inverted around it; `hi` an inactive (high) pin
+        let stores_complement = |clear: &str, preset: &str| {
+            nl(&format!(
+                "module t(ck,rn,d,q);\ninput ck,rn,d; output q;\nwire lo,hi,nd,s;\nTIE0 z(.LO(lo));\nINV h(.A(lo),.Y(hi));\n\
+                 INV i0(.A(d),.Y(nd));\nDFRS r(.CK(ck),.D(nd),.RESET_B({clear}),.SET_B({preset}),.Q(s));\nINV i1(.A(s),.Y(q));\nendmodule\n"
+            ))
+        };
+        // golden `DFRS r(.D(d),.RESET_B(rn),.SET_B(hi))` flipped: the swap moves rn to the preset
+        let ours = stores_complement("hi", "rn");
+        assert!(at(&stores_complement("hi", "rn"), &ours).is_empty());
+        assert_eq!(at(&stores_complement("rn", "hi"), &ours), ["r/CLR", "r/PRE"], "flipped without the swap");
+
+        let plain = |ports: &str| nl(&format!("module t(ck,d,{ports}q);\ninput ck,d; output q;\ninput rn;\nDFF r(.CK(ck),.D(d),.Q(q));\nendmodule\n"));
+        let dfr = |rn: &str| {
+            nl(&format!("module t(ck,d,rn,q);\ninput ck,d,rn; output q;\nwire lo,hi;\nTIE0 z(.LO(lo));\nINV h(.A(lo),.Y(hi));\nDFR r(.CK(ck),.D(d),.RESET_B({rn}),.Q(q));\nendmodule\n"))
+        };
+        assert!(at(&plain("rn,"), &dfr("hi")).is_empty(), "no clear is the constant 0, as a tied-off clear");
+        assert_eq!(at(&plain("rn,"), &dfr("rn")), ["r/CLR"]);
+    }
+
     #[test]
     fn a_latch_or_memory_is_one_cut_variable_in_check_and_in_the_register_map() {
         let l = Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/seq.lib")).expect("seq.lib");

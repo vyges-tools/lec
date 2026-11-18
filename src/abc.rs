@@ -350,6 +350,22 @@ mod tests {
         *v.get(ep).unwrap_or(&false)
     }
 
+    /// Gap L7 in the ABC engine: the clock, clear and preset endpoints (`inst/CK`, ...) are
+    /// miter outputs like D, so a clock gate with its enable dropped is disproved at `ff/CK`.
+    #[test]
+    fn a_dropped_clock_gate_enable_is_disproved_at_the_clock_pin() {
+        let l = Lib::load(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/seq.lib")).expect("seq.lib");
+        let gate = |g: &str| {
+            nl(&format!("module t(ck,e,d,q);\ninput ck,e,d; output q;\nwire el,gck;\nLATN lt(.G(ck),.D(e),.Q(el));\n{g}\nDFF ff(.CK(gck),.D(d),.Q(q));\nendmodule\n"))
+        };
+        let gold = gate("AND2 cg(.A(ck),.B(el),.Y(gck));");
+        assert_eq!(equivalence(&gold, &gate("AND2 cg(.A(el),.B(ck),.Y(gck));"), &l).unwrap().verdict, Verdict::Equivalent);
+        match equivalence(&gold, &gate("BUF cg(.A(ck),.Y(gck));"), &l).unwrap().verdict {
+            Verdict::Differs { endpoint, .. } => assert_eq!(endpoint, "ff/CK"),
+            v => panic!("expected a difference at ff/CK, got {v:?}"),
+        }
+    }
+
     #[test]
     fn de_morgan_rewrite_is_equivalent() {
         let g = nl("module t(a,b,f);\ninput a,b; output f;\nAND2 g(.A(a),.B(b),.Z(f));\nendmodule\n");
@@ -468,7 +484,7 @@ mod tests {
              AND2 g(.A(a),.B(net9),.Z(d2));\nDFF r(.CK(clk),.D(d2),.Q(net9));\nBUF ob(.A(net9),.Y(q));\nendmodule\n");
         let rep = equivalence(&g, &r, &lib()).unwrap();
         assert_eq!(rep.verdict, Verdict::Equivalent);
-        assert_eq!(rep.compared, 2);
+        assert_eq!(rep.compared, 5, "q, r/D and (gap L7) r/CK, r/CLR, r/PRE");
         let w = nl("module t(a,b,clk,q);\ninput a,b,clk; output q;\nwire d2,net9;\n\
              OR2 g(.A(a),.B(net9),.Z(d2));\nDFF r(.CK(clk),.D(d2),.Q(net9));\nBUF ob(.A(net9),.Y(q));\nendmodule\n");
         let rep = equivalence(&g, &w, &lib()).unwrap();
