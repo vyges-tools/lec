@@ -168,6 +168,11 @@ the proof uses the real enable);
 designs: held constant, or treated as a reset with the given inactive value (active first). They
 shape the candidates only: the proof keeps every input free, and the report lists them (`holds`,
 `resets_given`). An unknown input name is refused.
+A candidate class whose registers never toggled in that simulation is split by name: each golden
+register with exactly one same-named revised register in it becomes a candidate pair of its own
+(inverted when their constants are complementary), the rest stay together. A name only proposes:
+every pair is proved like any other, and one the proof splits is listed (`name_pairs`,
+`name_pairs_rejected`).
 registers that never differ, or always differ, are candidates. Then every candidate class is
 assumed to hold one value, each member's next-state function is built as a BDD, and members whose
 functions differ are split, until nothing splits (register correspondence). Every pair left starts

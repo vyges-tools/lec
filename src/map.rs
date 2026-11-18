@@ -135,6 +135,11 @@ pub struct MapReport {
     /// The asynchronous-reset inputs the simulation held, each with its inactive value
     /// ([`Stimulus`]).
     pub reset_inputs: Vec<(String, bool)>,
+    /// Candidate pairs PROPOSED by name ([`split_constant_classes_by_name`]): how many.
+    pub name_pairs: usize,
+    /// Of those, the pairs refinement disproved (golden name, revised name): proposed by name,
+    /// split by the proof, never in the map.
+    pub name_pairs_rejected: Vec<(String, String)>,
     /// Inputs the simulation held constant (`--hold`, [`SimHolds`]): input, value.
     pub holds: Vec<(String, bool)>,
     /// Inputs given as resets (`--reset`): input, inactive value. Also in `reset_inputs`.
@@ -214,10 +219,12 @@ pub fn register_map_with(golden: &Netlist, revised: &Netlist, lib: &Lib, names: 
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
     let stim = Stimulus::of(&[&g, &r]).with(holds);
     let (sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim)?;
-    let (mut classes, inv) = candidate_classes(&[&gm, &rm], &sigs);
+    let (classes, mut inv) = candidate_classes(&[&gm, &rm], &sigs);
+    let (mut classes, by_name) = split_constant_classes_by_name(&[&gm, &rm], &sigs, classes, &mut inv);
     let candidates = classes.clone();
     let (rounds, undecided) = refine(&[&gm, &rm], &mut classes, &inv)?;
     let mut rep = report(&[&gm, &rm], &candidates, &classes, &inv, &undecided, rounds);
+    name_pairs_kept(&[&gm, &rm], &classes, &by_name, &mut rep);
     attribute(&[&gm, &rm], &sigs, &classes, &inv, &mut rep)?;
     rep.reset_inputs = stim.held.into_iter().collect();
     rep.holds = stim.fixed.into_iter().collect();
@@ -523,6 +530,74 @@ pub(crate) fn candidate_classes(models: &[&Model], sigs: &[Vec<Vec<u64>>]) -> (V
         }
     }
     (classes, inv)
+}
+
+/// Stage 3b: a candidate class whose members NEVER toggled (every register constant in every
+/// simulated cycle after the all-zero start) is split by name. Simulation tells such registers
+/// nothing apart, so one class can hold most of a core whose state random inputs never write;
+/// each golden register with exactly one same-named revised register in the class becomes a
+/// class of its own with it, and the rest stay together as one residual class.
+///
+/// ⛔ A name only PROPOSES a pair. Every class, these included, goes through the same refinement
+/// (`refine`): a same-named pair whose next-state functions differ is split and never mapped
+/// (`name_pairs_rejected` lists it). Splitting a candidate class is sound (any partition that
+/// refinement leaves unsplit is an inductive invariant); it can only lose pairs the residual
+/// class would have found.
+///
+/// 🔑 Polarity comes from each register's constant: a register constantly 1 holds the complement
+/// of one constantly 0, so a pair with complementary constants is proposed INVERTED.
+pub(crate) fn split_constant_classes_by_name(
+    models: &[&Model],
+    sigs: &[Vec<Vec<u64>>],
+    classes: Vec<Vec<RegId>>,
+    inv: &mut Polarity,
+) -> (Vec<Vec<RegId>>, Vec<(RegId, RegId)>) {
+    let tail = |r: &RegId| sigs[r.0][r.1].get(1..).unwrap_or(&[]);
+    let constant = |r: &RegId| tail(r).iter().all(|w| *w == 0) || tail(r).iter().all(|w| *w == !0);
+    let mut out = Vec::with_capacity(classes.len());
+    let mut pairs = Vec::new();
+    for cl in classes {
+        if cl.len() < 2 || !cl.iter().all(constant) {
+            out.push(cl);
+            continue;
+        }
+        // each name with its registers on each side; only a name once on each side pairs
+        let mut by: HashMap<&str, (Vec<RegId>, Vec<RegId>)> = HashMap::new();
+        for r in &cl {
+            let e = by.entry(models[r.0].regs[r.1].name.as_str()).or_default();
+            if models[r.0].side == Side::Golden { e.0.push(*r) } else { e.1.push(*r) }
+        }
+        let mut paired: HashSet<RegId> = HashSet::new();
+        let mut own = Vec::new();
+        for &r in &cl {
+            let Some((g, v)) = by.get(models[r.0].regs[r.1].name.as_str()) else { continue };
+            if models[r.0].side != Side::Golden || g.len() != 1 || v.len() != 1 {
+                continue;
+            }
+            let m = v[0];
+            for x in [r, m] {
+                inv[x.0][x.1] = tail(&x).first().is_some_and(|w| w & 1 == 1);
+            }
+            paired.extend([r, m]);
+            pairs.push((r, m));
+            own.push(vec![r, m]);
+        }
+        let rest: Vec<RegId> = cl.into_iter().filter(|r| !paired.contains(r)).collect();
+        if !rest.is_empty() {
+            out.push(rest);
+        }
+        out.extend(own);
+    }
+    (out, pairs)
+}
+
+/// The name-proposed pairs ([`split_constant_classes_by_name`]) in the report: how many, and
+/// which refinement split (a pair is kept only while both stay in one class).
+fn name_pairs_kept(models: &[&Model], classes: &[Vec<RegId>], pairs: &[(RegId, RegId)], rep: &mut MapReport) {
+    let at: HashMap<RegId, usize> = classes.iter().enumerate().flat_map(|(i, c)| c.iter().map(move |r| (*r, i))).collect();
+    let name = |r: &RegId| models[r.0].regs[r.1].name.clone();
+    rep.name_pairs = pairs.len();
+    rep.name_pairs_rejected = pairs.iter().filter(|(g, r)| at.get(g) != at.get(r)).map(|(g, r)| (name(g), name(r))).collect();
 }
 
 /// The BDD of each of `nets` in one model, in `bdd`, a free input by its variable name and a
@@ -1323,6 +1398,27 @@ mod tests {
         let plain = nl("module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire s;\n\
              DFF r(.CK(clk),.D(d),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n");
         assert!(map(&plain, &m).mapped.is_empty());
+    }
+
+    /// ⛔ A never-toggling class is split by NAME, and a name only proposes. All six registers
+    /// below stay 0 (or 1) while `te` is held at 0, so simulation puts them in one class.
+    /// `s` (D = te both sides) is proved; `r` (D = te vs te & d) is same-named but NOT
+    /// equivalent with te free, so refinement splits it and the report lists it; `p` stores te
+    /// in the golden and !te in the revised (constants 0 and 1), so it pairs INVERTED.
+    #[test]
+    fn a_never_toggling_class_is_split_by_name_and_each_pair_still_proved() {
+        let holds = SimHolds { hold: [("te".to_string(), false)].into_iter().collect(), ..Default::default() };
+        let g = nl("module t(clk,te,d,q1,q2,q3);\ninput clk,te,d; output q1,q2,q3;\n\
+             DFF s(.CK(clk),.D(te),.Q(q1));\nDFF r(.CK(clk),.D(te),.Q(q2));\nDFF p(.CK(clk),.D(te),.Q(q3));\nendmodule\n");
+        let m = nl("module t(clk,te,d,q1,q2,q3);\ninput clk,te,d; output q1,q2,q3;\nwire a, n;\n\
+             AND2 x(.A(te),.B(d),.Y(a));\nINV i(.A(te),.Y(n));\n\
+             DFF s(.CK(clk),.D(te),.Q(q1));\nDFF r(.CK(clk),.D(a),.Q(q2));\nDFF p(.CK(clk),.D(n),.Q(q3));\nendmodule\n");
+        let rep = register_map_with(&g, &m, &lib(), (Naming::Instance, Naming::Instance), &holds).unwrap();
+        assert_eq!(rep.name_pairs, 3, "{rep:?}");
+        assert_eq!(rep.mapped.get("s").map(String::as_str), Some("s"), "{rep:?}");
+        assert!(!rep.mapped.contains_key("r") && !rep.inverted.contains_key("r"), "same name, not equivalent: {rep:?}");
+        assert_eq!(rep.name_pairs_rejected, [("r".to_string(), "r".to_string())], "{rep:?}");
+        assert_eq!(rep.inverted.get("p").map(String::as_str), Some("p"), "complementary constants pair inverted: {rep:?}");
     }
 
     /// ⛔ `--hold` / `--reset` act on the candidate simulation ONLY. A held input is constant and a

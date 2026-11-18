@@ -809,7 +809,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"name_pairs\": {},\n  \"name_pairs_rejected\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -830,6 +830,11 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             },
             {
                 let rows: Vec<String> = rep.resets_given.iter().map(|(n, v)| format!("{{\"input\": {}, \"inactive\": {}}}", json_str(n), u8::from(*v))).collect();
+                format!("[{}]", rows.join(", "))
+            },
+            rep.name_pairs,
+            {
+                let rows: Vec<String> = rep.name_pairs_rejected.iter().map(|(g, r)| format!("{{\"golden\": {}, \"revised\": {}}}", json_str(g), json_str(r))).collect();
                 format!("[{}]", rows.join(", "))
             },
             {
@@ -897,6 +902,16 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for (n, v) in &rep.resets_given {
             s += &format!("  reset given {n}, inactive {}  (--reset: candidate simulation only)\n", u8::from(*v));
+        }
+        if rep.name_pairs > 0 {
+            s += &format!(
+                "  by name     {} candidate pair(s) proposed by name among never-toggling registers, {} disproved (proved like any other)\n",
+                rep.name_pairs,
+                rep.name_pairs_rejected.len()
+            );
+        }
+        for (g, r) in &rep.name_pairs_rejected {
+            s += &format!("  name split  {g} / {r}  (same name, disproved)\n");
         }
         for g in &rep.free_enables {
             s += &format!("  free enable {g}  (simulation drives this clock gate's enable at random; the proof uses the real one)\n");
