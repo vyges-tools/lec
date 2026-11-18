@@ -160,7 +160,10 @@ vyges-lec map — ONE-TO-ONE ✓  34 of 34 golden and 34 revised register(s) map
 
 A pair is proved, never taken from a name. Both designs are simulated from the all-zero state on
 the same random inputs (an input that only reaches asynchronous clear or preset pins, found from
-the Liberty, is held active for the first cycles and inactive after, so a design leaves reset);
+the Liberty, is held active for the first cycles and inactive after, so a design leaves reset;
+and a clock-gate enable that never asserts is driven at random and the simulation rerun, so a
+core whose clock is enabled only by a register sequence still moves: listed as `free_enables`,
+the proof uses the real enable);
 registers that never differ, or always differ, are candidates. Then every candidate class is
 assumed to hold one value, each member's next-state function is built as a BDD, and members whose
 functions differ are split, until nothing splits (register correspondence). Every pair left starts

@@ -1099,6 +1099,11 @@ pub(crate) fn gate_net(inst: &str) -> String {
     format!("{inst} <enable>")
 }
 
+/// The clock-gate instance whose enable signal `net` is ([`gate_net`]), if it is one.
+pub(crate) fn gate_of(net: &str) -> Option<&str> {
+    net.strip_suffix(" <enable>")
+}
+
 /// Collect the cone of `endpoints` with exactly `build`'s rules: the same free-input test, the
 /// same cell-to-primitive map, the same input pins, the same errors.
 #[cfg_attr(not(feature = "abc"), allow(dead_code))]

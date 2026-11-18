@@ -774,7 +774,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -787,6 +787,10 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             regs(&rep.cut),
             {
                 let rows: Vec<String> = rep.reset_inputs.iter().map(|(n, v)| format!("{{\"input\": {}, \"inactive\": {}}}", json_str(n), u8::from(*v))).collect();
+                format!("[{}]", rows.join(", "))
+            },
+            {
+                let rows: Vec<String> = rep.free_enables.iter().map(|g| json_str(g)).collect();
                 format!("[{}]", rows.join(", "))
             },
             pairs(&rep.causes),
@@ -844,6 +848,9 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for (n, v) in &rep.reset_inputs {
             s += &format!("  reset input {n}  (simulation holds it active {RESET} cycle(s), then at {})\n", u8::from(*v), RESET = map::RESET_CYCLES);
+        }
+        for g in &rep.free_enables {
+            s += &format!("  free enable {g}  (simulation drives this clock gate's enable at random; the proof uses the real one)\n");
         }
         for x in &rep.cut {
             s += &format!("  cut         {} {}  (a latch or memory, cut as check cuts it: paired by instance name, not proved)\n", side(x.side), x.instance);

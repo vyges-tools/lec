@@ -12,8 +12,10 @@
 //!    clock, every register starting at 0, asynchronous clear and preset acting at the edge).
 //! 2. [`simulate`]: both designs from the all-zero state on the SAME inputs (each primary input
 //!    by name: random, except the asynchronous-reset inputs, held active and then inactive,
-//!    [`Stimulus`]), 64 runs at once for [`CYCLES`] cycles. A register's signature is its state
-//!    in every run and cycle.
+//!    [`Stimulus`]), 64 runs at once for [`CYCLES`] cycles; a clock-gate enable that never
+//!    asserts is then driven at random and the simulation rerun
+//!    ([`simulate_freeing_stuck_enables`]). A register's signature is its state in every run and
+//!    cycle.
 //! 3. [`candidate_classes`]: registers with one signature form a class, whichever design they
 //!    are in. Two registers that ever differed in simulation are never assumed equal.
 //! 4. [`refine`]: assume every class holds one value (one BDD variable per class) and build each
@@ -46,10 +48,10 @@
 //!   weakens what the others may assume, so the rest stays sound. A class too big for ONE
 //!   manager is built in chunks ([`chunked_keys`]) and still refined exactly.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use crate::bdd::Bdd;
-use crate::lec::{apply_op, func_bdd, next_net, outside_edge_model, seq_cone, state_net, Cone, Design, Logic, Op, Src};
+use crate::lec::{apply_op, func_bdd, gate_of, next_net, outside_edge_model, seq_cone, state_net, Cone, Design, Logic, Op, Src};
 use crate::liberty::{Dir, Lib};
 use crate::netlist::Netlist;
 use vyges_loom::liberty_func::Func;
@@ -60,6 +62,10 @@ pub const CYCLES: usize = 128;
 /// The first cycles of the simulation hold every asynchronous-reset input ACTIVE; after them
 /// it is held inactive ([`Stimulus`]).
 pub const RESET_CYCLES: usize = 2;
+
+/// The input name whose random words drive every clock-gate enable in [`simulate`] (a name no
+/// netlist input can have).
+pub(crate) const FREE_ENABLE: &str = "<clock-gate enable>";
 
 /// Nodes (plus memo entries) one BDD manager may take; a class that outgrows it continues in a
 /// fresh manager ([`chunked_keys`]).
@@ -127,6 +133,8 @@ pub struct MapReport {
     /// The asynchronous-reset inputs the simulation held, each with its inactive value
     /// ([`Stimulus`]).
     pub reset_inputs: Vec<(String, bool)>,
+    /// Clock gates whose enable the simulation drove at random ([`simulate`]), by instance.
+    pub free_enables: Vec<String>,
     pub golden_registers: usize,
     pub revised_registers: usize,
     /// Refinement rounds until nothing split.
@@ -166,13 +174,14 @@ pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Nami
     let (g, r) = (Design::register_model(golden, lib), Design::register_model(revised, lib));
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
     let stim = Stimulus::of(&[&g, &r]);
-    let sigs = simulate(&[&gm, &rm], &stim)?;
+    let (sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim)?;
     let (mut classes, inv) = candidate_classes(&[&gm, &rm], &sigs);
     let candidates = classes.clone();
     let (rounds, undecided) = refine(&[&gm, &rm], &mut classes, &inv)?;
     let mut rep = report(&[&gm, &rm], &candidates, &classes, &inv, &undecided, rounds);
     attribute(&[&gm, &rm], &sigs, &classes, &inv, &mut rep)?;
     rep.reset_inputs = stim.held.into_iter().collect();
+    rep.free_enables = freed.iter().flatten().filter_map(|n| gate_of(n).map(str::to_string)).collect::<BTreeSet<_>>().into_iter().collect();
     Ok(rep)
 }
 
@@ -342,9 +351,41 @@ fn prim_word(op: Op, pins: &[String], x: &[u64]) -> Result<u64, String> {
 
 /// Stage 2: each register's state in 64 runs over [`CYCLES`] cycles from the all-zero state,
 /// every design on the same inputs. `sigs[m][k]` is model `m`'s register `k`.
-pub(crate) fn simulate(models: &[&Model], stim: &Stimulus) -> Result<Vec<Vec<Vec<u64>>>, String> {
+/// The signatures (`sigs[model][register]`, one word per cycle) and, per model, the clock-gate
+/// enable nets that never asserted (or were freed).
+pub(crate) type Simulated = (Vec<Vec<Vec<u64>>>, Vec<BTreeSet<String>>);
+
+/// Stage 2 as run: [`simulate`] with every clock-gate enable computed; then, if some gate's
+/// enable never asserted after reset (in any run, any cycle), again with exactly those enables
+/// FREE. Returns the signatures and, per model, the enable nets freed.
+///
+/// 🔑 A core whose clock gate is enabled only by a register sequence random inputs never produce
+/// (CoralNPU: an enable written over AXI) never leaves reset behind that gate: 119,482 registers
+/// shared one all-zero class. Driving that enable at random (one stream for every freed gate,
+/// [`FREE_ENABLE`], so two designs see the same enables whatever their gates are called) moves
+/// them. Only an enable that NEVER asserts is freed: one that does is left computed, so a gated
+/// register still meets its plain enable-mux equivalent in the other design. Only the
+/// candidates change: `refine` builds the REAL enable ([`next_state_bdds`]), so a pair that
+/// differs under it is still split.
+pub(crate) fn simulate_freeing_stuck_enables(models: &[&Model], stim: &Stimulus) -> Result<Simulated, String> {
+    let none: Vec<BTreeSet<String>> = vec![BTreeSet::new(); models.len()];
+    let (sigs, stuck) = simulate(models, stim, &none)?;
+    if stuck.iter().all(BTreeSet::is_empty) {
+        return Ok((sigs, stuck));
+    }
+    let (sigs, _) = simulate(models, stim, &stuck)?;
+    Ok((sigs, stuck))
+}
+
+/// Stage 2: each register's state in 64 runs over [`CYCLES`] cycles from the all-zero state,
+/// every design on the same inputs, the enable nets in `free[m]` driven at random. Returns
+/// `sigs[m][k]` (model `m`'s register `k`) and, per model, the clock-gate enable nets that
+/// never asserted after [`RESET_CYCLES`].
+pub(crate) fn simulate(models: &[&Model], stim: &Stimulus, free: &[BTreeSet<String>]) -> Result<Simulated, String> {
     let mut out = Vec::new();
-    for m in models {
+    let mut stuck_all = Vec::new();
+    for (mi, m) in models.iter().enumerate() {
+        let mut asserted: BTreeSet<&str> = BTreeSet::new();
         let c = &m.cone;
         let mut state = vec![0u64; m.regs.len()];
         let mut sig = vec![Vec::with_capacity(CYCLES); m.regs.len()];
@@ -370,10 +411,18 @@ pub(crate) fn simulate(models: &[&Model], stim: &Stimulus) -> Result<Vec<Vec<Vec
                         Src::Const(v) => Ok(if *v { !0 } else { 0 }),
                     })
                     .collect::<Result<_, _>>()?;
-                let y = match &g.logic {
-                    Logic::Prim(op) => prim_word(*op, &g.pins, &x)?,
-                    Logic::Func(f) => func_word(f, &g.pins, &x),
+                // a freed clock-gate enable ([`simulate_freeing_stuck_enables`]): the shared random stream
+                let y = if free[mi].contains(&g.out) {
+                    stim.word(FREE_ENABLE, cycle)
+                } else {
+                    match &g.logic {
+                        Logic::Prim(op) => prim_word(*op, &g.pins, &x)?,
+                        Logic::Func(f) => func_word(f, &g.pins, &x),
+                    }
                 };
+                if y != 0 && cycle >= RESET_CYCLES && gate_of(&g.out).is_some() {
+                    asserted.insert(g.out.as_str());
+                }
                 val.insert(g.out.as_str(), y);
             }
             for (k, r) in c.regs.iter().enumerate() {
@@ -381,8 +430,9 @@ pub(crate) fn simulate(models: &[&Model], stim: &Stimulus) -> Result<Vec<Vec<Vec
             }
         }
         out.push(sig);
+        stuck_all.push(c.gates.iter().filter(|g| gate_of(&g.out).is_some() && !asserted.contains(g.out.as_str())).map(|g| g.out.clone()).collect());
     }
-    Ok(out)
+    Ok((out, stuck_all))
 }
 
 /// Each register's polarity in its class, per model: `true` when the register holds the
@@ -1216,6 +1266,40 @@ mod tests {
         let plain = nl("module t(clk,en,se,d,q);\ninput clk,en,se,d; output q;\nwire s;\n\
              DFF r(.CK(clk),.D(d),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n");
         assert!(map(&plain, &m).mapped.is_empty());
+    }
+
+    /// 🔑 A clock-gate enable that NEVER asserts in simulation is freed for the candidates only.
+    /// Here the gate's enable comes from `e`, a register stuck at 0, so `r` behind it never
+    /// loads and its signature is all zero; freed, the enable is the shared random stream and `r`
+    /// moves. The proof keeps the real enable: two designs whose enables are both stuck in
+    /// simulation but are different functions (`e` against `e & k`) are candidates, and `refine`
+    /// still splits `r` from `r`.
+    #[test]
+    fn a_stuck_clock_gate_enable_is_free_in_simulation_only() {
+        let gated = |en: &str| {
+            nl(&format!(
+                "module t(clk,k,d,q,p);\ninput clk,k,d; output q,p;\nwire eq,en,le,gclk,s;\n\
+                 DFF e(.CK(clk),.D(eq),.Q(eq));\nBUF o(.A(eq),.Y(p));\n{en}\nLATN l(.G(clk),.D(en),.Q(le));\n\
+                 AND2 g(.A(clk),.B(le),.Y(gclk));\nDFF r(.CK(gclk),.D(d),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n"
+            ))
+        };
+        let (g, r) = (gated("BUF n(.A(eq),.Y(en));"), gated("AND2 n(.A(eq),.B(k),.Y(en));"));
+        let l = lib();
+        let (gd, rd) = (Design::register_model(&g, &l), Design::register_model(&r, &l));
+        let (gm, rm) = (model(&gd, Side::Golden, Naming::Instance).unwrap(), model(&rd, Side::Revised, Naming::Instance).unwrap());
+        let stim = Stimulus::of(&[&gd, &rd]);
+        let (sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim).unwrap();
+        assert_eq!(freed[0].iter().map(String::as_str).collect::<Vec<_>>(), ["l <enable>"]);
+        let at = |m: &Model, n: &str| m.regs.iter().position(|x| x.name == n).unwrap();
+        assert!(sigs[0][at(&gm, "r")].iter().any(|w| *w != 0), "freed, r loads");
+        assert_eq!(sigs[0][at(&gm, "r")], sigs[1][at(&rm, "r")], "both designs see one enable stream");
+        let (plain, _) = simulate(&[&gm, &rm], &stim, &[BTreeSet::new(), BTreeSet::new()]).unwrap();
+        assert!(plain[0][at(&gm, "r")].iter().all(|w| *w == 0), "computed, the enable never asserts");
+        let rep = map(&g, &r);
+        assert_eq!(rep.free_enables, ["l"]);
+        assert_eq!(rep.mapped.get("e").map(String::as_str), Some("e"), "{rep:?}");
+        assert!(!rep.mapped.contains_key("r"), "the proof reads e against e & k: {rep:?}");
+        assert_eq!(map(&g, &g).mapped.get("r").map(String::as_str), Some("r"));
     }
 
     /// Two gates in a row (an outer gate whose output clocks the inner gate's latch) as a chain
