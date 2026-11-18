@@ -19,7 +19,8 @@
 //! 4. [`refine`]: assume every class holds one value (one BDD variable per class) and build each
 //!    member's next-state function over the primary inputs and the class variables. Members whose
 //!    functions differ are split. Repeat until nothing splits.
-//! 5. [`report`]: a class left with exactly one register of each design is a MAPPED pair.
+//! 5. [`report`]: a class left with exactly one register of each design is a MAPPED pair (an
+//!    INVERTED pair when one stores the other's complement).
 //!
 //! 🔑 Why the fixed point is a proof: every member of a final class starts at 0, and in any state
 //! where every class holds one value, every member of a class loads the same next value. By
@@ -31,7 +32,11 @@
 //!   counterpart that provably holds its value;
 //! - a class with several registers of one design (`duplicated` or `ambiguous`): the map gives one
 //!   name per name, and choosing one would be a guess;
-//! - a register stored inverted (its counterpart holds the complement): not matched by this model;
+//! - a register stored inverted is NOT left out: it shares a class with the complement of its
+//!   value (`inverted`, [`candidate_classes`]) and is proved like any member, read and compared
+//!   complemented. ⚠️ Such a pair does not hold at the all-zero start (both are 0 there); it
+//!   holds in every state reached from one where every class holds, i.e. after a reset that
+//!   clears one and presets the other, and so does every pair whose proof reads it;
 //! - a LATCH or a MEMORY macro (`cut`; any state that is not one `ff` group): not a register of
 //!   the map. It is cut as `check` cuts it, its outputs free inputs named by instance
 //!   ([`Design::register_model`]), so the map holds under `check`'s own assumption that two such
@@ -96,6 +101,11 @@ pub struct RegName {
 pub struct MapReport {
     /// Golden name -> revised name, each pair proved to hold the same value.
     pub mapped: BTreeMap<String, String>,
+    /// Golden name -> revised name, each pair proved to hold COMPLEMENTED values: the revised
+    /// register stores the negation (its clear acts where the golden's preset does, and the other
+    /// way round). Not in `mapped`, so a consumer that takes `mapped` as same-value pairs is
+    /// never handed one.
+    pub inverted: BTreeMap<String, String>,
     /// A golden register with several revised registers that all hold its value (a register the
     /// revised design duplicated): golden name -> revised names.
     pub duplicated: BTreeMap<String, Vec<String>>,
@@ -140,8 +150,9 @@ pub struct MapReport {
 impl MapReport {
     /// Every register of both designs is in a one-to-one pair.
     pub fn one_to_one(&self) -> bool {
-        self.mapped.len() == self.golden_registers
-            && self.mapped.len() == self.revised_registers
+        let n = self.mapped.len() + self.inverted.len();
+        n == self.golden_registers
+            && n == self.revised_registers
             && self.unobserved.is_empty()
     }
 }
@@ -156,11 +167,11 @@ pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Nami
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
     let stim = Stimulus::of(&[&g, &r]);
     let sigs = simulate(&[&gm, &rm], &stim)?;
-    let mut classes = candidate_classes(&[&gm, &rm], &sigs);
+    let (mut classes, inv) = candidate_classes(&[&gm, &rm], &sigs);
     let candidates = classes.clone();
-    let (rounds, undecided) = refine(&[&gm, &rm], &mut classes)?;
-    let mut rep = report(&[&gm, &rm], &candidates, &classes, &undecided, rounds);
-    attribute(&[&gm, &rm], &sigs, &classes, &mut rep)?;
+    let (rounds, undecided) = refine(&[&gm, &rm], &mut classes, &inv)?;
+    let mut rep = report(&[&gm, &rm], &candidates, &classes, &inv, &undecided, rounds);
+    attribute(&[&gm, &rm], &sigs, &classes, &inv, &mut rep)?;
     rep.reset_inputs = stim.held.into_iter().collect();
     Ok(rep)
 }
@@ -374,21 +385,37 @@ pub(crate) fn simulate(models: &[&Model], stim: &Stimulus) -> Result<Vec<Vec<Vec
     Ok(out)
 }
 
-/// Stage 3: the registers of all models grouped by signature, each class in (model, register)
-/// order, the classes in order of their first member.
-pub(crate) fn candidate_classes(models: &[&Model], sigs: &[Vec<Vec<u64>>]) -> Vec<Vec<RegId>> {
-    let mut by_sig: BTreeMap<&[u64], usize> = BTreeMap::new();
+/// Each register's polarity in its class, per model: `true` when the register holds the
+/// COMPLEMENT of its class's value.
+pub(crate) type Polarity = Vec<Vec<bool>>;
+
+/// Stage 3: the registers of all models grouped by signature UP TO COMPLEMENT, each class in
+/// (model, register) order, the classes in order of their first member; with each register's
+/// polarity in its class.
+///
+/// 🔑 A signature is compared from cycle 1: cycle 0 is the all-zero start, the same in every
+/// register, so leaving it out separates nothing that it separated. A signature whose first bit
+/// (cycle 1, run 0) is 1 is complemented and its register marked inverted, so a register and one
+/// that stores its negation (a golden register cleared where the revised one is preset) share a
+/// class; two registers with the same signature always get the same polarity.
+pub(crate) fn candidate_classes(models: &[&Model], sigs: &[Vec<Vec<u64>>]) -> (Vec<Vec<RegId>>, Polarity) {
+    let mut by_sig: HashMap<Vec<u64>, usize> = HashMap::new();
     let mut classes: Vec<Vec<RegId>> = Vec::new();
+    let mut inv: Polarity = models.iter().map(|m| vec![false; m.regs.len()]).collect();
     for (m, model) in models.iter().enumerate() {
         for (k, sig) in sigs[m].iter().enumerate().take(model.regs.len()) {
-            let c = *by_sig.entry(sig.as_slice()).or_insert_with(|| {
+            let tail = sig.get(1..).unwrap_or(&[]);
+            let flip = tail.first().is_some_and(|w| w & 1 == 1);
+            let key: Vec<u64> = if flip { tail.iter().map(|w| !w).collect() } else { tail.to_vec() };
+            inv[m][k] = flip;
+            let c = *by_sig.entry(key).or_insert_with(|| {
                 classes.push(Vec::new());
                 classes.len() - 1
             });
             classes[c].push((m, k));
         }
     }
-    classes
+    (classes, inv)
 }
 
 /// The BDD of each of `nets` in one model, in `bdd`, a free input by its variable name and a
@@ -399,7 +426,7 @@ fn next_state_bdds(
     nets: &[String],
     bdd: &mut Bdd,
     var: &mut dyn FnMut(&mut Bdd, &str) -> u32,
-    class_var: &dyn Fn(&str) -> String,
+    class_var: &dyn Fn(&str) -> (String, bool),
 ) -> Result<Option<Vec<u32>>, String> {
     let c = &model.cone;
     // the gates the nets need, by depth-first search without recursion, then in cone order
@@ -432,14 +459,16 @@ fn next_state_bdds(
                         // register whose `next_state` reads its own state (an enable register)
                         // as a free input, and as one it would be a variable of its own, not its
                         // class's: an enable register then never matched its own copy.
-                        let name = if model.state.contains(n.as_str()) {
+                        // a register inverted in its class reads as the class value's complement
+                        let (name, neg) = if model.state.contains(n.as_str()) {
                             class_var(n)
                         } else if let Some(v) = c.free.get(n) {
-                            v.clone()
+                            (v.clone(), false)
                         } else {
                             return Err(format!("cone gate `{}` reads `{n}` before it is computed (gate {k})", g.out));
                         };
                         let x = var(bdd, &name);
+                        let x = if neg { bdd.not(x) } else { x };
                         f.insert(n.as_str(), x);
                         x
                     }
@@ -539,30 +568,38 @@ pub(crate) fn chunked_keys(
 /// The next-state key of each of `members` ([`chunked_keys`]), a register's state read as its
 /// class's variable (`class_of[model][state net]`); `None` for a member undecided within the
 /// budget. Members with the same key load the same value whenever every class holds one value.
-fn next_keys(models: &[&Model], members: &[RegId], class_of: &[HashMap<String, usize>], limit: usize) -> Result<Vec<Option<Key>>, String> {
+fn next_keys(models: &[&Model], members: &[RegId], class_of: &[ClassOf], limit: usize) -> Result<Vec<Option<Key>>, String> {
     let mut build = |i: usize, bdd: &mut Bdd, var: &mut dyn FnMut(&mut Bdd, &str) -> u32| -> Result<Option<u32>, String> {
         let (m, k) = members[i];
         let co = &class_of[m];
-        let cv = |s: &str| format!("class {}", co.get(s).copied().unwrap_or(usize::MAX));
+        let cv = |s: &str| {
+            let (c, neg) = co.get(s).copied().unwrap_or((usize::MAX, false));
+            (format!("class {c}"), neg)
+        };
         let net = next_net(&models[m].regs[k].instance);
-        Ok(next_state_bdds(models[m], &[net], bdd, var, &cv)?.map(|v| v[0]))
+        let neg = co.get(&state_net(&models[m].regs[k].instance)).is_some_and(|x| x.1);
+        // an inverted member's next value is compared complemented, as the class's value
+        Ok(next_state_bdds(models[m], &[net], bdd, var, &cv)?.map(|v| if neg { bdd.not(v[0]) } else { v[0] }))
     };
     Ok(chunked_keys(members.len(), limit, &mut build)?.0)
 }
 
 /// `a` and `b` load the same next value with every class holding one value: proved, not
 /// undecided within the budget.
-fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[HashMap<String, usize>]) -> Result<bool, String> {
+fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[ClassOf]) -> Result<bool, String> {
     let k = next_keys(models, &[a, b], class_of, BDD_LIMIT)?;
     Ok(matches!((&k[0], &k[1]), (Some(x), Some(y)) if x == y))
 }
 
 /// Each register's class, by its state net, per model.
-fn class_index(models: &[&Model], classes: &[Vec<RegId>]) -> Vec<HashMap<String, usize>> {
-    let mut class_of: Vec<HashMap<String, usize>> = vec![HashMap::new(); models.len()];
+/// A register's class and its polarity in it, by its state net.
+type ClassOf = HashMap<String, (usize, bool)>;
+
+fn class_index(models: &[&Model], classes: &[Vec<RegId>], inv: &dyn Fn(RegId) -> bool) -> Vec<ClassOf> {
+    let mut class_of: Vec<ClassOf> = vec![HashMap::new(); models.len()];
     for (ci, cl) in classes.iter().enumerate() {
         for &(m, k) in cl {
-            class_of[m].insert(state_net(&models[m].regs[k].instance), ci);
+            class_of[m].insert(state_net(&models[m].regs[k].instance), (ci, inv((m, k))));
         }
     }
     class_of
@@ -570,17 +607,17 @@ fn class_index(models: &[&Model], classes: &[Vec<RegId>]) -> Vec<HashMap<String,
 
 /// Stage 4: split every class whose members load different next values when every class holds
 /// one value, until nothing splits. Returns the rounds taken and the registers left undecided.
-pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>) -> Result<(usize, Vec<RegId>), String> {
-    refine_within(models, classes, BDD_LIMIT)
+pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity) -> Result<(usize, Vec<RegId>), String> {
+    refine_within(models, classes, inv, BDD_LIMIT)
 }
 
 /// [`refine`] with each manager limited to `limit` nodes plus memo entries.
-pub(crate) fn refine_within(models: &[&Model], classes: &mut Vec<Vec<RegId>>, limit: usize) -> Result<(usize, Vec<RegId>), String> {
+pub(crate) fn refine_within(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity, limit: usize) -> Result<(usize, Vec<RegId>), String> {
     let mut undecided: Vec<RegId> = Vec::new();
     let mut rounds = 0;
     loop {
         rounds += 1;
-        let class_of = class_index(models, classes);
+        let class_of = class_index(models, classes, &|r: RegId| inv[r.0][r.1]);
         let mut next: Vec<Vec<RegId>> = Vec::with_capacity(classes.len());
         let mut split = false;
         for cl in classes.iter() {
@@ -620,7 +657,7 @@ pub(crate) fn refine_within(models: &[&Model], classes: &mut Vec<Vec<RegId>>, li
 
 /// Stage 5: the map from the final classes; `candidates` (stage 3) tells a register that never
 /// had a counterpart from one whose counterpart was disproved.
-pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Vec<RegId>], undecided: &[RegId], rounds: usize) -> MapReport {
+pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Vec<RegId>], inv: &Polarity, undecided: &[RegId], rounds: usize) -> MapReport {
     let name = |r: &RegId| models[r.0].regs[r.1].name.clone();
     let golden = |r: &&RegId| models[r.0].side == Side::Golden;
     let mut had_candidate: HashMap<RegId, bool> = HashMap::new();
@@ -636,7 +673,21 @@ pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Ve
         rounds,
         ..MapReport::default()
     };
+    // 🔑 A class's registers of one polarity are reported as before; only when NEITHER polarity
+    // holds registers of both designs are the two taken together, the pairs then inverted. A
+    // register and a revised one of its own polarity therefore never lose their pairing to one
+    // stored inverted.
+    let mut groups: Vec<(Vec<RegId>, bool)> = Vec::new();
     for cl in classes {
+        let (pos, neg): (Vec<RegId>, Vec<RegId>) = cl.iter().partition(|r| !inv[r.0][r.1]);
+        let both = |v: &[RegId]| v.iter().any(|r| golden(&r)) && v.iter().any(|r| !golden(&r));
+        if !both(&pos) && !both(&neg) && both(cl) {
+            groups.push((cl.clone(), true));
+        } else {
+            groups.extend([pos, neg].into_iter().filter(|v| !v.is_empty()).map(|v| (v, false)));
+        }
+    }
+    for (cl, inverted) in &groups {
         let (g, r): (Vec<&RegId>, Vec<&RegId>) = cl.iter().partition(golden);
         let (gn, rn): (Vec<String>, Vec<String>) = (g.iter().map(|x| name(x)).collect(), r.iter().map(|x| name(x)).collect());
         match (g.len(), r.len()) {
@@ -650,9 +701,14 @@ pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Ve
                     rep.unmatched_golden.insert(name(x), had_candidate[x]);
                 }
             }
+            (1, 1) if *inverted => {
+                rep.inverted.insert(gn[0].clone(), rn[0].clone());
+            }
             (1, 1) => {
                 rep.mapped.insert(gn[0].clone(), rn[0].clone());
             }
+            // an inverted class that is not one-to-one is not decided
+            _ if *inverted => rep.ambiguous.push((gn, rn)),
             (1, _) => {
                 rep.duplicated.insert(gn[0].clone(), rn);
             }
@@ -701,7 +757,11 @@ fn agreement(a: &[u64], b: &[u64]) -> (u32, u32) {
 /// Each rule is pinned by a unit test that states it (`the_register_where_*`, `agreement_*`,
 /// `mutual_best_*`, `leftovers_*`, `a_pair_reading_*`) and by the corpus witness (a gcd netlist
 /// with one register's D tied to its Q names exactly that register, 33 pairs following).
-pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Vec<RegId>], rep: &mut MapReport) -> Result<(), String> {
+pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Vec<RegId>], inv: &Polarity, rep: &mut MapReport) -> Result<(), String> {
+    // polarity as proved for a register in a class of both designs; every other register is
+    // assumed as itself (the pairs below are by its raw signature)
+    let mapped: HashSet<RegId> = classes.iter().filter(|c| c.iter().any(|r| models[r.0].side == Side::Golden) && c.iter().any(|r| models[r.0].side == Side::Revised)).flatten().copied().collect();
+    let pol = |r: RegId| inv[r.0][r.1] && mapped.contains(&r);
     let only = |cl: &Vec<RegId>, side: Side| cl.iter().all(|r| models[r.0].side == side);
     let gold: Vec<RegId> = classes.iter().filter(|c| only(c, Side::Golden)).flatten().copied().collect();
     let rev: Vec<RegId> = classes.iter().filter(|c| only(c, Side::Revised)).flatten().copied().collect();
@@ -727,7 +787,7 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
     let (gn, rn) = (gold.len(), rev.len());
     let left = |pairs: &[(usize, usize)]| (gn - pairs.len()) * (rn - pairs.len());
     if left(&pairs) * (pairs.len() + 1) <= LEFTOVER_CAP {
-        pair_leftovers(gn, rn, &mut pairs, &mut |p: &[(usize, usize)]| follows(models, classes, &gold, &rev, p))?;
+        pair_leftovers(gn, rn, &mut pairs, &mut |p: &[(usize, usize)]| follows(models, classes, &pol, &gold, &rev, p))?;
     }
     let (mut gfree, mut rfree) = (vec![true; gn], vec![true; rn]);
     for &(i, j) in &pairs {
@@ -735,7 +795,7 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
         rfree[j] = false;
     }
     // 4. each pair's verdict, every class and pair assumed equal
-    let class_of = class_index(models, &assumed_classes(models, classes, &gold, &rev, &pairs));
+    let class_of = class_index(models, &assumed_classes(models, classes, &gold, &rev, &pairs), &pol);
     let unpaired: HashSet<String> = gold
         .iter()
         .zip(&gfree)
@@ -848,8 +908,8 @@ fn assumed_classes(models: &[&Model], classes: &[Vec<RegId>], gold: &[RegId], re
 }
 
 /// How many of `pairs` load the same next value with every class and pair assumed equal.
-fn follows(models: &[&Model], classes: &[Vec<RegId>], gold: &[RegId], rev: &[RegId], pairs: &[(usize, usize)]) -> Result<usize, String> {
-    let class_of = class_index(models, &assumed_classes(models, classes, gold, rev, pairs));
+fn follows(models: &[&Model], classes: &[Vec<RegId>], pol: &dyn Fn(RegId) -> bool, gold: &[RegId], rev: &[RegId], pairs: &[(usize, usize)]) -> Result<usize, String> {
+    let class_of = class_index(models, &assumed_classes(models, classes, gold, rev, pairs), pol);
     let mut n = 0;
     for &(i, j) in pairs {
         if same_next(models, gold[i], rev[j], &class_of)? {
@@ -1041,16 +1101,81 @@ mod tests {
             c.sort();
             c
         };
+        let flat: Polarity = models.iter().map(|m| vec![false; m.regs.len()]).collect();
         let mut full = vec![all.clone()];
-        let (_, u) = refine(&models, &mut full).unwrap();
+        let (_, u) = refine(&models, &mut full, &flat).unwrap();
         assert!(u.is_empty());
         let mut small = vec![all];
         // 8 nodes plus memo entries: each member fits a manager alone, the class does not (7 makes
         // a member undecided; with the old rule, any overflow undecided the whole class)
-        let (_, u) = refine_within(&models, &mut small, 8).unwrap();
+        let (_, u) = refine_within(&models, &mut small, &flat, 8).unwrap();
         assert!(u.is_empty(), "chunks, not undecided: {u:?}");
         assert_eq!(sorted(small), sorted(full.clone()));
         assert_eq!(full.iter().filter(|c| c.len() == 2).count(), 3, "r0=u0, r1=u1, r2=u2");
+    }
+
+    /// The golden pair `r0` (cleared, loads `d`) and `r1` (cleared, loads `r0`), against a
+    /// revised design whose `u0` stores the complement: preset where `r0` is cleared, loading
+    /// `!d`, `u1` loading `!u0`. `u0_kind` is u0's cell and reset pin, `u0_d` its data input.
+    fn complement(u0: &str) -> (Netlist, Netlist) {
+        let g = nl("module t(clk,rst_n,d,q);\ninput clk,rst_n,d; output q;\nwire s0;\n\
+             DFR r0(.CK(clk),.D(d),.RESET_B(rst_n),.Q(s0));\nDFR r1(.CK(clk),.D(s0),.RESET_B(rst_n),.Q(q));\nendmodule\n");
+        let r = nl(&format!(
+            "module t(clk,rst_n,d,q);\ninput clk,rst_n,d; output q;\nwire nd,s0,ns0;\n\
+             INV i0(.A(d),.Y(nd));\n{u0}\nINV i1(.A(s0),.Y(ns0));\nDFR u1(.CK(clk),.D(ns0),.RESET_B(rst_n),.Q(q));\nendmodule\n"
+        ));
+        (g, r)
+    }
+
+    /// 🔑 L1: a register maps to one storing its COMPLEMENT, with clear and preset swapped (the
+    /// golden `r0` cleared where the revised `u0` is preset): proved like any pair, with `u0`
+    /// read as the complement of the class value, and reported under `inverted`, never `mapped`.
+    /// `r1` maps to `u1` as itself THROUGH that pair (u1 reads `!u0` = `r0`).
+    #[test]
+    fn a_register_storing_the_complement_maps_inverted_with_clear_and_preset_swapped() {
+        let (g, r) = complement("DFS u0(.CK(clk),.D(nd),.SET_B(rst_n),.Q(s0));");
+        let rep = map(&g, &r);
+        assert_eq!(rep.inverted, [("r0".to_string(), "u0".to_string())].into_iter().collect());
+        assert_eq!(rep.mapped, [("r1".to_string(), "u1".to_string())].into_iter().collect());
+        assert!(rep.one_to_one());
+        // clear NOT swapped for preset: in reset both are 0, so u0 is not the complement of r0
+        let (g, r) = complement("DFR u0(.CK(clk),.D(nd),.RESET_B(rst_n),.Q(s0));");
+        let rep = map(&g, &r);
+        assert!(rep.inverted.is_empty() && rep.mapped.is_empty(), "{rep:?}");
+    }
+
+    /// The proof, not the signature, decides an inverted member: a class holding `r0` and an
+    /// inverted `u0` stays one class only when u0's next value is the complement of r0's with u0
+    /// READ complemented; a u0 that is cleared, not preset, splits off.
+    #[test]
+    fn an_inverted_member_is_proved_complemented() {
+        let l = lib();
+        for (u0, holds) in [("DFS u0(.CK(clk),.D(nd),.SET_B(rst_n),.Q(s0));", true), ("DFR u0(.CK(clk),.D(nd),.RESET_B(rst_n),.Q(s0));", false)] {
+            let (g, r) = complement(u0);
+            let (gd, rd) = (Design::register_model(&g, &l), Design::register_model(&r, &l));
+            let (gm, rm) = (model(&gd, Side::Golden, Naming::Instance).unwrap(), model(&rd, Side::Revised, Naming::Instance).unwrap());
+            let models = [&gm, &rm];
+            let at = |m: usize, n: &str| (m, models[m].regs.iter().position(|x| x.name == n).unwrap());
+            let mut inv: Polarity = models.iter().map(|m| vec![false; m.regs.len()]).collect();
+            inv[1][at(1, "u0").1] = true;
+            let mut classes = vec![vec![at(0, "r0"), at(1, "u0")], vec![at(0, "r1"), at(1, "u1")]];
+            refine(&models, &mut classes, &inv).unwrap();
+            assert_eq!(classes.iter().all(|c| c.len() == 2), holds, "{u0}: {classes:?}");
+        }
+    }
+
+    /// Candidates up to complement: from cycle 1 a register and its complement share a class with
+    /// opposite polarity; a register keeps its own-polarity partner when one exists (`u` maps to
+    /// `r` as itself, and `w`, the complement, is left unmatched rather than making it ambiguous).
+    #[test]
+    fn a_same_polarity_partner_wins_over_a_complement() {
+        let g = nl("module t(clk,rst_n,d,q);\ninput clk,rst_n,d; output q;\nDFR r(.CK(clk),.D(d),.RESET_B(rst_n),.Q(q));\nendmodule\n");
+        let r = nl("module t(clk,rst_n,d,q,p);\ninput clk,rst_n,d; output q,p;\nwire nd;\n\
+             DFR u(.CK(clk),.D(d),.RESET_B(rst_n),.Q(q));\nINV i(.A(d),.Y(nd));\nDFS w(.CK(clk),.D(nd),.SET_B(rst_n),.Q(p));\nendmodule\n");
+        let rep = map(&g, &r);
+        assert_eq!(rep.mapped, [("r".to_string(), "u".to_string())].into_iter().collect());
+        assert!(rep.inverted.is_empty());
+        assert!(rep.unmatched_revised.contains_key("w"), "{rep:?}");
     }
 
     /// A gated-clock design: `r` on `clk` gated by `gate` (the netlist text making `gclk`), with

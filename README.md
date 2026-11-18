@@ -159,7 +159,9 @@ vyges-lec map — ONE-TO-ONE ✓  34 of 34 golden and 34 revised register(s) map
 ```
 
 A pair is proved, never taken from a name. Both designs are simulated from the all-zero state on
-the same random inputs; registers that never differ are candidates. Then every candidate class is
+the same random inputs (an input that only reaches asynchronous clear or preset pins, found from
+the Liberty, is held active for the first cycles and inactive after, so a design leaves reset);
+registers that never differ, or always differ, are candidates. Then every candidate class is
 assumed to hold one value, each member's next-state function is built as a BDD, and members whose
 functions differ are split, until nothing splits (register correspondence). Every pair left starts
 at 0 and loads the same next value whenever the pairs agree, so by induction it holds the same
@@ -185,8 +187,10 @@ What is not in the map is reported, with why:
   changed takes the registers it feeds with it, since they then hold different values too;
 - `duplicated` (one golden register, several revised copies) and `ambiguous` (several golden
   registers in one class): one name per name is not decided by guessing;
-- a register stored inverted, or a state re-encoded (a one-hot FSM against a binary one), does
-  not map;
+- a state re-encoded (a one-hot FSM against a binary one) does not map. A register stored
+  inverted DOES map, under `inverted` (never `mapped` or `--write-map`): proved to hold the
+  complement, its clear acting where the golden's preset does. Such a pair holds after a reset,
+  not in the all-zero start state, and so does any pair whose proof reads it;
 - `undecided`: a register whose next-state BDD outgrew the node budget on its own (a class too
   big for one BDD manager is built in chunks, each member compared by its canonical diagram over
   one variable order, and refined exactly);

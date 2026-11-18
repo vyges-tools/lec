@@ -738,10 +738,11 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
     let rep: MapReport = map::register_map(g, r, lib, names).unwrap_or_else(|e| die(&e));
     let one = rep.one_to_one();
     let head = format!(
-        "{} of {} golden and {} revised register(s) mapped in {} round(s)",
-        rep.mapped.len(),
+        "{} of {} golden and {} revised register(s) mapped{} in {} round(s)",
+        rep.mapped.len() + rep.inverted.len(),
         rep.golden_registers,
         rep.revised_registers,
+        if rep.inverted.is_empty() { String::new() } else { format!(" ({} inverted)", rep.inverted.len()) },
         rep.rounds
     );
     let (code, sev) = if one { ("LEC-MAPPED", Severity::Info) } else { ("LEC-UNMAPPED", Severity::Warn) };
@@ -767,12 +768,13 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         let dup: Vec<String> = rep.duplicated.iter().map(|(k, v)| format!("{}: {}", json_str(k), list(v))).collect();
         let amb: Vec<String> = rep.ambiguous.iter().map(|(a, b)| format!("{{\"golden\": {}, \"revised\": {}}}", list(a), list(b))).collect();
         let mapped = map_json(&rep.mapped).trim_end().replace('\n', "\n  ");
+        let inverted = map_json(&rep.inverted).trim_end().replace('\n', "\n  ");
         let pairs = |v: &[(String, String)]| {
             let rows: Vec<String> = v.iter().map(|(g, r)| format!("{{\"golden\": {}, \"revised\": {}}}", json_str(g), json_str(r))).collect();
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -817,6 +819,9 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for (k, v) in &rep.mapped {
             s += &format!("  mapped      {k} -> {v}\n");
+        }
+        for (k, v) in &rep.inverted {
+            s += &format!("  inverted    {k} -> {v}  (stores the complement: clear and preset swapped)\n");
         }
         for (k, v) in &rep.duplicated {
             s += &format!("  duplicated  {k} -> {}\n", v.join(" "));
