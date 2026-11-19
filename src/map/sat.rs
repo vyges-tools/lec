@@ -44,6 +44,7 @@ struct Diag {
     /// per model: state net -> register
     reg_of: Vec<FxHashMap<String, usize>>,
     logged: usize,
+    dumped: usize,
 }
 thread_local! {
     static DIAG: std::cell::RefCell<Diag> = std::cell::RefCell::new(Diag::default());
@@ -206,6 +207,9 @@ fn split_class<'m>(
                             xor_gates(models[head.0], &gh),
                             xor_gates(models[r.0], &gm)
                         );
+                    }
+                    if let Some(dir) = std::env::var_os("LEC_DUMP_DIR") {
+                        dump_obligation(models, head, r, class_of, std::path::Path::new(&dir));
                     }
                     unsure[p] = true;
                     home = Some(None);
@@ -559,6 +563,71 @@ fn diag_rejection<'m>(models: &[&'m Model], h: RegId, m: RegId, cex: &[Var], rs:
     }
     let same = models[h.0].regs[h.1].name == models[m.0].regs[m.1].name;
     eprintln!("SATDIAG rej r={round} same={same} {} / {} te={te} aresetn={ar} constrained={constrained}{fan}", n(h), n(m));
+}
+
+/// DIAGNOSTIC: one obligation re-encoded on its own (fresh CNF: the two cones, class variables,
+/// the difference literal asserted) and written as DIMACS (`.cnf`, SAT = the pair differs) and
+/// as bit-level SMT-LIB (`.smt2`, the same AND/XOR structure), with one manifest line.
+fn dump_obligation(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf], dir: &std::path::Path) {
+    use std::io::Write;
+    let n = |x: RegId| models[x.0].regs[x.1].name.clone();
+    let mut cnf = Cnf::new();
+    let mut vars: FxHashMap<Var, i32> = FxHashMap::default();
+    let (mut lh, mut lm) = (FxHashMap::default(), FxHashMap::default());
+    let (Ok(a), Ok(b)) = (next_lit(&mut cnf, &mut vars, &mut lh, models[h.0], h, &class_of[h.0]), next_lit(&mut cnf, &mut vars, &mut lm, models[m.0], m, &class_of[m.0])) else { return };
+    let d = cnf.xor2(a, b);
+    let k = DIAG.with(|x| {
+        let mut x = x.borrow_mut();
+        x.dumped += 1;
+        x.dumped
+    });
+    let base = dir.join(format!("ob-{}-{k}", DIAG.with(|x| x.borrow().round)));
+    let _ = std::fs::create_dir_all(dir);
+    if let Ok(mut f) = std::fs::File::create(base.with_extension("cnf")) {
+        let _ = writeln!(f, "c lec obligation {} / {} (SAT = they differ)", n(h), n(m));
+        let _ = writeln!(f, "p cnf {} {}", cnf.n, cnf.clauses.len() + 1);
+        for c in &cnf.clauses {
+            let s: Vec<String> = c.iter().map(|l| l.to_string()).collect();
+            let _ = writeln!(f, "{} 0", s.join(" "));
+        }
+        let _ = writeln!(f, "{d} 0");
+    }
+    let mut def: FxHashMap<i32, String> = FxHashMap::default();
+    let lit = |l: i32| -> String {
+        if l == T {
+            "true".into()
+        } else if l == -T {
+            "false".into()
+        } else if l < 0 {
+            format!("(not v{})", -l)
+        } else {
+            format!("v{l}")
+        }
+    };
+    for (&(x, y), &o) in &cnf.and {
+        def.insert(o, format!("(and {} {})", lit(x), lit(y)));
+    }
+    for (&(x, y), &o) in &cnf.xor {
+        def.insert(o, format!("(xor {} {})", lit(x), lit(y)));
+    }
+    if let Ok(mut f) = std::fs::File::create(base.with_extension("smt2")) {
+        let _ = writeln!(f, "; lec obligation {} / {} (sat = they differ)\n(set-logic QF_BV)", n(h), n(m));
+        for v in 2..=cnf.n {
+            match def.get(&v) {
+                Some(e) => {
+                    let _ = writeln!(f, "(define-fun v{v} () Bool {e})");
+                }
+                None => {
+                    let _ = writeln!(f, "(declare-const v{v} Bool)");
+                }
+            }
+        }
+        let _ = writeln!(f, "(assert {})\n(check-sat)\n(exit)", lit(d));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("manifest.tsv")) {
+        let (gh, gm) = (cone_gates(models[h.0], h, &|_| false), cone_gates(models[m.0], m, &|_| false));
+        let _ = writeln!(f, "{}\t{}\t{}\t{}/{}\t{}/{}\t{}\t{}", base.display(), n(h), n(m), gh.len(), gm.len(), xor_gates(models[h.0], &gh), xor_gates(models[m.0], &gm), cnf.n, cnf.clauses.len() + 1);
+    }
 }
 
 enum Outcome {
