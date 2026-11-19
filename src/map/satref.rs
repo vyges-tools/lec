@@ -28,7 +28,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use splr::{Certificate, Config, SolveIF, Solver, SolverError};
 use vyges_loom::liberty_func::Func;
 
-use super::{active_classes, class_index, func_word, prim_word, readers_of, ClassOf, Model, Polarity, RegId};
+use super::{active_classes, class_index, func_word, prim_word, readers_of, ClassOf, Key, Model, Polarity, RegId};
 use crate::lec::{next_net, state_net, Logic, Op, Src};
 
 /// CPU seconds one obligation may take before its member is undecided.
@@ -51,10 +51,36 @@ pub(crate) fn refine_sat(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: 
             eprintln!("SATREF round {rounds} classes {} active {} {stats:?} split {}", classes.len(), active.iter().filter(|a| **a).count(), split.len());
         }
         if split.is_empty() {
+            if std::env::var_os("LEC_SAT_VERIFY").is_some() {
+                verify_with_bdd(models, classes, inv)?;
+            }
             return Ok((rounds, undecided));
         }
         seeds = Some(split);
     }
+}
+
+/// Independent check of the SAT fixed point: one BDD round ([`super::round_keys`]) over the final
+/// classes. A class the BDD keys split, every key decided, is a soundness bug; a member over the
+/// BDD budget is only unchecked.
+fn verify_with_bdd(models: &[&Model], classes: &[Vec<RegId>], inv: &Polarity) -> Result<(), String> {
+    let class_of = class_index(models, classes, &|r: RegId| inv[r.0][r.1]);
+    let all = vec![true; classes.len()];
+    let keys = super::round_keys(models, classes, &all, &class_of, super::BDD_LIMIT)?;
+    let (mut checked, mut disagree, mut unchecked) = (0usize, 0usize, 0usize);
+    for (cl, k) in classes.iter().zip(keys) {
+        let Some(k) = k else { continue };
+        let decided: Vec<&Key> = k.iter().flatten().collect();
+        unchecked += cl.len() - decided.len();
+        checked += 1;
+        if decided.windows(2).any(|w| w[0] != w[1]) {
+            disagree += 1;
+            let n = |r: &RegId| models[r.0].regs[r.1].name.clone();
+            eprintln!("SATVERIFY DISAGREE class {:?}", cl.iter().map(n).collect::<Vec<_>>());
+        }
+    }
+    eprintln!("SATVERIFY classes checked {checked} bdd-disagree {disagree} members-over-bdd-budget {unchecked}");
+    Ok(())
 }
 
 #[derive(Debug, Default)]
