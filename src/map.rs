@@ -602,34 +602,40 @@ fn name_pairs_kept(models: &[&Model], classes: &[Vec<RegId>], pairs: &[(RegId, R
 
 /// The BDD of each of `nets` in one model, in `bdd`, a free input by its variable name and a
 /// register's state by its class: `var(name)` gives the variable. `None` once the manager is
-/// exhausted.
-fn next_state_bdds(
-    model: &Model,
+/// exhausted. `f` holds the nodes already built in `bdd` by net: a gate whose output is in it is
+/// neither searched through nor built again. It is valid only for this manager and this
+/// numbering of classes (one refinement round, [`SharedRound`]); pass an empty map otherwise.
+fn next_state_bdds<'m>(
+    model: &'m Model,
     nets: &[String],
     bdd: &mut Bdd,
     var: &mut dyn FnMut(&mut Bdd, &str) -> u32,
     class_var: &dyn Fn(&str) -> (String, bool),
+    f: &mut FxHashMap<&'m str, u32>,
 ) -> Result<Option<Vec<u32>>, String> {
     let c = &model.cone;
-    // the gates the nets need, by depth-first search without recursion, then in cone order
-    let mut need = vec![false; c.gates.len()];
-    let mut stack: Vec<usize> = nets.iter().filter_map(|n| model.gate.get(n).copied()).collect();
+    // the gates the nets need and `f` lacks, by depth-first search without recursion, then in
+    // cone order
+    let mut need: FxHashSet<usize> = FxHashSet::default();
+    let mut stack: Vec<usize> = nets.iter().filter(|n| !f.contains_key(n.as_str())).filter_map(|n| model.gate.get(n).copied()).collect();
     while let Some(k) = stack.pop() {
-        if std::mem::replace(&mut need[k], true) {
+        if !need.insert(k) {
             continue;
         }
         for s in &c.gates[k].ins {
             if let Src::Net(n) = s {
                 if let Some(&j) = model.gate.get(n) {
-                    if !need[j] {
+                    if !need.contains(&j) && !f.contains_key(n.as_str()) {
                         stack.push(j);
                     }
                 }
             }
         }
     }
-    let mut f: FxHashMap<&str, u32> = FxHashMap::default();
-    for (k, g) in c.gates.iter().enumerate().filter(|(k, _)| need[*k]) {
+    let mut order: Vec<usize> = need.into_iter().collect();
+    order.sort_unstable();
+    for k in order {
+        let g = &c.gates[k];
         let mut ins = Vec::with_capacity(g.ins.len());
         for s in &g.ins {
             ins.push(match s {
@@ -756,18 +762,31 @@ pub(crate) fn chunked_keys(
 /// budget. Members with the same key load the same value whenever every class holds one value.
 fn next_keys(models: &[&Model], members: &[RegId], class_of: &[ClassOf], limit: usize) -> Result<Vec<Option<Key>>, String> {
     let mut build = |i: usize, bdd: &mut Bdd, var: &mut dyn FnMut(&mut Bdd, &str) -> u32| -> Result<Option<u32>, String> {
-        let (m, k) = members[i];
-        let co = &class_of[m];
-        let cv = |s: &str| {
-            let (c, neg) = co.get(s).copied().unwrap_or((usize::MAX, false));
-            (format!("class {c}"), neg)
-        };
-        let net = next_net(&models[m].regs[k].instance);
-        let neg = co.get(&state_net(&models[m].regs[k].instance)).is_some_and(|x| x.1);
-        // an inverted member's next value is compared complemented, as the class's value
-        Ok(next_state_bdds(models[m], &[net], bdd, var, &cv)?.map(|v| if neg { bdd.not(v[0]) } else { v[0] }))
+        member_next(models, members[i], bdd, var, class_of, &mut FxHashMap::default())
     };
     Ok(chunked_keys(members.len(), limit, &mut build)?.0)
+}
+
+/// Register `r`'s next-state function, its state read as its class's variable and complemented
+/// when it is inverted in its class, built into `bdd` reusing `built` ([`next_state_bdds`]).
+fn member_next<'m>(
+    models: &[&'m Model],
+    r: RegId,
+    bdd: &mut Bdd,
+    var: &mut dyn FnMut(&mut Bdd, &str) -> u32,
+    class_of: &[ClassOf],
+    built: &mut FxHashMap<&'m str, u32>,
+) -> Result<Option<u32>, String> {
+    let (m, k) = r;
+    let co = &class_of[m];
+    let cv = |s: &str| {
+        let (c, neg) = co.get(s).copied().unwrap_or((usize::MAX, false));
+        (format!("class {c}"), neg)
+    };
+    let net = next_net(&models[m].regs[k].instance);
+    let neg = co.get(&state_net(&models[m].regs[k].instance)).is_some_and(|x| x.1);
+    // an inverted member's next value is compared complemented, as the class's value
+    Ok(next_state_bdds(models[m], &[net], bdd, var, &cv, built)?.map(|v| if neg { bdd.not(v[0]) } else { v[0] }))
 }
 
 /// `a` and `b` load the same next value with every class holding one value: proved, not
@@ -799,46 +818,170 @@ pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Pol
 
 /// [`refine`] with each manager limited to `limit` nodes plus memo entries.
 pub(crate) fn refine_within(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity, limit: usize) -> Result<(usize, Vec<RegId>), String> {
+    let readers = readers_of(models);
     let mut undecided: Vec<RegId> = Vec::new();
+    let mut seeds: Option<Vec<RegId>> = None;
     let mut rounds = 0;
     loop {
         rounds += 1;
         let class_of = class_index(models, classes, &|r: RegId| inv[r.0][r.1]);
-        let mut next: Vec<Vec<RegId>> = Vec::with_capacity(classes.len());
-        let mut split = false;
-        for cl in classes.iter() {
-            if cl.len() < 2 {
-                next.push(cl.clone());
-                continue;
-            }
-            let keys = next_keys(models, cl, &class_of, limit)?;
-            // members grouped by their next-state key, in order of first appearance; a member
-            // undecided within the budget stands alone
-            let mut parts: Vec<Vec<RegId>> = Vec::new();
-            let mut at: HashMap<&Key, usize> = HashMap::new();
-            for (i, &r) in cl.iter().enumerate() {
-                match &keys[i] {
-                    Some(key) => match at.get(key) {
-                        Some(&p) => parts[p].push(r),
-                        None => {
-                            at.insert(key, parts.len());
-                            parts.push(vec![r]);
-                        }
-                    },
-                    None => {
-                        undecided.push(r);
-                        parts.push(vec![r]);
-                    }
-                }
-            }
-            split |= parts.len() > 1;
-            next.extend(parts);
-        }
-        *classes = next;
-        if !split {
+        let active = active_classes(classes, &readers, seeds.as_deref());
+        let keys = round_keys(models, classes, &active, &class_of, limit)?;
+        let split = split_on_keys(classes, keys, &mut undecided);
+        if split.is_empty() {
             return Ok((rounds, undecided));
         }
+        seeds = Some(split);
     }
+}
+
+/// Per model, per register `j`: the registers whose next-state function reads `j`'s state (the
+/// one-frame fanout [`active_classes`] follows). Static: computed once per refinement.
+fn readers_of(models: &[&Model]) -> Vec<Vec<Vec<usize>>> {
+    models
+        .iter()
+        .map(|model| {
+            let c = &model.cone;
+            let reg_of: FxHashMap<String, usize> = model.regs.iter().enumerate().map(|(k, r)| (state_net(&r.instance), k)).collect();
+            let mut readers: Vec<Vec<usize>> = vec![Vec::new(); model.regs.len()];
+            let mut stamp: Vec<usize> = vec![usize::MAX; c.gates.len()];
+            for (k, r) in model.regs.iter().enumerate() {
+                let mut read: Vec<usize> = Vec::new();
+                let mut stack: Vec<String> = vec![next_net(&r.instance)];
+                while let Some(n) = stack.pop() {
+                    // over-approximated: a net that is both a state and a gate output counts as both
+                    if let Some(&j) = reg_of.get(&n) {
+                        read.push(j);
+                    }
+                    let Some(&g) = model.gate.get(&n) else { continue };
+                    if std::mem::replace(&mut stamp[g], k) == k {
+                        continue;
+                    }
+                    stack.extend(c.gates[g].ins.iter().filter_map(|s| if let Src::Net(x) = s { Some(x.clone()) } else { None }));
+                }
+                read.sort_unstable();
+                read.dedup();
+                for j in read {
+                    readers[j].push(k);
+                }
+            }
+            readers
+        })
+        .collect()
+}
+
+/// Which classes a round re-keys: every class in the first round; afterwards, a class with a
+/// member that READS a register of a class the previous round split (`seeds`, [`readers_of`]).
+///
+/// 🔑 The rule is ABC's incremental `&scorr` filter (`cecCorrIncr.c`): seeds are the nodes whose
+/// representative changed since the last round, their one-frame transitive fanout is marked,
+/// and only a candidate pair with an endpoint in it is proved again. Here every member of a
+/// split class is a seed (its class variable changed: the alias edge from representative to
+/// member), and a class's key reads only the classes of the registers in its next-state cones.
+/// A class none of whose members reads a seed has the same keys as last round, which did not
+/// split it, so it would not split now: skipping it changes no partition and no round count.
+fn active_classes(classes: &[Vec<RegId>], readers: &[Vec<Vec<usize>>], seeds: Option<&[RegId]>) -> Vec<bool> {
+    let Some(seeds) = seeds else { return vec![true; classes.len()] };
+    let mut hit: Vec<Vec<bool>> = readers.iter().map(|r| vec![false; r.len()]).collect();
+    for &(m, j) in seeds {
+        for &k in &readers[m][j] {
+            hit[m][k] = true;
+        }
+    }
+    classes.iter().map(|c| c.iter().any(|&(m, k)| hit[m][k])).collect()
+}
+
+/// Each active class's member keys ([`next_keys`]), `None` for a class not re-keyed.
+///
+/// 🔑 One manager is shared by the classes of a round ([`SharedRound`]), so a cone two classes
+/// read is built once. A class that exhausts it is keyed on its own exactly as before
+/// ([`next_keys`], fresh managers) and a fresh shared manager follows: a key is still compared
+/// only within its class, and within one manager equal nodes are equal functions.
+fn round_keys(models: &[&Model], classes: &[Vec<RegId>], active: &[bool], class_of: &[ClassOf], limit: usize) -> Result<Vec<Option<Vec<Option<Key>>>>, String> {
+    let mut out: Vec<Option<Vec<Option<Key>>>> = vec![None; classes.len()];
+    let mut shared = SharedRound::new(models.len(), limit);
+    for (ci, cl) in classes.iter().enumerate() {
+        if cl.len() < 2 || !active[ci] {
+            continue;
+        }
+        out[ci] = Some(match shared.keys(models, cl, class_of)? {
+            Some(k) => k,
+            None => {
+                shared = SharedRound::new(models.len(), limit);
+                next_keys(models, cl, class_of, limit)?
+            }
+        });
+    }
+    Ok(out)
+}
+
+/// A round's shared manager: the BDD, its variable numbering by name, and per model the nodes
+/// built so far by net ([`next_state_bdds`]).
+struct SharedRound<'m> {
+    bdd: Bdd,
+    names: FxHashMap<String, u32>,
+    built: Vec<FxHashMap<&'m str, u32>>,
+}
+
+impl<'m> SharedRound<'m> {
+    fn new(models: usize, limit: usize) -> SharedRound<'m> {
+        SharedRound { bdd: Bdd::with_limit(limit), names: FxHashMap::default(), built: vec![FxHashMap::default(); models] }
+    }
+
+    /// Every member's key in this manager, or `None` once it is exhausted.
+    fn keys(&mut self, models: &[&'m Model], members: &[RegId], class_of: &[ClassOf]) -> Result<Option<Vec<Option<Key>>>, String> {
+        let mut keys = Vec::with_capacity(members.len());
+        for &r in members {
+            let names = &mut self.names;
+            let mut var = |bdd: &mut Bdd, name: &str| -> u32 {
+                let next = names.len() as u32;
+                let k = *names.entry(name.to_string()).or_insert(next);
+                bdd.var(k)
+            };
+            match member_next(models, r, &mut self.bdd, &mut var, class_of, &mut self.built[r.0])? {
+                Some(node) if !self.bdd.exhausted() => keys.push(Some(Key::Node(node))),
+                _ => return Ok(None),
+            }
+        }
+        Ok(Some(keys))
+    }
+}
+
+/// Splits each re-keyed class by its members' keys, in order of first appearance (a member
+/// undecided within the budget stands alone and is added to `undecided`); returns every member
+/// of a class that split, the next round's seeds ([`active_classes`]).
+fn split_on_keys(classes: &mut Vec<Vec<RegId>>, keys: Vec<Option<Vec<Option<Key>>>>, undecided: &mut Vec<RegId>) -> Vec<RegId> {
+    let mut next: Vec<Vec<RegId>> = Vec::with_capacity(classes.len());
+    let mut split = Vec::new();
+    for (cl, keys) in classes.iter().zip(keys) {
+        let Some(keys) = keys else {
+            next.push(cl.clone());
+            continue;
+        };
+        let mut parts: Vec<Vec<RegId>> = Vec::new();
+        let mut at: HashMap<&Key, usize> = HashMap::new();
+        for (i, &r) in cl.iter().enumerate() {
+            match &keys[i] {
+                Some(key) => match at.get(key) {
+                    Some(&p) => parts[p].push(r),
+                    None => {
+                        at.insert(key, parts.len());
+                        parts.push(vec![r]);
+                    }
+                },
+                None => {
+                    undecided.push(r);
+                    parts.push(vec![r]);
+                }
+            }
+        }
+        if parts.len() > 1 {
+            split.extend(cl.iter().copied());
+        }
+        next.extend(parts);
+    }
+    *classes = next;
+    split
 }
 
 /// Stage 5: the map from the final classes; `candidates` (stage 3) tells a register that never
@@ -1419,6 +1562,25 @@ mod tests {
         assert!(!rep.mapped.contains_key("r") && !rep.inverted.contains_key("r"), "same name, not equivalent: {rep:?}");
         assert_eq!(rep.name_pairs_rejected, [("r".to_string(), "r".to_string())], "{rep:?}");
         assert_eq!(rep.inverted.get("p").map(String::as_str), Some("p"), "complementary constants pair inverted: {rep:?}");
+    }
+
+    /// 🔑 Refinement re-keys a class when a class its members READ split the round before (ABC's
+    /// incremental `&scorr` filter), with one manager per round. `a` (D = te vs te & d) splits in
+    /// round 1; `b` reads `a` and only splits in round 2, once `a`'s two registers are separate
+    /// classes; round 3 splits nothing. A filter that skipped `b`, or a key kept from the round
+    /// before, would map `b` although it is not equivalent.
+    #[test]
+    fn a_class_whose_fanin_split_is_keyed_again_in_the_next_round() {
+        let holds = SimHolds { hold: [("te".to_string(), false)].into_iter().collect(), ..Default::default() };
+        let g = nl("module t(clk,te,d,q);\ninput clk,te,d; output q;\nwire qa;\n\
+             DFF a(.CK(clk),.D(te),.Q(qa));\nDFF b(.CK(clk),.D(qa),.Q(q));\nendmodule\n");
+        let m = nl("module t(clk,te,d,q);\ninput clk,te,d; output q;\nwire n, qa;\n\
+             AND2 x(.A(te),.B(d),.Y(n));\nDFF a(.CK(clk),.D(n),.Q(qa));\nDFF b(.CK(clk),.D(qa),.Q(q));\nendmodule\n");
+        let rep = register_map_with(&g, &m, &lib(), (Naming::Instance, Naming::Instance), &holds).unwrap();
+        assert!(rep.mapped.is_empty(), "{rep:?}");
+        assert_eq!(rep.rounds, 3, "{rep:?}");
+        let rejected: Vec<&str> = rep.name_pairs_rejected.iter().map(|p| p.0.as_str()).collect();
+        assert_eq!(rejected, ["a", "b"], "{rep:?}");
     }
 
     /// ⛔ `--hold` / `--reset` act on the candidate simulation ONLY. A held input is constant and a
