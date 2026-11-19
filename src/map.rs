@@ -73,6 +73,61 @@ pub(crate) const FREE_ENABLE: &str = "<clock-gate enable>";
 /// fresh manager ([`chunked_keys`]).
 pub const BDD_LIMIT: usize = 1 << 20;
 
+#[cfg(feature = "sat")]
+mod sat;
+#[cfg(feature = "sat")]
+pub use sat::PAIR_CONFLICTS;
+
+/// How stage 4 proves the classes (`map --refine`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refine {
+    /// BDD keys per class ([`refine_within`]).
+    Bdd,
+    /// SAT, as ABC's `&scorr` (`sat` feature): one incremental solver per round.
+    Sat,
+    /// SAT, then the fixed point re-keyed by BDDs; a class they split is an error.
+    Both,
+}
+
+impl Default for Refine {
+    /// SAT when the `sat` feature is built in (as released), BDD otherwise.
+    fn default() -> Refine {
+        if cfg!(feature = "sat") {
+            Refine::Sat
+        } else {
+            Refine::Bdd
+        }
+    }
+}
+
+impl Refine {
+    pub fn name(self) -> &'static str {
+        match self {
+            Refine::Bdd => "bdd",
+            Refine::Sat => "sat",
+            Refine::Both => "both",
+        }
+    }
+}
+
+/// The proof effort of a SAT refinement, for the report (all 0 under `--refine bdd`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SatEffort {
+    /// Obligations the solver proved (the two sides equal under the round's classes).
+    pub proved: usize,
+    /// Obligations proved by structure alone (both sides one literal), no solver call.
+    pub structural: usize,
+    /// Obligations the solver disproved, each with a counter-example.
+    pub disproved: usize,
+    /// Obligations over the conflict limit: their member is undecided.
+    pub gave_up: usize,
+    /// Counter-example batches resimulated.
+    pub resimulated: usize,
+    /// `--refine both`: classes the BDD keys re-checked, and members over the BDD budget.
+    pub bdd_checked: usize,
+    pub bdd_unchecked: usize,
+}
+
 /// Unmatched golden x revised register pairs [`attribute`] compares by simulation at most.
 pub const ATTRIBUTION_CAP: usize = 1 << 22;
 
@@ -137,6 +192,9 @@ pub struct MapReport {
     pub reset_inputs: Vec<(String, bool)>,
     /// Candidate pairs PROPOSED by name ([`split_constant_classes_by_name`]): how many.
     pub name_pairs: usize,
+    /// How the classes were proved (`--refine`), and the SAT proof effort.
+    pub refine: Refine,
+    pub sat: SatEffort,
     /// Of those, the pairs refinement disproved (golden name, revised name): proposed by name,
     /// split by the proof, never in the map.
     pub name_pairs_rejected: Vec<(String, String)>,
@@ -179,7 +237,7 @@ impl MapReport {
 /// The register map of `golden` to `revised`: the thin sequence of the stages the module doc
 /// names, in its order.
 pub fn register_map(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Naming, Naming)) -> Result<MapReport, String> {
-    register_map_with(golden, revised, lib, names, &SimHolds::default())
+    register_map_with(golden, revised, lib, names, &SimHolds::default(), Refine::default())
 }
 
 /// What the user fixes in the candidate-class simulation (`lec map --hold`, `--reset`), by
@@ -199,7 +257,19 @@ pub struct SimHolds {
 
 /// [`register_map`] with the simulation holds `holds` ([`SimHolds`]). A name that is not a
 /// primary input of both designs, or that is both held and a reset, is refused.
-pub fn register_map_with(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Naming, Naming), holds: &SimHolds) -> Result<MapReport, String> {
+pub fn register_map_with(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Naming, Naming), holds: &SimHolds, engine: Refine) -> Result<MapReport, String> {
+    register_map_at(golden, revised, lib, names, holds, engine, SAT_CONFLICTS)
+}
+
+/// The conflict limit of one SAT obligation in stage 4 ([`Refine::Sat`]).
+#[cfg(feature = "sat")]
+const SAT_CONFLICTS: i32 = PAIR_CONFLICTS;
+#[cfg(not(feature = "sat"))]
+const SAT_CONFLICTS: i32 = 0;
+
+/// [`register_map_with`] with stage 4's SAT conflict limit `limit` (a test lowers it to reach the
+/// undecided path). Thin sequencer: the stages in order, no work of its own.
+fn register_map_at(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Naming, Naming), holds: &SimHolds, engine: Refine, limit: i32) -> Result<MapReport, String> {
     if lib.cells.is_empty() {
         return Err("no cells in the Liberty".into());
     }
@@ -222,8 +292,11 @@ pub fn register_map_with(golden: &Netlist, revised: &Netlist, lib: &Lib, names: 
     let (classes, mut inv) = candidate_classes(&[&gm, &rm], &sigs);
     let (mut classes, by_name) = split_constant_classes_by_name(&[&gm, &rm], &sigs, classes, &mut inv);
     let candidates = classes.clone();
-    let (rounds, undecided) = refine(&[&gm, &rm], &mut classes, &inv)?;
+    let mut effort = SatEffort::default();
+    let (rounds, undecided) = refine_by(engine, &[&gm, &rm], &mut classes, &inv, limit, &mut effort)?;
     let mut rep = report(&[&gm, &rm], &candidates, &classes, &inv, &undecided, rounds);
+    rep.refine = engine;
+    rep.sat = effort;
     name_pairs_kept(&[&gm, &rm], &classes, &by_name, &mut rep);
     attribute(&[&gm, &rm], &sigs, &classes, &inv, &mut rep)?;
     rep.reset_inputs = stim.held.into_iter().collect();
@@ -791,7 +864,13 @@ fn member_next<'m>(
 
 /// `a` and `b` load the same next value with every class holding one value: proved, not
 /// undecided within the budget.
-fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[ClassOf]) -> Result<bool, String> {
+fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[ClassOf], engine: Refine) -> Result<bool, String> {
+    #[cfg(feature = "sat")]
+    if engine != Refine::Bdd {
+        return sat::RoundSolver::new(models.len(), PAIR_CONFLICTS).same_next(models, a, b, class_of);
+    }
+    #[cfg(not(feature = "sat"))]
+    let _ = engine;
     let k = next_keys(models, &[a, b], class_of, BDD_LIMIT)?;
     Ok(matches!((&k[0], &k[1]), (Some(x), Some(y)) if x == y))
 }
@@ -812,6 +891,26 @@ fn class_index(models: &[&Model], classes: &[Vec<RegId>], inv: &dyn Fn(RegId) ->
 
 /// Stage 4: split every class whose members load different next values when every class holds
 /// one value, until nothing splits. Returns the rounds taken and the registers left undecided.
+/// Stage 4 by the chosen engine ([`Refine`]).
+fn refine_by(engine: Refine, models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity, limit: i32, effort: &mut SatEffort) -> Result<(usize, Vec<RegId>), String> {
+    match engine {
+        Refine::Bdd => refine(models, classes, inv),
+        #[cfg(feature = "sat")]
+        Refine::Sat => sat::refine_sat(models, classes, inv, limit, effort),
+        #[cfg(feature = "sat")]
+        Refine::Both => {
+            let got = sat::refine_sat(models, classes, inv, limit, effort)?;
+            (effort.bdd_checked, effort.bdd_unchecked) = sat::cross_check_with_bdd(models, classes, inv)?;
+            Ok(got)
+        }
+        #[cfg(not(feature = "sat"))]
+        Refine::Sat | Refine::Both => {
+            let _ = (effort, limit);
+            Err("map --refine sat|both needs the `sat` feature (built without it)".into())
+        }
+    }
+}
+
 pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity) -> Result<(usize, Vec<RegId>), String> {
     refine_within(models, classes, inv, BDD_LIMIT)
 }
@@ -1091,6 +1190,8 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
     // assumed as itself (the pairs below are by its raw signature)
     let mapped: HashSet<RegId> = classes.iter().filter(|c| c.iter().any(|r| models[r.0].side == Side::Golden) && c.iter().any(|r| models[r.0].side == Side::Revised)).flatten().copied().collect();
     let pol = |r: RegId| inv[r.0][r.1] && mapped.contains(&r);
+    // a pair is proved by the engine that proved the classes
+    let engine = rep.refine;
     let only = |cl: &Vec<RegId>, side: Side| cl.iter().all(|r| models[r.0].side == side);
     let gold: Vec<RegId> = classes.iter().filter(|c| only(c, Side::Golden)).flatten().copied().collect();
     let rev: Vec<RegId> = classes.iter().filter(|c| only(c, Side::Revised)).flatten().copied().collect();
@@ -1116,7 +1217,7 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
     let (gn, rn) = (gold.len(), rev.len());
     let left = |pairs: &[(usize, usize)]| (gn - pairs.len()) * (rn - pairs.len());
     if left(&pairs) * (pairs.len() + 1) <= LEFTOVER_CAP {
-        pair_leftovers(gn, rn, &mut pairs, &mut |p: &[(usize, usize)]| follows(models, classes, &pol, &gold, &rev, p))?;
+        pair_leftovers(gn, rn, &mut pairs, &mut |p: &[(usize, usize)]| follows(models, classes, &pol, &gold, &rev, p, engine))?;
     }
     let (mut gfree, mut rfree) = (vec![true; gn], vec![true; rn]);
     for &(i, j) in &pairs {
@@ -1135,7 +1236,7 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
     let name = |r: &RegId| models[r.0].regs[r.1].name.clone();
     for &(i, j) in &pairs {
         let pair = (name(&gold[i]), name(&rev[j]));
-        match same_next(models, gold[i], rev[j], &class_of)? {
+        match same_next(models, gold[i], rev[j], &class_of, engine)? {
             true => rep.follows.push(pair),
             // a pair that reads an unpaired register may differ only through it: not a cause
             _ if [gold[i], rev[j]].iter().any(|r| states_read(models[r.0], r.1).iter().any(|s| unpaired.contains(s))) => {
@@ -1237,11 +1338,11 @@ fn assumed_classes(models: &[&Model], classes: &[Vec<RegId>], gold: &[RegId], re
 }
 
 /// How many of `pairs` load the same next value with every class and pair assumed equal.
-fn follows(models: &[&Model], classes: &[Vec<RegId>], pol: &dyn Fn(RegId) -> bool, gold: &[RegId], rev: &[RegId], pairs: &[(usize, usize)]) -> Result<usize, String> {
+fn follows(models: &[&Model], classes: &[Vec<RegId>], pol: &dyn Fn(RegId) -> bool, gold: &[RegId], rev: &[RegId], pairs: &[(usize, usize)], engine: Refine) -> Result<usize, String> {
     let class_of = class_index(models, &assumed_classes(models, classes, gold, rev, pairs), pol);
     let mut n = 0;
     for &(i, j) in pairs {
-        if same_next(models, gold[i], rev[j], &class_of)? {
+        if same_next(models, gold[i], rev[j], &class_of, engine)? {
             n += 1;
         }
     }
@@ -1556,7 +1657,7 @@ mod tests {
         let m = nl("module t(clk,te,d,q1,q2,q3);\ninput clk,te,d; output q1,q2,q3;\nwire a, n;\n\
              AND2 x(.A(te),.B(d),.Y(a));\nINV i(.A(te),.Y(n));\n\
              DFF s(.CK(clk),.D(te),.Q(q1));\nDFF r(.CK(clk),.D(a),.Q(q2));\nDFF p(.CK(clk),.D(n),.Q(q3));\nendmodule\n");
-        let rep = register_map_with(&g, &m, &lib(), (Naming::Instance, Naming::Instance), &holds).unwrap();
+        let rep = register_map_with(&g, &m, &lib(), (Naming::Instance, Naming::Instance), &holds, Refine::Bdd).unwrap();
         assert_eq!(rep.name_pairs, 3, "{rep:?}");
         assert_eq!(rep.mapped.get("s").map(String::as_str), Some("s"), "{rep:?}");
         assert!(!rep.mapped.contains_key("r") && !rep.inverted.contains_key("r"), "same name, not equivalent: {rep:?}");
@@ -1576,7 +1677,7 @@ mod tests {
              DFF a(.CK(clk),.D(te),.Q(qa));\nDFF b(.CK(clk),.D(qa),.Q(q));\nendmodule\n");
         let m = nl("module t(clk,te,d,q);\ninput clk,te,d; output q;\nwire n, qa;\n\
              AND2 x(.A(te),.B(d),.Y(n));\nDFF a(.CK(clk),.D(n),.Q(qa));\nDFF b(.CK(clk),.D(qa),.Q(q));\nendmodule\n");
-        let rep = register_map_with(&g, &m, &lib(), (Naming::Instance, Naming::Instance), &holds).unwrap();
+        let rep = register_map_with(&g, &m, &lib(), (Naming::Instance, Naming::Instance), &holds, Refine::Bdd).unwrap();
         assert!(rep.mapped.is_empty(), "{rep:?}");
         assert_eq!(rep.rounds, 3, "{rep:?}");
         let rejected: Vec<&str> = rep.name_pairs_rejected.iter().map(|p| p.0.as_str()).collect();
@@ -1609,12 +1710,12 @@ mod tests {
         let held = Stimulus::of(&[&gd, &md]).with(&holds);
         let (sigs, _) = simulate_freeing_stuck_enables(&[&gm, &mm], &held).unwrap();
         assert_eq!(sigs[0][0], sigs[1][0], "held, r and u are candidates");
-        let rep = register_map_with(&g, &m, &l, (Naming::Instance, Naming::Instance), &holds).unwrap();
+        let rep = register_map_with(&g, &m, &l, (Naming::Instance, Naming::Instance), &holds, Refine::Bdd).unwrap();
         assert!(rep.mapped.is_empty(), "the proof keeps te free: {rep:?}");
         assert_eq!(rep.holds, [("te".to_string(), false)]);
         assert_eq!(rep.resets_given, [("rst_n".to_string(), true)]);
         let bad = SimHolds { hold: [("tee".to_string(), false)].into_iter().collect(), ..Default::default() };
-        let e = register_map_with(&g, &m, &l, (Naming::Instance, Naming::Instance), &bad).unwrap_err();
+        let e = register_map_with(&g, &m, &l, (Naming::Instance, Naming::Instance), &bad, Refine::Bdd).unwrap_err();
         assert!(e.contains("`tee` is not a primary input"), "{e}");
     }
 
@@ -1780,6 +1881,62 @@ mod tests {
         for i in 0..6 {
             assert_eq!(rep.mapped.get(&format!("r{i}")).map(String::as_str), Some(format!("r{i}").as_str()), "{rep:?}");
         }
+    }
+
+    /// 🔑 By SAT (ABC `&scorr`): a pair simulation cannot tell apart shares a candidate class,
+    /// the solver finds the state that tells them apart, and that counter-example is resimulated
+    /// over every register before the class is split (`Cec_ManResimulateCounterExamples`). The
+    /// revised design adds `h`, which loads `d0 ^ c6`: it toggles with `r0` until the 8-bit
+    /// counter's carry out first rises (cycle 255, past the [`CYCLES`] simulated).
+    #[cfg(feature = "sat")]
+    #[test]
+    fn a_pair_the_solver_disproves_is_split_and_its_counter_example_resimulated() {
+        let mut body = String::new();
+        // counts every cycle: `c0` is tied high, not an input simulation drives at random
+        let mut wires = vec!["c0".to_string(), "lo".to_string()];
+        body.push_str("TIE0 t0(.LO(lo));\nINV b0(.A(lo),.Y(c0));\n");
+        for i in 0..8 {
+            wires.extend([format!("q{i}"), format!("d{i}"), format!("c{}", i + 1)]);
+            body.push_str(&format!(
+                "XOR2 x{i}(.A(c{i}),.B(q{i}),.Y(d{i}));\nDFF r{i}(.CK(clk),.D(d{i}),.Q(q{i}));\nAND2 a{i}(.A(c{i}),.B(q{i}),.Y(c{}));\n",
+                i + 1
+            ));
+        }
+        let top = |extra: &str| nl(&format!("module t(clk,y);\ninput clk; output y;\nwire {};\n{body}{extra}endmodule\n", wires.join(",")));
+        let a = top("BUF o(.A(q5),.Y(y));\n");
+        let b = top("wire h, hd;\nXOR2 hx(.A(d0),.B(c8),.Y(hd));\nDFF h(.CK(clk),.D(hd),.Q(h));\nAND2 o(.A(q5),.B(h),.Y(y));\n");
+        let names = (Naming::Instance, Naming::Instance);
+        let rep = register_map_with(&a, &b, &lib(), names, &SimHolds::default(), Refine::Sat).unwrap();
+        assert!(rep.sat.disproved > 0 && rep.sat.resimulated > 0, "{:?}", rep.sat);
+        assert!(rep.unmatched_revised.contains_key("h"), "{rep:?}");
+        for i in 0..8 {
+            assert_eq!(rep.mapped.get(&format!("r{i}")).map(String::as_str), Some(format!("r{i}").as_str()), "{rep:?}");
+        }
+        // the same classes as the BDD keys, and `both` re-checks every class
+        let bdd = register_map_with(&a, &b, &lib(), names, &SimHolds::default(), Refine::Bdd).unwrap();
+        let both = register_map_with(&a, &b, &lib(), names, &SimHolds::default(), Refine::Both).unwrap();
+        assert_eq!((&rep.mapped, &rep.unmatched_revised), (&bdd.mapped, &bdd.unmatched_revised));
+        assert!(both.sat.bdd_checked > 0 && both.sat.bdd_unchecked == 0, "{:?}", both.sat);
+    }
+
+    /// ⛔ An obligation over its conflict limit leaves its member undecided and alone, never
+    /// mapped (ABC `Gia_ManCheckRefinements`, status -1: `Cec_ManSimClassRemoveOne`). Golden
+    /// loads `a ^ q`, revised the same value as `(a | q) & !(a & q)`: equal, but only by search,
+    /// so at a limit of 0 conflicts neither is mapped and both are undecided.
+    #[cfg(feature = "sat")]
+    #[test]
+    fn a_pair_over_the_conflict_limit_is_undecided_and_never_mapped() {
+        let a = nl("module t(clk,a,y);\ninput clk,a; output y;\nwire q,d;\nXOR2 x(.A(a),.B(q),.Y(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nBUF o(.A(q),.Y(y));\nendmodule\n");
+        let b = nl("module t(clk,a,y);\ninput clk,a; output y;\nwire q,d,o1,a1,n1;\nOR2 g1(.A(a),.B(q),.Y(o1));\nAND2 g2(.A(a),.B(q),.Y(a1));\nINV g3(.A(a1),.Y(n1));\nAND2 g4(.A(o1),.B(n1),.Y(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nBUF o(.A(q),.Y(y));\nendmodule\n");
+        let names = (Naming::Instance, Naming::Instance);
+        let proved = register_map_at(&a, &b, &lib(), names, &SimHolds::default(), Refine::Sat, PAIR_CONFLICTS).unwrap();
+        assert_eq!(proved.mapped.get("r").map(String::as_str), Some("r"), "{proved:?}");
+        let capped = register_map_at(&a, &b, &lib(), names, &SimHolds::default(), Refine::Sat, 0).unwrap();
+        assert!(capped.sat.gave_up > 0, "{:?}", capped.sat);
+        assert!(capped.mapped.is_empty(), "{capped:?}");
+        // both of the pair: the head is not disproved, nothing told it apart
+        assert_eq!(capped.undecided.len(), 2, "{capped:?}");
+        assert!(capped.unmatched_golden.is_empty() && capped.unmatched_revised.is_empty(), "{capped:?}");
     }
 
     /// 🔑 One wrong register takes the registers it reaches with it, but is named as the one

@@ -28,8 +28,8 @@ exhaustive, exactly the work an open Rust engine can own.
 
 LEC is a **commercial** sign-off tool (Conformal, Formality, …) behind major
 licenses; the open ecosystem is thin and mostly research code. `vyges-lec` is a
-clean-room Rust engine with an **in-tree ROBDD** package — no external SAT/BDD
-dependency — reading the **same Liberty / Verilog** the rest of the Vyges flow uses.
+clean-room Rust engine with an **in-tree ROBDD** package (`map` also uses the CaDiCaL SAT
+solver, the `sat` feature) reading the **same Liberty / Verilog** the rest of the Vyges flow uses.
 Because a reduced, ordered BDD over a fixed variable order is **canonical**, two
 functions are equal *iff* they are the same node: the equivalence test is a pointer
 compare, and a mismatch's miter walks straight to a counter-example.
@@ -47,7 +47,7 @@ Or the standalone binary:
 
 ```sh
 cargo build --release --features abc   # as released: links the prebuilt ABC archive
-cargo build --release                  # std-only: the in-tree BDD engine, `check` only
+cargo build --release                  # the in-tree BDD engine for `check`, CaDiCaL for `map`
 
 vyges-lec check golden.v revised.v --lib cells.lib                  # -> verdict
 vyges-lec check golden.v revised.v --lib cells.lib --json
@@ -174,10 +174,18 @@ register with exactly one same-named revised register in it becomes a candidate 
 every pair is proved like any other, and one the proof splits is listed (`name_pairs`,
 `name_pairs_rejected`).
 registers that never differ, or always differ, are candidates. Then every candidate class is
-assumed to hold one value, each member's next-state function is built as a BDD, and members whose
-functions differ are split, until nothing splits (register correspondence). Every pair left starts
-at 0 and loads the same next value whenever the pairs agree, so by induction it holds the same
-value in every state the two designs reach.
+assumed to hold one value, each member's next value is compared with the others', and members
+whose next values differ are split, until nothing splits (register correspondence). Every pair left
+starts at 0 and loads the same next value whenever the pairs agree, so by induction it holds the
+same value in every state the two designs reach.
+
+`--refine` chooses how each comparison is proved. `sat` (the default with the `sat` feature, as
+released) poses each one to an incremental SAT solver (CaDiCaL), one solver per round, with a
+conflict limit per comparison; a counter-example is simulated over every register before the next
+comparison, and only classes whose inputs split are compared again. `bdd` builds each member's
+next-state BDD instead. `both` runs `sat`, then re-checks every class with BDDs and stops with an
+error if they split one. The two engines reach the same classes; they can differ only in which
+registers stay `undecided` within their budgets.
 
 Inputs are paired by name. An RTL elaboration (syn, and the reference's `synthesize`) numbers a
 vector port's bits from 0 at the right bound of its declaration (`input [11:8] a` becomes `a[0]`..
@@ -203,9 +211,10 @@ What is not in the map is reported, with why:
   inverted DOES map, under `inverted` (never `mapped` or `--write-map`): proved to hold the
   complement, its clear acting where the golden's preset does. Such a pair holds after a reset,
   not in the all-zero start state, and so does any pair whose proof reads it;
-- `undecided`: a register whose next-state BDD outgrew the node budget on its own (a class too
-  big for one BDD manager is built in chunks, each member compared by its canonical diagram over
-  one variable order, and refined exactly);
+- `undecided`: under `--refine sat`, a register whose comparison passed the conflict limit; under
+  `--refine bdd`, one whose next-state BDD outgrew the node budget on its own (a class too big for
+  one BDD manager is built in chunks, each member compared by its canonical diagram over one
+  variable order, and refined exactly). An undecided register is never mapped;
 - `unobserved`: a register with no connected output;
 - clock gates: `map` models the standard clock gate, an enable latch transparent while the clock
   is low ANDed with the clock (nested gates too), or a `latch_posedge` clock-gate cell. A register

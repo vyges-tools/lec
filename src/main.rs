@@ -2,7 +2,7 @@
 //!
 //!   vyges-lec check GOLDEN.v REVISED.v --lib L.lib [--engine bdd|abc|both] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
-//!   vyges-lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names instance|net] [--revised-names instance|net] [--ranges RANGES.json] [--hold NET=0|1]... [--reset NET=0|1]... [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
+//!   vyges-lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names instance|net] [--revised-names instance|net] [--ranges RANGES.json] [--hold NET=0|1]... [--reset NET=0|1]... [--refine sat|bdd|both] [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
 //!   vyges-lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N] [-o OUT] [--json] [--fail-on-diff]
 //!
 //! Proves combinational equivalence of two gate-level netlists. Exit codes:
@@ -43,6 +43,7 @@ usage:
   vyges physical lec sec   GOLDEN.v REVISED.v --lib L.lib [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec map   GOLDEN.v REVISED.v --lib L.lib [--golden-names N] [--revised-names N]
                           [--ranges RANGES.json] [--hold NET=0|1]... [--reset NET=0|1]...
+                          [--refine sat|bdd|both]
                           [--write-map MAP.json] [-o OUT] [--json] [--fail-on-diff]
   vyges physical lec prove DESIGN.v --lib L.lib --never NET [--never NET ...] [--bound N]
                           [-o OUT] [--json] [--fail-on-diff]
@@ -77,6 +78,10 @@ flags:
   --reset NET=V    map, repeatable: treat primary input NET as an asynchronous reset whose
                    INACTIVE value is V: active for the first cycles of the candidate simulation,
                    then V; the proof keeps NET free. Listed in the report
+  --refine E       map: how the register classes are proved. sat (default): one incremental
+                   SAT solver per round, a pair over its conflict limit left undecided; bdd: BDD
+                   keys per class; both: sat, then every class re-checked by BDD keys, a class
+                   they split being an error
   --write-map FILE map: write the proved pairs as {\"golden name\": \"revised name\"}
   -o FILE          write the report to FILE (default: stdout)
   --json           machine-readable JSON instead of text
@@ -161,7 +166,7 @@ const DESCRIBE: &str = r#"{
       "summary": "register map: each golden register paired with the revised register proved to hold the same state, written as a JSON rename map",
       "invocation": {
         "args_template": ["map", "{golden}", "{revised}", "--lib", "{lib}"],
-        "optional": [{ "arg": "golden_names", "flag": "--golden-names" }, { "arg": "revised_names", "flag": "--revised-names" }, { "arg": "ranges", "flag": "--ranges" }, { "arg": "hold", "flag": "--hold" }, { "arg": "reset", "flag": "--reset" }, { "arg": "write_map", "flag": "--write-map" }, { "arg": "out", "flag": "-o" }],
+        "optional": [{ "arg": "golden_names", "flag": "--golden-names" }, { "arg": "revised_names", "flag": "--revised-names" }, { "arg": "ranges", "flag": "--ranges" }, { "arg": "hold", "flag": "--hold" }, { "arg": "reset", "flag": "--reset" }, { "arg": "refine", "flag": "--refine" }, { "arg": "write_map", "flag": "--write-map" }, { "arg": "out", "flag": "-o" }],
         "emits_json": true
       },
       "inputs": {
@@ -176,6 +181,7 @@ const DESCRIBE: &str = r#"{
           "ranges": { "type": "string", "description": "declared vector ranges (syn sv-ranges): the revised netlist's port bits are renumbered from their declared numbering to the elaborated one before inputs are paired by name" },
           "hold": { "type": "string", "description": "NET=0|1: hold a primary input constant in both designs during the candidate simulation only (the proof keeps it free); repeatable" },
           "reset": { "type": "string", "description": "NET=0|1: treat a primary input as an asynchronous reset with this inactive value, active first, during the candidate simulation only; repeatable" },
+          "refine": { "type": "string", "enum": ["sat", "bdd", "both"], "description": "how the register classes are proved: sat (default; incremental SAT, a pair over its conflict limit left undecided), bdd (BDD keys), or both (sat, re-checked by BDD keys; a class they split is an error)" },
           "write_map": { "type": "string", "description": "write the proved pairs to FILE as a JSON object, golden name to revised name" },
           "out": { "type": "string", "description": "write the report to FILE instead of stdout" }
         }
@@ -428,7 +434,7 @@ pub fn main() {
         exit(2);
     }
     // positionals: not a flag, not a flag's value
-    let valued = ["--lib", "--engine", "-o", "--never", "--bound", "--golden-names", "--revised-names", "--ranges", "--write-map", "--hold", "--reset"];
+    let valued = ["--lib", "--engine", "-o", "--never", "--bound", "--golden-names", "--revised-names", "--ranges", "--write-map", "--hold", "--reset", "--refine"];
     let pos: Vec<&String> = args[1..]
         .iter()
         .enumerate()
@@ -770,7 +776,17 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
     }
     let r = renumbered.as_ref().map_or(r, |n| &n.netlist);
     let holds = map::SimHolds { hold: net_values(args, "--hold"), reset: net_values(args, "--reset") };
-    let rep: MapReport = map::register_map_with(g, r, lib, names, &holds).unwrap_or_else(|e| die(&e));
+    let engine = match opt(args, "--refine").as_deref() {
+        None => map::Refine::default(),
+        Some("sat") => map::Refine::Sat,
+        Some("bdd") => map::Refine::Bdd,
+        Some("both") => map::Refine::Both,
+        Some(e) => {
+            diag!("error: --refine expects sat, bdd or both, got {e:?}");
+            exit(2);
+        }
+    };
+    let rep: MapReport = map::register_map_with(g, r, lib, names, &holds, engine).unwrap_or_else(|e| die(&e));
     let one = rep.one_to_one();
     let head = format!(
         "{} of {} golden and {} revised register(s) mapped{} in {} round(s)",
@@ -809,7 +825,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"name_pairs\": {},\n  \"name_pairs_rejected\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"name_pairs\": {},\n  \"name_pairs_rejected\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {},\n  \"refine\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -855,7 +871,21 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
                     out.join(", "),
                     pairs_as(&n.name_taken, "bit", "would_be")
                 )
-            })
+            }),
+            {
+                let e = &rep.sat;
+                format!(
+                    "{{\"engine\": {}, \"proved\": {}, \"structural\": {}, \"disproved\": {}, \"gave_up\": {}, \"resimulated\": {}, \"bdd_checked\": {}, \"bdd_unchecked\": {}}}",
+                    json_str(rep.refine.name()),
+                    e.proved,
+                    e.structural,
+                    e.disproved,
+                    e.gave_up,
+                    e.resimulated,
+                    e.bdd_checked,
+                    e.bdd_unchecked
+                )
+            }
         );
         with_report_path(&s, opt(args, "-o").as_deref())
     } else {
@@ -896,6 +926,21 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for (n, v) in &rep.reset_inputs {
             s += &format!("  reset input {n}  (simulation holds it active {RESET} cycle(s), then at {})\n", u8::from(*v), RESET = map::RESET_CYCLES);
+        }
+        if rep.refine != map::Refine::Bdd {
+            let e = &rep.sat;
+            s += &format!(
+                "  refine      {}: {} proved, {} structural, {} disproved, {} over the conflict limit (undecided), {} resimulation(s)\n",
+                rep.refine.name(),
+                e.proved,
+                e.structural,
+                e.disproved,
+                e.gave_up,
+                e.resimulated
+            );
+            if rep.refine == map::Refine::Both {
+                s += &format!("  refine      bdd re-check: {} class(es) agree, {} member(s) over the BDD budget\n", e.bdd_checked, e.bdd_unchecked);
+            }
         }
         for (n, v) in &rep.holds {
             s += &format!("  hold        {n} = {}  (--hold: candidate simulation only; the proof keeps it free)\n", u8::from(*v));

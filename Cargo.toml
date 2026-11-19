@@ -17,6 +17,9 @@ vyges-events = { git = "https://github.com/vyges-tools/events", branch = "main",
 # The ABC engine (`--engine abc|both`). Optional: it links a prebuilt ABC archive, which the default
 # std-only, offline build does not need.
 vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main", optional = true }
+# Incremental SAT for register-map refinement (`sat` feature). Pinned exactly; MIT, builds the
+# bundled CaDiCaL from source.
+cadical = { version = "=0.1.16", optional = true }
 # FxHash for the BDD tables and the register map's lookup tables: deterministic (no random seed), and
 # those tables are only looked up, never iterated. Pinned exactly; no dependencies of its own.
 rustc-hash = { version = "=2.1.1", default-features = false, features = ["std"] }
@@ -42,7 +45,9 @@ serde_json = "1"
 # The command-line entry built into the library too (`cli_main`), for the suite binaries
 # that link every engine and run the one they are invoked as.
 suite = []
-default = ["mimalloc"]
+default = ["mimalloc", "sat"]
+# Register-map refinement by SAT (`map --refine sat`, the default): incremental CaDiCaL.
+sat = ["dep:cadical"]
 abc = ["dep:vyges-abc-lib"]
 
 # The binary's allocator (see [dependencies]). On by default for the binary; the suite, the only
