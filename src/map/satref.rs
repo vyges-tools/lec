@@ -97,7 +97,7 @@ struct Stats {
 
 /// One round: every obligation of the active classes, counter-examples resimulated in batches of
 /// 64. Returns every member of a class that split (the next round's seeds).
-fn sat_round<'m>(models: &[&'m Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], class_of: &[ClassOf], undecided: &mut Vec<RegId>, st: &mut Stats) -> Result<Vec<RegId>, String> {
+fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], class_of: &[ClassOf], undecided: &mut Vec<RegId>, st: &mut Stats) -> Result<Vec<RegId>, String> {
     let pairs: Vec<(RegId, RegId)> = classes
         .iter()
         .zip(active)
@@ -225,6 +225,14 @@ impl<'m> RoundSolver<'m> {
             None => Ok(Outcome::GaveUp([cone_size(models[h.0], h), cone_size(models[m.0], m)])),
         }
     }
+}
+
+/// [`super::same_next`] by SAT (attribution, stage 6): `a` and `b` load the same next value with
+/// every class holding one value. Over the conflict limit is not proved, as a BDD over budget.
+pub(crate) fn same_next_sat(models: &[&Model], a: RegId, b: RegId, class_of: &[ClassOf]) -> Result<bool, String> {
+    let mut rs = RoundSolver::new(models.len());
+    let got = rs.prove(models, a, b, class_of, &mut Stats::default())?;
+    Ok(matches!(got, Outcome::Unsat | Outcome::Structural))
 }
 
 /// The gates of register `r`'s next-state cone, by depth-first search, in cone order.

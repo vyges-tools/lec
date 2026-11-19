@@ -802,6 +802,10 @@ fn member_next<'m>(
 /// `a` and `b` load the same next value with every class holding one value: proved, not
 /// undecided within the budget.
 fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[ClassOf]) -> Result<bool, String> {
+    // PROTOTYPE (branch): attribution by SAT too under `LEC_REFINE=sat`
+    if std::env::var("LEC_REFINE").as_deref() == Ok("sat") {
+        return satref::same_next_sat(models, a, b, class_of);
+    }
     let k = next_keys(models, &[a, b], class_of, BDD_LIMIT)?;
     Ok(matches!((&k[0], &k[1]), (Some(x), Some(y)) if x == y))
 }
