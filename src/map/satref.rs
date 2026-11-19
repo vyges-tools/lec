@@ -175,7 +175,8 @@ fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf]) -> Re
         return Ok(Outcome::Structural);
     }
     cnf.clauses.push(vec![d]);
-    let config = Config { quiet_mode: true, c_timeout: PAIR_TIMEOUT_S, ..Config::default() };
+    let limit = std::env::var("LEC_SAT_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(PAIR_TIMEOUT_S);
+    let config = Config { quiet_mode: true, c_timeout: limit, ..Config::default() };
     let n = cnf.n;
     let got = match Solver::try_from((config, cnf.clauses.as_slice())) {
         Ok(mut s) => s.solve(),
