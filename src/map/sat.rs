@@ -587,7 +587,71 @@ fn diag_rejection<'m>(models: &[&'m Model], h: RegId, m: RegId, cex: &[Var], rs:
         }
     }
     let same = models[h.0].regs[h.1].name == models[m.0].regs[m.1].name;
+    if same && round == 1 && std::env::var_os("LEC_DIAG_EXPLAIN").is_some() {
+        diag_explain(models, h, m, class_of);
+    }
     eprintln!("SATDIAG rej r={round} same={same} {} / {} te={te} aresetn={ar} constrained={constrained}{fan}", n(h), n(m));
+}
+
+/// DIAGNOSTIC: why a same-name pair differs. The obligation alone in a fresh solver; the
+/// counter-example reduced greedily to a prime implicant (every literal left is needed to force
+/// the difference); each side's next value. A class variable is named by up to two registers of
+/// its class, `~` when that register is the complement. Optionally dumped (`LEC_EXPLAIN_DIR`).
+fn diag_explain(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf]) {
+    let n = |x: RegId| models[x.0].regs[x.1].name.clone();
+    let mut cnf = Cnf::new();
+    let mut vars: FxHashMap<Var, i32> = FxHashMap::default();
+    let (mut lh, mut lm) = (FxHashMap::default(), FxHashMap::default());
+    let (Ok(a), Ok(b)) = (next_lit(&mut cnf, &mut vars, &mut lh, models[h.0], h, &class_of[h.0]), next_lit(&mut cnf, &mut vars, &mut lm, models[m.0], m, &class_of[m.0])) else { return };
+    let d = cnf.xor2(a, b);
+    let mut s = cadical::Solver::new();
+    for c in &cnf.clauses {
+        s.add_clause(c.iter().copied());
+    }
+    if s.solve_with([d]) != Some(true) {
+        eprintln!("SATDIAG explain {} / {} NOT SAT ALONE", n(h), n(m));
+        return;
+    }
+    let val = |s: &cadical::Solver, l: i32| if l == T { true } else if l == -T { false } else { s.value(l).unwrap_or(false) };
+    let (va, vb) = (val(&s, a), val(&s, b));
+    let mut keep: Vec<(Var, i32)> = vars.iter().map(|(k, &v)| (k.clone(), if s.value(v).unwrap_or(false) { v } else { -v })).collect();
+    keep.sort_by_key(|(k, _)| format!("{k:?}"));
+    let support = keep.len();
+    let mut i = 0;
+    while i < keep.len() {
+        let mut assume: Vec<i32> = keep.iter().enumerate().filter(|&(j, _)| j != i).map(|(_, x)| x.1).collect();
+        assume.push(-d);
+        if s.solve_with(assume) == Some(false) {
+            keep.remove(i);
+        } else {
+            i += 1;
+        }
+    }
+    let name_class = |ci: usize| -> String {
+        let mut v: Vec<String> = Vec::new();
+        for (side, co) in class_of.iter().enumerate() {
+            let mut names: Vec<(&String, bool)> = co.iter().filter(|(_, &(c, _))| c == ci).map(|(k, &(_, inv))| (k, inv)).collect();
+            names.sort();
+            for (k, inv) in names.into_iter().take(2) {
+                v.push(format!("{}{}{k}", if side == 0 { "g:" } else { "r:" }, if inv { "~" } else { "" }));
+            }
+        }
+        v.join("|")
+    };
+    let lits: Vec<String> = keep
+        .iter()
+        .map(|(k, l)| {
+            let b = if *l > 0 { 1 } else { 0 };
+            match k {
+                Var::Input(x) => format!("in:{x}={b}"),
+                Var::Class(c) => format!("C{c}[{}]={b}", name_class(*c)),
+            }
+        })
+        .collect();
+    eprintln!("SATDIAG explain {} / {} golden_next={} revised_next={} support {} implicant {}: {}", n(h), n(m), if h.0 == 0 { va } else { vb } as u8, if h.0 == 0 { vb } else { va } as u8, support, lits.len(), lits.join(" ; "));
+    if let Some(dir) = std::env::var_os("LEC_EXPLAIN_DIR") {
+        dump_obligation(models, h, m, class_of, std::path::Path::new(&dir));
+    }
 }
 
 /// DIAGNOSTIC: one obligation re-encoded on its own (fresh CNF: the two cones, class variables,
@@ -724,7 +788,20 @@ impl<'m> RoundSolver<'m> {
         }
         self.sent = self.cnf.clauses.len();
         self.sat.set_limit("conflicts", self.limit).map_err(|e| format!("SAT refinement: {e:?}"))?;
-        Ok(match self.sat.solve_with([d]) {
+        let mut r = self.sat.solve_with([d]);
+        // DIAGNOSTIC (sat-diag only): `LEC_DIAG_ESCALATE=N` retries a pair over the limit once with N
+        // conflicts, to measure what a larger budget for the hard pairs costs
+        if r.is_none() {
+            static ESC: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
+            if let Some(n) = *ESC.get_or_init(|| std::env::var("LEC_DIAG_ESCALATE").ok().and_then(|s| s.parse().ok())) {
+                let t0 = std::time::Instant::now();
+                self.sat.set_limit("conflicts", n).map_err(|e| format!("SAT refinement: {e:?}"))?;
+                r = self.sat.solve_with([d]);
+                let names = (models[h.0].regs[h.1].name.as_str(), models[m.0].regs[m.1].name.as_str());
+                eprintln!("SATDIAG escalate {} / {} result={} ms={}", names.0, names.1, match r { Some(false) => "unsat", Some(true) => "sat", None => "gaveup" }, t0.elapsed().as_millis());
+            }
+        }
+        Ok(match r {
             Some(false) => Outcome::Unsat,
             Some(true) => Outcome::Sat(self.vars.iter().filter(|(_, &v)| self.sat.value(v).unwrap_or(false)).map(|(name, _)| name.clone()).collect()),
             None => Outcome::GaveUp,
