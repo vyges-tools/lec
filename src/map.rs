@@ -863,16 +863,36 @@ fn member_next<'m>(
 }
 
 /// `a` and `b` load the same next value with every class holding one value: proved, not
-/// undecided within the budget.
-fn same_next(models: &[&Model], a: RegId, b: RegId, class_of: &[ClassOf], engine: Refine) -> Result<bool, String> {
+/// undecided within the budget. One prover per set of assumed classes: under SAT its solver
+/// keeps the gates it encoded for every pair asked of it (one incremental solver, as a round).
+struct SameNext<'m> {
+    #[cfg_attr(not(feature = "sat"), allow(dead_code))]
+    engine: Refine,
     #[cfg(feature = "sat")]
-    if engine != Refine::Bdd {
-        return sat::RoundSolver::new(models.len(), PAIR_CONFLICTS).same_next(models, a, b, class_of);
-    }
+    sat: sat::RoundSolver<'m>,
     #[cfg(not(feature = "sat"))]
-    let _ = engine;
-    let k = next_keys(models, &[a, b], class_of, BDD_LIMIT)?;
-    Ok(matches!((&k[0], &k[1]), (Some(x), Some(y)) if x == y))
+    _m: std::marker::PhantomData<&'m ()>,
+}
+
+impl<'m> SameNext<'m> {
+    fn new(engine: Refine, models: usize) -> SameNext<'m> {
+        #[cfg(feature = "sat")]
+        return SameNext { engine, sat: sat::RoundSolver::new(models, PAIR_CONFLICTS) };
+        #[cfg(not(feature = "sat"))]
+        {
+            let _ = models;
+            SameNext { engine, _m: std::marker::PhantomData }
+        }
+    }
+
+    fn same(&mut self, models: &[&'m Model], a: RegId, b: RegId, class_of: &[ClassOf]) -> Result<bool, String> {
+        #[cfg(feature = "sat")]
+        if self.engine != Refine::Bdd {
+            return self.sat.same_next(models, a, b, class_of);
+        }
+        let k = next_keys(models, &[a, b], class_of, BDD_LIMIT)?;
+        Ok(matches!((&k[0], &k[1]), (Some(x), Some(y)) if x == y))
+    }
 }
 
 /// Each register's class, by its state net, per model.
@@ -924,7 +944,7 @@ pub(crate) fn refine_within(models: &[&Model], classes: &mut Vec<Vec<RegId>>, in
     loop {
         rounds += 1;
         let class_of = class_index(models, classes, &|r: RegId| inv[r.0][r.1]);
-        let active = active_classes(classes, &readers, seeds.as_deref());
+        let active = active_classes(models, classes, &readers, seeds.as_deref());
         let keys = round_keys(models, classes, &active, &class_of, limit)?;
         let split = split_on_keys(classes, keys, &mut undecided);
         if split.is_empty() {
@@ -934,39 +954,39 @@ pub(crate) fn refine_within(models: &[&Model], classes: &mut Vec<Vec<RegId>>, in
     }
 }
 
-/// Per model, per register `j`: the registers whose next-state function reads `j`'s state (the
-/// one-frame fanout [`active_classes`] follows). Static: computed once per refinement.
-fn readers_of(models: &[&Model]) -> Vec<Vec<Vec<usize>>> {
-    models
-        .iter()
-        .map(|model| {
-            let c = &model.cone;
-            let reg_of: FxHashMap<String, usize> = model.regs.iter().enumerate().map(|(k, r)| (state_net(&r.instance), k)).collect();
-            let mut readers: Vec<Vec<usize>> = vec![Vec::new(); model.regs.len()];
-            let mut stamp: Vec<usize> = vec![usize::MAX; c.gates.len()];
-            for (k, r) in model.regs.iter().enumerate() {
-                let mut read: Vec<usize> = Vec::new();
-                let mut stack: Vec<String> = vec![next_net(&r.instance)];
-                while let Some(n) = stack.pop() {
-                    // over-approximated: a net that is both a state and a gate output counts as both
-                    if let Some(&j) = reg_of.get(&n) {
-                        read.push(j);
-                    }
-                    let Some(&g) = model.gate.get(&n) else { continue };
-                    if std::mem::replace(&mut stamp[g], k) == k {
-                        continue;
-                    }
-                    stack.extend(c.gates[g].ins.iter().filter_map(|s| if let Src::Net(x) = s { Some(x.clone()) } else { None }));
-                }
-                read.sort_unstable();
-                read.dedup();
-                for j in read {
-                    readers[j].push(k);
+/// Per model, the one-frame fanout graph [`active_classes`] walks forward from a round's seeds:
+/// which gates read each net, and which registers load each net. Static: built once per
+/// refinement, in time linear in the cone (a per-register walk of each cone is quadratic on a
+/// core: every register re-walks the shared logic).
+pub(crate) struct Fanout<'m> {
+    /// per model: net -> gates reading it
+    readers: Vec<FxHashMap<&'m str, Vec<usize>>>,
+    /// per model: net -> registers whose next-state net it is
+    loads: Vec<FxHashMap<String, Vec<usize>>>,
+    /// per model: each register's state net
+    state: Vec<Vec<String>>,
+}
+
+fn readers_of<'m>(models: &[&'m Model]) -> Fanout<'m> {
+    let mut f = Fanout { readers: Vec::new(), loads: Vec::new(), state: Vec::new() };
+    for model in models {
+        let mut readers: FxHashMap<&str, Vec<usize>> = FxHashMap::default();
+        for (g, gate) in model.cone.gates.iter().enumerate() {
+            for s in &gate.ins {
+                if let Src::Net(n) = s {
+                    readers.entry(n.as_str()).or_default().push(g);
                 }
             }
-            readers
-        })
-        .collect()
+        }
+        let mut loads: FxHashMap<String, Vec<usize>> = FxHashMap::default();
+        for (k, r) in model.regs.iter().enumerate() {
+            loads.entry(next_net(&r.instance)).or_default().push(k);
+        }
+        f.readers.push(readers);
+        f.loads.push(loads);
+        f.state.push(model.regs.iter().map(|r| state_net(&r.instance)).collect());
+    }
+    f
 }
 
 /// Which classes a round re-keys: every class in the first round; afterwards, a class with a
@@ -979,12 +999,25 @@ fn readers_of(models: &[&Model]) -> Vec<Vec<Vec<usize>>> {
 /// member), and a class's key reads only the classes of the registers in its next-state cones.
 /// A class none of whose members reads a seed has the same keys as last round, which did not
 /// split it, so it would not split now: skipping it changes no partition and no round count.
-fn active_classes(classes: &[Vec<RegId>], readers: &[Vec<Vec<usize>>], seeds: Option<&[RegId]>) -> Vec<bool> {
+///
+/// Per round, as ABC marks it: forward from each seed's state net through the gates that read
+/// it, to the registers that load what it reaches; one mark per gate, so a round costs at most
+/// one pass over the cone.
+fn active_classes(models: &[&Model], classes: &[Vec<RegId>], fanout: &Fanout<'_>, seeds: Option<&[RegId]>) -> Vec<bool> {
     let Some(seeds) = seeds else { return vec![true; classes.len()] };
-    let mut hit: Vec<Vec<bool>> = readers.iter().map(|r| vec![false; r.len()]).collect();
+    let mut hit: Vec<Vec<bool>> = models.iter().map(|m| vec![false; m.regs.len()]).collect();
+    let mut seen: Vec<Vec<bool>> = models.iter().map(|m| vec![false; m.cone.gates.len()]).collect();
     for &(m, j) in seeds {
-        for &k in &readers[m][j] {
-            hit[m][k] = true;
+        let mut stack: Vec<&str> = vec![fanout.state[m][j].as_str()];
+        while let Some(n) = stack.pop() {
+            for &k in fanout.loads[m].get(n).into_iter().flatten() {
+                hit[m][k] = true;
+            }
+            for &g in fanout.readers[m].get(n).into_iter().flatten() {
+                if !std::mem::replace(&mut seen[m][g], true) {
+                    stack.push(models[m].cone.gates[g].out.as_str());
+                }
+            }
         }
     }
     classes.iter().map(|c| c.iter().any(|&(m, k)| hit[m][k])).collect()
@@ -1234,9 +1267,10 @@ pub(crate) fn attribute(models: &[&Model], sigs: &[Vec<Vec<u64>>], classes: &[Ve
         .map(|(r, _)| state_net(&models[r.0].regs[r.1].instance))
         .collect();
     let name = |r: &RegId| models[r.0].regs[r.1].name.clone();
+    let mut prover = SameNext::new(engine, models.len());
     for &(i, j) in &pairs {
         let pair = (name(&gold[i]), name(&rev[j]));
-        match same_next(models, gold[i], rev[j], &class_of, engine)? {
+        match prover.same(models, gold[i], rev[j], &class_of)? {
             true => rep.follows.push(pair),
             // a pair that reads an unpaired register may differ only through it: not a cause
             _ if [gold[i], rev[j]].iter().any(|r| states_read(models[r.0], r.1).iter().any(|s| unpaired.contains(s))) => {
@@ -1341,8 +1375,9 @@ fn assumed_classes(models: &[&Model], classes: &[Vec<RegId>], gold: &[RegId], re
 fn follows(models: &[&Model], classes: &[Vec<RegId>], pol: &dyn Fn(RegId) -> bool, gold: &[RegId], rev: &[RegId], pairs: &[(usize, usize)], engine: Refine) -> Result<usize, String> {
     let class_of = class_index(models, &assumed_classes(models, classes, gold, rev, pairs), pol);
     let mut n = 0;
+    let mut prover = SameNext::new(engine, models.len());
     for &(i, j) in pairs {
-        if same_next(models, gold[i], rev[j], &class_of, engine)? {
+        if prover.same(models, gold[i], rev[j], &class_of)? {
             n += 1;
         }
     }

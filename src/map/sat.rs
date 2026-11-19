@@ -37,14 +37,15 @@ pub const PAIR_CONFLICTS: i32 = 1000;
 /// [`super::refine_within`] does. Thin sequencer, one stage per line.
 pub(crate) fn refine_sat(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity, limit: i32, effort: &mut SatEffort) -> Result<(usize, Vec<RegId>), String> {
     let readers = super::readers_of(models);
+    let sim: Vec<Compiled> = models.iter().map(|m| Compiled::of(m)).collect::<Result<_, _>>()?;
     let mut undecided: Vec<RegId> = Vec::new();
     let mut seeds: Option<Vec<RegId>> = None;
     let mut rounds = 0;
     loop {
         rounds += 1;
         let class_of = class_index(models, classes, &|r: RegId| inv[r.0][r.1]);
-        let active = super::active_classes(classes, &readers, seeds.as_deref());
-        let split = sat_round(models, classes, &active, &class_of, limit, &mut undecided, effort)?;
+        let active = super::active_classes(models, classes, &readers, seeds.as_deref());
+        let split = sat_round(models, &sim, classes, &active, &class_of, limit, &mut undecided, effort)?;
         if split.is_empty() {
             return Ok((rounds, undecided));
         }
@@ -55,7 +56,8 @@ pub(crate) fn refine_sat(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: 
 /// One round: each active class split by [`split_class`] under the round's classes `class_of`,
 /// one solver and one set of counter-examples for the round. Returns every member of a class
 /// that split, the next round's seeds.
-fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], class_of: &[ClassOf], limit: i32, undecided: &mut Vec<RegId>, effort: &mut SatEffort) -> Result<Vec<RegId>, String> {
+#[allow(clippy::too_many_arguments)]
+fn sat_round(models: &[&Model], sim: &[Compiled], classes: &mut Vec<Vec<RegId>>, active: &[bool], class_of: &[ClassOf], limit: i32, undecided: &mut Vec<RegId>, effort: &mut SatEffort) -> Result<Vec<RegId>, String> {
     let mut rs = RoundSolver::new(models.len(), limit);
     let mut sims = Signatures::new(models);
     let mut next: Vec<Vec<RegId>> = Vec::with_capacity(classes.len());
@@ -65,7 +67,7 @@ fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], 
             next.push(cl.clone());
             continue;
         }
-        let parts = split_class(models, cl, class_of, &mut rs, &mut sims, undecided, effort)?;
+        let parts = split_class(models, sim, cl, class_of, &mut rs, &mut sims, undecided, effort)?;
         if parts.len() > 1 {
             split.extend(cl.iter().copied());
         }
@@ -78,9 +80,12 @@ fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], 
 /// One class split into the parts of members that load the same next value under `class_of`, in
 /// order of their first member. A member is proved only against the head of a part whose
 /// counter-example signature it shares ([`Signatures`]); the counter-examples a class produced
-/// are resimulated before the next class (and every 64).
+/// are resimulated over every register before the next class (and every 64), so a later class
+/// is not asked what they already tell apart.
+#[allow(clippy::too_many_arguments)]
 fn split_class<'m>(
     models: &[&'m Model],
+    sim: &[Compiled],
     cl: &[RegId],
     class_of: &[ClassOf],
     rs: &mut RoundSolver<'m>,
@@ -113,7 +118,7 @@ fn split_class<'m>(
                     effort.disproved += 1;
                     sims.pending.push((cex, head, r));
                     if sims.pending.len() == 64 {
-                        resimulate_counter_examples(models, class_of, sims, effort)?;
+                        resimulate_counter_examples(models, sim, class_of, sims, effort)?;
                     }
                 }
                 Outcome::GaveUp => {
@@ -150,7 +155,7 @@ fn split_class<'m>(
         }
     }
     if !sims.pending.is_empty() {
-        resimulate_counter_examples(models, class_of, sims, effort)?;
+        resimulate_counter_examples(models, sim, class_of, sims, effort)?;
     }
     Ok(parts)
 }
@@ -174,54 +179,122 @@ impl Signatures {
     }
 }
 
+/// One model's cone by index, compiled once per refinement so a resimulation is one pass over
+/// words (resolving every input by name per pass cost a core minutes per class).
+struct Compiled {
+    ins: Vec<Vec<In>>,
+    /// state nets read (by [`In::State`]), looked up in the round's classes per resimulation
+    states: Vec<String>,
+    /// free-input variable names read (by [`In::Free`])
+    frees: Vec<String>,
+    /// each register's next value
+    next: Vec<In>,
+    /// each register's state net
+    reg_state: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum In {
+    Const(bool),
+    Gate(usize),
+    State(usize),
+    Free(usize),
+}
+
+impl Compiled {
+    /// Each gate input resolved as the BDD and CNF builders resolve it: a gate already computed,
+    /// then a state, then a free input; anything else is an error.
+    fn of(model: &Model) -> Result<Compiled, String> {
+        let c = &model.cone;
+        let mut out = Compiled { ins: Vec::with_capacity(c.gates.len()), states: Vec::new(), frees: Vec::new(), next: Vec::new(), reg_state: Vec::new() };
+        let mut st: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut fr: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut done: FxHashMap<&str, usize> = FxHashMap::default();
+        let mut resolve = |n: &str, done: &FxHashMap<&str, usize>, out: &mut Compiled| -> Option<In> {
+            if let Some(&g) = done.get(n) {
+                return Some(In::Gate(g));
+            }
+            if let Some(k) = model.state.get(n) {
+                let i = *st.entry(k.as_str()).or_insert_with(|| {
+                    out.states.push(k.to_string());
+                    out.states.len() - 1
+                });
+                return Some(In::State(i));
+            }
+            let v = c.free.get(n)?;
+            let i = *fr.entry(v.as_str()).or_insert_with(|| {
+                out.frees.push(v.clone());
+                out.frees.len() - 1
+            });
+            Some(In::Free(i))
+        };
+        for (g, gate) in c.gates.iter().enumerate() {
+            let mut ins = Vec::with_capacity(gate.ins.len());
+            for s in &gate.ins {
+                ins.push(match s {
+                    Src::Const(v) => In::Const(*v),
+                    Src::Net(n) => resolve(n, &done, &mut out).ok_or_else(|| format!("cone gate `{}` reads `{n}` before it is computed", gate.out))?,
+                });
+            }
+            out.ins.push(ins);
+            done.insert(gate.out.as_str(), g);
+        }
+        for r in &model.regs {
+            let n = next_net(&r.instance);
+            // a next net nothing computes reads 0, as the word evaluation always did
+            let i = resolve(&n, &done, &mut out).unwrap_or(In::Const(false));
+            out.next.push(i);
+            out.reg_state.push(state_net(&r.instance));
+        }
+        Ok(out)
+    }
+}
+
 /// Every model evaluated under the pending counter-examples (one per bit; a name one does not
 /// assign reads 0), states read as the ROUND's class values, and each register's next value
 /// (complemented when inverted in its class) appended to its signature.
 ///
 /// ⛔ A counter-example tells apart the pair it came from; one that does not is an error (the
 /// CNF and the simulation disagree on a gate), never a silent merge.
-fn resimulate_counter_examples(models: &[&Model], class_of: &[ClassOf], sims: &mut Signatures, effort: &mut SatEffort) -> Result<(), String> {
+fn resimulate_counter_examples(models: &[&Model], sim: &[Compiled], class_of: &[ClassOf], sims: &mut Signatures, effort: &mut SatEffort) -> Result<(), String> {
     let pending = std::mem::take(&mut sims.pending);
     let word = |name: &str| -> u64 { pending.iter().enumerate().fold(0u64, |w, (i, c)| if c.0.get(name).copied().unwrap_or(false) { w | (1 << i) } else { w }) };
     let mask = if pending.len() == 64 { !0 } else { (1u64 << pending.len()) - 1 };
+    let mut class_words: FxHashMap<usize, u64> = FxHashMap::default();
     for (mi, model) in models.iter().enumerate() {
-        let c = &model.cone;
+        let (c, cs) = (&model.cone, &sim[mi]);
         let co = &class_of[mi];
-        let mut val: FxHashMap<&str, u64> = FxHashMap::default();
-        let mut words: FxHashMap<String, u64> = FxHashMap::default();
-        for g in &c.gates {
-            let mut x = Vec::with_capacity(g.ins.len());
-            for s in &g.ins {
-                x.push(match s {
-                    Src::Const(v) => if *v { !0 } else { 0 },
-                    Src::Net(n) => match val.get(n.as_str()) {
-                        Some(&w) => w,
-                        None => {
-                            let w = if model.state.contains(n.as_str()) {
-                                let (ci, neg) = co.get(n.as_str()).copied().unwrap_or((usize::MAX, false));
-                                let name = format!("class {ci}");
-                                let w = *words.entry(name.clone()).or_insert_with(|| word(&name));
-                                if neg { !w } else { w }
-                            } else if let Some(v) = c.free.get(n) {
-                                *words.entry(v.clone()).or_insert_with(|| word(v))
-                            } else {
-                                return Err(format!("cone gate `{}` reads `{n}` before it is computed", g.out));
-                            };
-                            val.insert(n.as_str(), w);
-                            w
-                        }
-                    },
-                });
+        let state: Vec<u64> = cs
+            .states
+            .iter()
+            .map(|n| {
+                let (ci, neg) = co.get(n.as_str()).copied().unwrap_or((usize::MAX, false));
+                let w = *class_words.entry(ci).or_insert_with(|| word(&format!("class {ci}")));
+                if neg { !w } else { w }
+            })
+            .collect();
+        let free: Vec<u64> = cs.frees.iter().map(|v| word(v)).collect();
+        let mut val: Vec<u64> = Vec::with_capacity(c.gates.len());
+        let mut x: Vec<u64> = Vec::new();
+        let read = |i: In, val: &[u64]| -> u64 {
+            match i {
+                In::Const(v) => if v { !0 } else { 0 },
+                In::Gate(g) => val[g],
+                In::State(s) => state[s],
+                In::Free(f) => free[f],
             }
-            let y = match &g.logic {
-                Logic::Prim(op) => prim_word(*op, &g.pins, &x)?,
-                Logic::Func(f) => func_word(f, &g.pins, &x),
-            };
-            val.insert(g.out.as_str(), y);
+        };
+        for (g, gate) in c.gates.iter().enumerate() {
+            x.clear();
+            x.extend(cs.ins[g].iter().map(|&i| read(i, &val)));
+            val.push(match &gate.logic {
+                Logic::Prim(op) => prim_word(*op, &gate.pins, &x)?,
+                Logic::Func(f) => func_word(f, &gate.pins, &x),
+            });
         }
-        for (k, r) in model.regs.iter().enumerate() {
-            let w = val.get(next_net(&r.instance).as_str()).copied().unwrap_or(0);
-            let neg = co.get(&state_net(&r.instance)).is_some_and(|x| x.1);
+        for k in 0..model.regs.len() {
+            let w = read(cs.next[k], &val);
+            let neg = co.get(cs.reg_state[k].as_str()).is_some_and(|x| x.1);
             sims.words[mi][k].push((if neg { !w } else { w }) & mask);
         }
     }
