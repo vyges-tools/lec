@@ -25,7 +25,7 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use vyges_loom::liberty_func::Func;
 
-use super::{class_index, func_word, prim_word, ClassOf, Key, Model, Polarity, RegId, SatEffort};
+use super::{class_index, ClassOf, Key, Model, Polarity, RegId, SatEffort};
 use crate::lec::{next_net, state_net, Logic, Op, Src};
 
 /// Conflicts one obligation may take before its member is undecided. ABC's `&scorr` default is
@@ -183,6 +183,8 @@ impl Signatures {
 /// words (resolving every input by name per pass cost a core minutes per class).
 struct Compiled {
     ins: Vec<Vec<In>>,
+    /// each gate's function over its inputs by position ([`program`])
+    prog: Vec<Vec<Ins>>,
     /// state nets read (by [`In::State`]), looked up in the round's classes per resimulation
     states: Vec<String>,
     /// free-input variable names read (by [`In::Free`])
@@ -206,7 +208,7 @@ impl Compiled {
     /// then a state, then a free input; anything else is an error.
     fn of(model: &Model) -> Result<Compiled, String> {
         let c = &model.cone;
-        let mut out = Compiled { ins: Vec::with_capacity(c.gates.len()), states: Vec::new(), frees: Vec::new(), next: Vec::new(), reg_state: Vec::new() };
+        let mut out = Compiled { ins: Vec::with_capacity(c.gates.len()), prog: Vec::with_capacity(c.gates.len()), states: Vec::new(), frees: Vec::new(), next: Vec::new(), reg_state: Vec::new() };
         let mut st: FxHashMap<&str, usize> = FxHashMap::default();
         let mut fr: FxHashMap<&str, usize> = FxHashMap::default();
         let mut done: FxHashMap<&str, usize> = FxHashMap::default();
@@ -236,6 +238,7 @@ impl Compiled {
                     Src::Net(n) => resolve(n, &done, &mut out).ok_or_else(|| format!("cone gate `{}` reads `{n}` before it is computed", gate.out))?,
                 });
             }
+            out.prog.push(program(&gate.logic, &gate.pins, ins.len()).map_err(|e| format!("cone gate `{}`: {e}", gate.out))?);
             out.ins.push(ins);
             done.insert(gate.out.as_str(), g);
         }
@@ -248,6 +251,106 @@ impl Compiled {
         }
         Ok(out)
     }
+}
+
+/// One step of a gate program, a stack machine over words: `Arg(k)` pushes input `k`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Ins {
+    Arg(u32),
+    One,
+    Zero,
+    Not,
+    And,
+    Or,
+    Xor,
+}
+
+/// A gate's function as a program over its inputs by position, pins resolved once: the same
+/// rules as [`super::func_word`] and [`super::prim_word`], which resolve them on every call.
+fn program(logic: &Logic, pins: &[String], n: usize) -> Result<Vec<Ins>, String> {
+    fn func(f: &Func, pins: &[String], out: &mut Vec<Ins>) -> Result<(), String> {
+        match f {
+            Func::Port(p) => out.push(Ins::Arg(pins.iter().position(|q| q == p).ok_or_else(|| format!("function reads `{p}`, not a pin"))? as u32)),
+            Func::Not(a) => {
+                func(a, pins, out)?;
+                out.push(Ins::Not);
+            }
+            Func::And(a, b) | Func::Or(a, b) | Func::Xor(a, b) => {
+                func(a, pins, out)?;
+                func(b, pins, out)?;
+                out.push(match f {
+                    Func::And(..) => Ins::And,
+                    Func::Or(..) => Ins::Or,
+                    _ => Ins::Xor,
+                });
+            }
+            Func::One => out.push(Ins::One),
+            Func::Zero => out.push(Ins::Zero),
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    match logic {
+        Logic::Func(f) => func(f, pins, &mut out)?,
+        Logic::Prim(op) => {
+            if n == 0 {
+                return Err("primitive needs inputs".into());
+            }
+            let need = |k: usize| if n == k { Ok(()) } else { Err(format!("primitive expected {k} input(s), got {n}")) };
+            let fold = |out: &mut Vec<Ins>, op: Ins| {
+                out.push(Ins::Arg(0));
+                for k in 1..n {
+                    out.push(Ins::Arg(k as u32));
+                    out.push(op);
+                }
+            };
+            match op {
+                Op::Buf | Op::Not => {
+                    need(1)?;
+                    out.push(Ins::Arg(0));
+                }
+                Op::And | Op::Nand => fold(&mut out, Ins::And),
+                Op::Or | Op::Nor => fold(&mut out, Ins::Or),
+                Op::Xor | Op::Xnor => fold(&mut out, Ins::Xor),
+                Op::Mux => {
+                    need(3)?;
+                    let idx = |want: &str| pins.iter().position(|p| p.eq_ignore_ascii_case(want));
+                    let (Some(a), Some(b), Some(s)) = (idx("A"), idx("B"), idx("S")) else { return Err("MUX needs pins A, B, S".into()) };
+                    out.extend([Ins::Arg(s as u32), Ins::Arg(b as u32), Ins::And, Ins::Arg(s as u32), Ins::Not, Ins::Arg(a as u32), Ins::And, Ins::Or]);
+                }
+            }
+            if matches!(op, Op::Not | Op::Nand | Op::Nor | Op::Xnor) {
+                out.push(Ins::Not);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// A gate program run over the input words `x`.
+fn run(prog: &[Ins], x: &[u64], stack: &mut Vec<u64>) -> u64 {
+    stack.clear();
+    for &i in prog {
+        match i {
+            Ins::Arg(k) => stack.push(x[k as usize]),
+            Ins::One => stack.push(!0),
+            Ins::Zero => stack.push(0),
+            Ins::Not => {
+                let a = stack.pop().unwrap_or(0);
+                stack.push(!a);
+            }
+            Ins::And | Ins::Or | Ins::Xor => {
+                let b = stack.pop().unwrap_or(0);
+                let a = stack.pop().unwrap_or(0);
+                stack.push(match i {
+                    Ins::And => a & b,
+                    Ins::Or => a | b,
+                    _ => a ^ b,
+                });
+            }
+        }
+    }
+    stack.pop().unwrap_or(0)
 }
 
 /// Every model evaluated under the pending counter-examples (one per bit; a name one does not
@@ -276,6 +379,7 @@ fn resimulate_counter_examples(models: &[&Model], sim: &[Compiled], class_of: &[
         let free: Vec<u64> = cs.frees.iter().map(|v| word(v)).collect();
         let mut val: Vec<u64> = Vec::with_capacity(c.gates.len());
         let mut x: Vec<u64> = Vec::new();
+        let mut stack: Vec<u64> = Vec::new();
         let read = |i: In, val: &[u64]| -> u64 {
             match i {
                 In::Const(v) => if v { !0 } else { 0 },
@@ -284,13 +388,10 @@ fn resimulate_counter_examples(models: &[&Model], sim: &[Compiled], class_of: &[
                 In::Free(f) => free[f],
             }
         };
-        for (g, gate) in c.gates.iter().enumerate() {
+        for g in 0..c.gates.len() {
             x.clear();
             x.extend(cs.ins[g].iter().map(|&i| read(i, &val)));
-            val.push(match &gate.logic {
-                Logic::Prim(op) => prim_word(*op, &gate.pins, &x)?,
-                Logic::Func(f) => func_word(f, &gate.pins, &x),
-            });
+            val.push(run(&cs.prog[g], &x, &mut stack));
         }
         for k in 0..model.regs.len() {
             let w = read(cs.next[k], &val);
@@ -625,6 +726,33 @@ fn prim_lit(cnf: &mut Cnf, op: Op, ins: &[i32], pins: &[String]) -> Result<i32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A gate program computes what the word evaluators compute, for every primitive (both
+    /// polarities, two and three inputs, the mux by pin name in any order) and a Liberty
+    /// function, on words that cover every input combination.
+    #[test]
+    fn a_gate_program_agrees_with_the_word_evaluators() {
+        let pins = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<String>>();
+        let x = [0xaaaa_aaaa_aaaa_aaaa_u64, 0xcccc_cccc_cccc_cccc, 0xf0f0_f0f0_f0f0_f0f0];
+        let mut stack = Vec::new();
+        for op in [Op::And, Op::Nand, Op::Or, Op::Nor, Op::Xor, Op::Xnor] {
+            for n in [2, 3] {
+                let p = pins(&["A", "B", "C"][..n]);
+                let got = run(&program(&Logic::Prim(op), &p, n).unwrap(), &x[..n], &mut stack);
+                assert_eq!(got, super::super::prim_word(op, &p, &x[..n]).unwrap(), "{op:?}/{n}");
+            }
+        }
+        for op in [Op::Buf, Op::Not] {
+            let p = pins(&["A"]);
+            assert_eq!(run(&program(&Logic::Prim(op), &p, 1).unwrap(), &x[..1], &mut stack), super::super::prim_word(op, &p, &x[..1]).unwrap());
+        }
+        let p = pins(&["S", "A", "B"]);
+        assert_eq!(run(&program(&Logic::Prim(Op::Mux), &p, 3).unwrap(), &x, &mut stack), super::super::prim_word(Op::Mux, &p, &x).unwrap());
+        let f = Func::Xor(Box::new(Func::And(Box::new(Func::Port("B".into())), Box::new(Func::Not(Box::new(Func::Port("A".into())))))), Box::new(Func::Or(Box::new(Func::Port("C".into())), Box::new(Func::Zero))));
+        let p = pins(&["A", "B", "C"]);
+        assert_eq!(run(&program(&Logic::Func(f.clone()), &p, 3).unwrap(), &x, &mut stack), super::super::func_word(&f, &p, &x));
+        assert!(program(&Logic::Prim(Op::Not), &p, 3).is_err());
+    }
 
     /// ABC recycles only when the solver is over `nSatVarMax` variables AND has answered more
     /// than `nCallsRecycle` calls since the last recycle: a small solver is kept however many
