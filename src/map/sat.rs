@@ -53,19 +53,26 @@ fn diag_on() -> bool {
     DIAG.with(|d| d.borrow().on)
 }
 fn xor_gates(model: &Model, gates: &[usize]) -> usize {
-    fn fx(f: &Func) -> bool {
-        match f {
-            Func::Xor(..) => true,
-            Func::Not(a) => fx(a),
-            Func::And(a, b) | Func::Or(a, b) => fx(a) || fx(b),
-            _ => false,
-        }
-    }
-    gates.iter().filter(|&&g| match &model.cone.gates[g].logic {
-        Logic::Prim(Op::Xor | Op::Xnor) => true,
-        Logic::Func(f) => fx(f),
-        _ => false,
-    }).count()
+    // by truth table: a gate whose output is the parity (or its complement) of two or more of its
+    // inputs, however its Liberty function is written (ASAP7 writes XOR as a sum of products)
+    const W: [u64; 4] = [0xaaaa_aaaa_aaaa_aaaa, 0xcccc_cccc_cccc_cccc, 0xf0f0_f0f0_f0f0_f0f0, 0xff00_ff00_ff00_ff00];
+    gates
+        .iter()
+        .filter(|&&g| {
+            let gate = &model.cone.gates[g];
+            let n = gate.ins.len();
+            if !(2..=4).contains(&n) {
+                return false;
+            }
+            let Ok(prog) = program(&gate.logic, &gate.pins, n) else { return false };
+            let y = run(&prog, &W[..n], &mut Vec::new());
+            let mask = if n == 4 { !0u64 } else { (1u64 << (1 << n)) - 1 };
+            (3u32..(1 << n)).filter(|s| s.count_ones() >= 2).any(|s| {
+                let par = (0..n).filter(|k| s >> k & 1 == 1).fold(0u64, |a, k| a ^ W[k]);
+                (y ^ par) & mask == 0 || (y ^ !par) & mask == 0
+            })
+        })
+        .count()
 }
 
 /// Stage 4 by SAT: the fixed point ([`self`]); returns the rounds and the undecided registers, as
