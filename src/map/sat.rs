@@ -49,6 +49,21 @@ struct Diag {
 thread_local! {
     static DIAG: std::cell::RefCell<Diag> = std::cell::RefCell::new(Diag::default());
 }
+/// DIAGNOSTIC ONLY (branch sat-diag): `LEC_DIAG_ASSUME=io_te=0,io_aresetn=1` fixes those inputs in
+/// the PROOF too (CNF and resimulation), to measure whether they cause the CoralNPU collapse.
+fn diag_assume(name: &str) -> Option<bool> {
+    static FIX: std::sync::OnceLock<Vec<(String, bool)>> = std::sync::OnceLock::new();
+    let fix = FIX.get_or_init(|| {
+        let s = std::env::var("LEC_DIAG_ASSUME").unwrap_or_default();
+        let v: Vec<(String, bool)> = s.split(',').filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.to_string(), v == "1"))).collect();
+        if !v.is_empty() {
+            eprintln!("SATDIAG ASSUME (diagnostic, proof constrained): {v:?}");
+        }
+        v
+    });
+    fix.iter().find(|(k, _)| k == name).map(|x| x.1)
+}
+
 fn diag_on() -> bool {
     DIAG.with(|d| d.borrow().on)
 }
@@ -316,6 +331,9 @@ impl Compiled {
                 return Some(In::State(i));
             }
             let v = c.free.get(n)?;
+            if let Some(b) = diag_assume(v) {
+                return Some(In::Const(b));
+            }
             let i = *fr.entry(v.as_str()).or_insert_with(|| {
                 out.frees.push(v.clone());
                 out.frees.len() - 1
@@ -811,7 +829,10 @@ fn next_lit<'m>(cnf: &mut Cnf, vars: &mut FxHashMap<Var, i32>, lit: &mut FxHashM
                             let x = var(cnf, Var::Class(ci));
                             if neg { -x } else { x }
                         } else if let Some(v) = c.free.get(n) {
-                            var(cnf, Var::Input(v.clone()))
+                            match diag_assume(v) {
+                                Some(b) => if b { T } else { -T },
+                                None => var(cnf, Var::Input(v.clone())),
+                            }
                         } else {
                             return Err(format!("cone gate `{}` reads `{n}` before it is computed (gate {k})", g.out));
                         };
