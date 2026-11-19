@@ -288,7 +288,18 @@ fn register_map_at(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Namin
     let (g, r) = (Design::register_model(golden, lib), Design::register_model(revised, lib));
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
     let stim = Stimulus::of(&[&g, &r]).with(holds);
-    let (sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim)?;
+    let (mut sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim)?;
+    // DIAGNOSTIC (sat-diag only): `LEC_DIAG_SIG_SKIP=K` drops the first K simulated cycles before
+    // the candidate classes are drawn, so a register without reset is compared only after it has
+    // been written (its all-zero starting storage is not a value the design defines)
+    if let Some(k) = std::env::var("LEC_DIAG_SIG_SKIP").ok().and_then(|s| s.parse::<usize>().ok()) {
+        eprintln!("SATDIAG SIG_SKIP {k} cycles dropped before candidate classes (diagnostic)");
+        for side in sigs.iter_mut() {
+            for w in side.iter_mut() {
+                w.drain(..k.min(w.len()));
+            }
+        }
+    }
     let (classes, mut inv) = candidate_classes(&[&gm, &rm], &sigs);
     // DIAGNOSTIC (sat-diag only): `LEC_DIAG_SIG=sub1,sub2` prints each matching register's
     // simulation signature (cycle words 0..8 of run bit 0, and whether its tail is constant) and its
