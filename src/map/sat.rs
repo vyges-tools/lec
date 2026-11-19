@@ -326,16 +326,46 @@ pub(crate) struct RoundSolver<'m> {
     /// per model: each net's literal this round
     lit: Vec<FxHashMap<&'m str, i32>>,
     limit: i32,
+    /// obligations since the solver was last recycled
+    calls: usize,
+}
+
+/// ABC recycles its sweeping solver (`Cec_ManSatSolverRecycle`) once it holds more than
+/// `nSatVarMax` variables and has answered more than `nCallsRecycle` calls since the last
+/// recycle (`Cec_ManSatSetDefaultParams`: 2000 and 200). A solver that only grows makes every
+/// satisfiable answer extend a model over the whole round's CNF: on a core that was 30% of the
+/// run (2026-11-19).
+///
+/// ⚠️ DIVERGENCE: the variable cap is 2^17, not 2000. CaDiCaL keeps what it learned across
+/// calls, and at 2000 a cold solver gave up on a pair the warm one proves (rvv_backend_rob
+/// `u_uop_valid_fifo.mem[0]`, BDD-undecided too), which cost 1,834 of 5,514 pairs; at 2^17 a
+/// leaf's round is never recycled and only a core's is.
+const SAT_VAR_MAX: i32 = 1 << 17;
+const CALLS_RECYCLE: usize = 200;
+
+/// ABC's recycle condition (`cecSolve.c`): BOTH over the variable cap and past the call count.
+fn needs_recycle(vars: i32, calls: usize) -> bool {
+    vars > SAT_VAR_MAX && calls > CALLS_RECYCLE
 }
 
 impl<'m> RoundSolver<'m> {
     pub(crate) fn new(models: usize, limit: i32) -> RoundSolver<'m> {
-        RoundSolver { cnf: Cnf::new(), sent: 0, sat: cadical::Solver::new(), vars: FxHashMap::default(), lit: vec![FxHashMap::default(); models], limit }
+        RoundSolver { cnf: Cnf::new(), sent: 0, sat: cadical::Solver::new(), vars: FxHashMap::default(), lit: vec![FxHashMap::default(); models], limit, calls: 0 }
+    }
+
+    /// A fresh solver and CNF, every literal forgotten (ABC `Cec_ManSatSolverRecycle`): the next
+    /// obligation encodes its cones again.
+    fn recycle(&mut self) {
+        *self = RoundSolver::new(self.lit.len(), self.limit);
     }
 
     /// One obligation: `h` and `m` load different values (each complemented when inverted in its
     /// class), every state read as its class's variable, every input free.
     fn prove(&mut self, models: &[&'m Model], h: RegId, m: RegId, class_of: &[ClassOf]) -> Result<Outcome, String> {
+        self.calls += 1;
+        if needs_recycle(self.cnf.n, self.calls) {
+            self.recycle();
+        }
         let a = next_lit(&mut self.cnf, &mut self.vars, &mut self.lit[h.0], models[h.0], h, &class_of[h.0])?;
         let b = next_lit(&mut self.cnf, &mut self.vars, &mut self.lit[m.0], models[m.0], m, &class_of[m.0])?;
         let d = self.cnf.xor2(a, b);
@@ -590,4 +620,20 @@ fn prim_lit(cnf: &mut Cnf, op: Op, ins: &[i32], pins: &[String]) -> Result<i32, 
         Op::Xor => fold(cnf, Cnf::xor2, "XOR/XNOR")?,
         Op::Xnor => -fold(cnf, Cnf::xor2, "XOR/XNOR")?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ABC recycles only when the solver is over `nSatVarMax` variables AND has answered more
+    /// than `nCallsRecycle` calls since the last recycle: a small solver is kept however many
+    /// calls it answers, and a large one until it has been used 200 times (our cap: 2^17).
+    #[test]
+    fn the_solver_is_recycled_past_both_abc_limits_only() {
+        assert!(!needs_recycle(SAT_VAR_MAX, CALLS_RECYCLE + 1));
+        assert!(!needs_recycle(SAT_VAR_MAX + 1, CALLS_RECYCLE));
+        assert!(needs_recycle(SAT_VAR_MAX + 1, CALLS_RECYCLE + 1));
+        assert_eq!((SAT_VAR_MAX, CALLS_RECYCLE), (1 << 17, 200));
+    }
 }
