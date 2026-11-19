@@ -67,11 +67,20 @@ fn sat_round(models: &[&Model], sim: &[Compiled], classes: &mut Vec<Vec<RegId>>,
             next.push(cl.clone());
             continue;
         }
+        // counter-examples are resimulated before a class they can spare more than one call: a
+        // pass costs the whole model, a pair one obligation (ABC resimulates per batch only)
+        if cl.len() > 2 && !sims.pending.is_empty() {
+            resimulate_counter_examples(models, sim, class_of, &mut sims, effort)?;
+        }
         let parts = split_class(models, sim, cl, class_of, &mut rs, &mut sims, undecided, effort)?;
         if parts.len() > 1 {
             split.extend(cl.iter().copied());
         }
         next.extend(parts);
+    }
+    // the round's last counter-examples, checked like every batch
+    if !sims.pending.is_empty() {
+        resimulate_counter_examples(models, sim, class_of, &mut sims, effort)?;
     }
     *classes = next;
     Ok(split)
@@ -79,9 +88,9 @@ fn sat_round(models: &[&Model], sim: &[Compiled], classes: &mut Vec<Vec<RegId>>,
 
 /// One class split into the parts of members that load the same next value under `class_of`, in
 /// order of their first member. A member is proved only against the head of a part whose
-/// counter-example signature it shares ([`Signatures`]); the counter-examples a class produced
-/// are resimulated over every register before the next class (and every 64), so a later class
-/// is not asked what they already tell apart.
+/// counter-example signature it shares ([`Signatures`]); counter-examples are resimulated over
+/// every register every 64, before a class of three or more members ([`sat_round`]), and at the
+/// round's end, so a later class is not asked what they already tell apart.
 #[allow(clippy::too_many_arguments)]
 fn split_class<'m>(
     models: &[&'m Model],
@@ -153,9 +162,6 @@ fn split_class<'m>(
         if !undecided.contains(&part[0]) {
             undecided.push(part[0]);
         }
-    }
-    if !sims.pending.is_empty() {
-        resimulate_counter_examples(models, sim, class_of, sims, effort)?;
     }
     Ok(parts)
 }
