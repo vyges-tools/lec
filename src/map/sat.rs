@@ -33,6 +33,40 @@ use crate::lec::{next_net, state_net, Logic, Op, Src};
 /// (2026-11-19: `rvv_backend_alu_unit_0` maps 363 at 1000, 352 at 100).
 pub const PAIR_CONFLICTS: i32 = 1000;
 
+/// DIAGNOSTIC (branch sat-diag only): per-round attribution of rejections, `LEC_DIAG_SAT=1`.
+#[derive(Default)]
+struct Diag {
+    on: bool,
+    round: usize,
+    /// registers whose class split in the previous round
+    split_prev: FxHashSet<RegId>,
+    undecided: FxHashSet<RegId>,
+    /// per model: state net -> register
+    reg_of: Vec<FxHashMap<String, usize>>,
+    logged: usize,
+}
+thread_local! {
+    static DIAG: std::cell::RefCell<Diag> = std::cell::RefCell::new(Diag::default());
+}
+fn diag_on() -> bool {
+    DIAG.with(|d| d.borrow().on)
+}
+fn xor_gates(model: &Model, gates: &[usize]) -> usize {
+    fn fx(f: &Func) -> bool {
+        match f {
+            Func::Xor(..) => true,
+            Func::Not(a) => fx(a),
+            Func::And(a, b) | Func::Or(a, b) => fx(a) || fx(b),
+            _ => false,
+        }
+    }
+    gates.iter().filter(|&&g| match &model.cone.gates[g].logic {
+        Logic::Prim(Op::Xor | Op::Xnor) => true,
+        Logic::Func(f) => fx(f),
+        _ => false,
+    }).count()
+}
+
 /// Stage 4 by SAT: the fixed point ([`self`]); returns the rounds and the undecided registers, as
 /// [`super::refine_within`] does. Thin sequencer, one stage per line.
 pub(crate) fn refine_sat(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity, limit: i32, effort: &mut SatEffort) -> Result<(usize, Vec<RegId>), String> {
@@ -41,11 +75,40 @@ pub(crate) fn refine_sat(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: 
     let mut undecided: Vec<RegId> = Vec::new();
     let mut seeds: Option<Vec<RegId>> = None;
     let mut rounds = 0;
+    if std::env::var_os("LEC_DIAG_SAT").is_some() {
+        DIAG.with(|d| {
+            let mut d = d.borrow_mut();
+            d.on = true;
+            d.reg_of = models.iter().map(|m| m.regs.iter().enumerate().map(|(k, r)| (state_net(&r.instance), k)).collect()).collect();
+        });
+    }
     loop {
         rounds += 1;
+        let before = *effort;
+        if diag_on() {
+            DIAG.with(|d| {
+                let mut d = d.borrow_mut();
+                d.round = rounds;
+                d.split_prev = seeds.iter().flatten().copied().collect();
+                d.undecided = undecided.iter().copied().collect();
+                d.logged = 0;
+            });
+        }
         let class_of = class_index(models, classes, &|r: RegId| inv[r.0][r.1]);
         let active = super::active_classes(models, classes, &readers, seeds.as_deref());
         let split = sat_round(models, &sim, classes, &active, &class_of, limit, &mut undecided, effort)?;
+        if diag_on() {
+            eprintln!(
+                "SATDIAG round {rounds} active {} proved {} structural {} disproved {} gave_up {} split_members {} undecided_total {}",
+                active.iter().zip(classes.iter()).filter(|(a, _)| **a).count(),
+                effort.proved - before.proved,
+                effort.structural - before.structural,
+                effort.disproved - before.disproved,
+                effort.gave_up - before.gave_up,
+                split.len(),
+                undecided.len()
+            );
+        }
         if split.is_empty() {
             return Ok((rounds, undecided));
         }
@@ -120,6 +183,9 @@ fn split_class<'m>(
                 }
                 Outcome::Sat(cex) => {
                     effort.disproved += 1;
+                    if diag_on() {
+                        diag_rejection(models, head, r, &cex, rs, class_of);
+                    }
                     sims.pending.push((cex, head, r));
                     if sims.pending.len() == 64 {
                         resimulate_counter_examples(models, sim, class_of, sims, effort)?;
@@ -127,6 +193,20 @@ fn split_class<'m>(
                 }
                 Outcome::GaveUp => {
                     effort.gave_up += 1;
+                    if diag_on() {
+                        let n = |x: RegId| models[x.0].regs[x.1].name.clone();
+                        let (gh, gm) = (cone_gates(models[head.0], head, &|_| false), cone_gates(models[r.0], r, &|_| false));
+                        eprintln!(
+                            "SATDIAG gaveup r={} {} / {} gates {}/{} xor {}/{}",
+                            DIAG.with(|d| d.borrow().round),
+                            n(head),
+                            n(r),
+                            gh.len(),
+                            gm.len(),
+                            xor_gates(models[head.0], &gh),
+                            xor_gates(models[r.0], &gm)
+                        );
+                    }
                     unsure[p] = true;
                     home = Some(None);
                 }
@@ -426,6 +506,61 @@ enum Var {
     Input(String),
 }
 
+/// DIAGNOSTIC: one rejected obligation: the counter-example's io_te / io_aresetn, the same pair
+/// re-proved with io_te=0 and io_aresetn=1 assumed, and (rounds after the first) the fan-in
+/// registers that were undecided or split last round.
+fn diag_rejection<'m>(models: &[&'m Model], h: RegId, m: RegId, cex: &[Var], rs: &mut RoundSolver<'m>, class_of: &[ClassOf]) {
+    let n = |x: RegId| models[x.0].regs[x.1].name.clone();
+    let (round, logged) = DIAG.with(|d| {
+        let mut d = d.borrow_mut();
+        d.logged += 1;
+        (d.round, d.logged)
+    });
+    let val = |name: &str| -> &str {
+        let v = Var::Input(name.to_string());
+        if !rs.vars.contains_key(&v) {
+            "-"
+        } else if cex.contains(&v) {
+            "1"
+        } else {
+            "0"
+        }
+    };
+    let (te, ar) = (val("io_te"), val("io_aresetn"));
+    // the constrained recheck and the fan-in census cost a solve and a cone walk: first 3000 per round
+    let mut constrained = "skip";
+    let mut fan = String::new();
+    if logged <= 3000 {
+        constrained = match rs.prove_assuming(models, h, m, class_of, &[("io_te", false), ("io_aresetn", true)]) {
+            Ok(Outcome::Unsat) | Ok(Outcome::Structural) => "unsat",
+            Ok(Outcome::Sat(_)) => "sat",
+            Ok(Outcome::GaveUp) => "gaveup",
+            Err(_) => "err",
+        };
+        if round > 1 {
+            DIAG.with(|d| {
+                let d = d.borrow();
+                let (mut und, mut spl) = (0, 0);
+                for x in [h, m] {
+                    for s in super::states_read(models[x.0], x.1) {
+                        if let Some(&k) = d.reg_of[x.0].get(&s) {
+                            let id = (x.0, k);
+                            if d.undecided.contains(&id) {
+                                und += 1;
+                            } else if d.split_prev.contains(&id) {
+                                spl += 1;
+                            }
+                        }
+                    }
+                }
+                fan = format!(" fanin_undecided {und} fanin_split {spl}");
+            });
+        }
+    }
+    let same = models[h.0].regs[h.1].name == models[m.0].regs[m.1].name;
+    eprintln!("SATDIAG rej r={round} same={same} {} / {} te={te} aresetn={ar} constrained={constrained}{fan}", n(h), n(m));
+}
+
 enum Outcome {
     Structural,
     Unsat,
@@ -498,6 +633,29 @@ impl<'m> RoundSolver<'m> {
         Ok(match self.sat.solve_with([d]) {
             Some(false) => Outcome::Unsat,
             Some(true) => Outcome::Sat(self.vars.iter().filter(|(_, &v)| self.sat.value(v).unwrap_or(false)).map(|(name, _)| name.clone()).collect()),
+            None => Outcome::GaveUp,
+        })
+    }
+
+    /// DIAGNOSTIC: [`Self::prove`] with input values assumed (an input not in the CNF is left).
+    fn prove_assuming(&mut self, models: &[&'m Model], h: RegId, m: RegId, class_of: &[ClassOf], fix: &[(&str, bool)]) -> Result<Outcome, String> {
+        let a = next_lit(&mut self.cnf, &mut self.vars, &mut self.lit[h.0], models[h.0], h, &class_of[h.0])?;
+        let b = next_lit(&mut self.cnf, &mut self.vars, &mut self.lit[m.0], models[m.0], m, &class_of[m.0])?;
+        let d = self.cnf.xor2(a, b);
+        for c in &self.cnf.clauses[self.sent..] {
+            self.sat.add_clause(c.iter().copied());
+        }
+        self.sent = self.cnf.clauses.len();
+        let mut assume = vec![d];
+        for (name, v) in fix {
+            if let Some(&x) = self.vars.get(&Var::Input(name.to_string())) {
+                assume.push(if *v { x } else { -x });
+            }
+        }
+        self.sat.set_limit("conflicts", self.limit).map_err(|e| format!("{e:?}"))?;
+        Ok(match self.sat.solve_with(assume) {
+            Some(false) => Outcome::Unsat,
+            Some(true) => Outcome::Sat(Vec::new()),
             None => Outcome::GaveUp,
         })
     }
