@@ -90,6 +90,13 @@ struct Stats {
     sat: usize,
     gave_up: usize,
     resims: usize,
+    /// seconds: CNF encoding, solver construction, solving, resimulation
+    t_encode: f64,
+    t_build: f64,
+    t_solve: f64,
+    t_resim: f64,
+    vars: usize,
+    clauses: usize,
 }
 
 /// One round: every obligation of the active classes, counter-examples resimulated in batches of
@@ -108,14 +115,16 @@ fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], 
         if at[&h] != at[&m] {
             continue;
         }
-        match prove_pair(models, h, m, class_of)? {
+        match prove_pair(models, h, m, class_of, st)? {
             Outcome::Structural => st.structural += 1,
             Outcome::Unsat => st.unsat += 1,
             Outcome::Sat(cex) => {
                 st.sat += 1;
                 cexs.push(cex);
                 if cexs.len() == 64 {
+                    let t3 = std::time::Instant::now();
                     resimulate(models, classes, class_of, &std::mem::take(&mut cexs), &mut split)?;
+                    st.t_resim += t3.elapsed().as_secs_f64();
                     st.resims += 1;
                     at = position(classes);
                 }
@@ -136,7 +145,9 @@ fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], 
         }
     }
     if !cexs.is_empty() {
+        let t3 = std::time::Instant::now();
         resimulate(models, classes, class_of, &cexs, &mut split)?;
+        st.t_resim += t3.elapsed().as_secs_f64();
         st.resims += 1;
     }
     let mut out: Vec<RegId> = split.into_iter().collect();
@@ -165,7 +176,8 @@ struct Cone2 {
 
 /// One obligation: `h` and `m` load different values (each complemented when inverted in its
 /// class), every state read as its class's variable, every input free.
-fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf]) -> Result<Outcome, String> {
+fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf], st: &mut Stats) -> Result<Outcome, String> {
+    let t0 = std::time::Instant::now();
     let mut cnf = Cnf::new();
     let mut vars: FxHashMap<String, i32> = FxHashMap::default();
     let (a, ca) = next_lit(&mut cnf, &mut vars, models[h.0], h, &class_of[h.0])?;
@@ -175,14 +187,22 @@ fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf]) -> Re
         return Ok(Outcome::Structural);
     }
     cnf.clauses.push(vec![d]);
+    st.t_encode += t0.elapsed().as_secs_f64();
+    st.vars += cnf.n as usize;
+    st.clauses += cnf.clauses.len();
     let limit = std::env::var("LEC_SAT_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(PAIR_TIMEOUT_S);
     let config = Config { quiet_mode: true, c_timeout: limit, ..Config::default() };
     let n = cnf.n;
-    let got = match Solver::try_from((config, cnf.clauses.as_slice())) {
+    let t1 = std::time::Instant::now();
+    let built = Solver::try_from((config, cnf.clauses.as_slice()));
+    st.t_build += t1.elapsed().as_secs_f64();
+    let t2 = std::time::Instant::now();
+    let got = match built {
         Ok(mut s) => s.solve(),
         Err(Ok(c)) => Ok(c),
         Err(Err(e)) => Err(e),
     };
+    st.t_solve += t2.elapsed().as_secs_f64();
     let model = match got {
         Ok(Certificate::SAT(v)) => v,
         Ok(Certificate::UNSAT) | Err(SolverError::EmptyClause) | Err(SolverError::RootLevelConflict(_)) | Err(SolverError::Inconsistent) => {

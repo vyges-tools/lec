@@ -217,17 +217,25 @@ pub fn register_map_with(golden: &Netlist, revised: &Netlist, lib: &Lib, names: 
             }
         }
     }
+    let t_stage = std::time::Instant::now();
+    let lap = |what: &str| if std::env::var_os("LEC_SAT_STATS").is_some() { eprintln!("STAGE {what} {:.1}s", t_stage.elapsed().as_secs_f64()) };
     let (g, r) = (Design::register_model(golden, lib), Design::register_model(revised, lib));
     let (gm, rm) = (model(&g, Side::Golden, names.0)?, model(&r, Side::Revised, names.1)?);
     let stim = Stimulus::of(&[&g, &r]).with(holds);
+    lap("model");
     let (sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim)?;
+    lap("simulate");
     let (classes, mut inv) = candidate_classes(&[&gm, &rm], &sigs);
     let (mut classes, by_name) = split_constant_classes_by_name(&[&gm, &rm], &sigs, classes, &mut inv);
+    lap("classes");
     let candidates = classes.clone();
     let (rounds, undecided) = refine(&[&gm, &rm], &mut classes, &inv)?;
+    lap("refine");
     let mut rep = report(&[&gm, &rm], &candidates, &classes, &inv, &undecided, rounds);
+    lap("report");
     name_pairs_kept(&[&gm, &rm], &classes, &by_name, &mut rep);
     attribute(&[&gm, &rm], &sigs, &classes, &inv, &mut rep)?;
+    lap("attribute");
     rep.reset_inputs = stim.held.into_iter().collect();
     rep.holds = stim.fixed.into_iter().collect();
     rep.resets_given = holds.reset.clone().into_iter().collect();
