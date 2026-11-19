@@ -290,6 +290,29 @@ fn register_map_at(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Namin
     let stim = Stimulus::of(&[&g, &r]).with(holds);
     let (sigs, freed) = simulate_freeing_stuck_enables(&[&gm, &rm], &stim)?;
     let (classes, mut inv) = candidate_classes(&[&gm, &rm], &sigs);
+    // DIAGNOSTIC (sat-diag only): `LEC_DIAG_SIG=sub1,sub2` prints each matching register's
+    // simulation signature (cycle words 0..8 of run bit 0, and whether its tail is constant) and its
+    // candidate class; `LEC_DIAG_SIG_EXIT` stops after printing.
+    if let Ok(subs) = std::env::var("LEC_DIAG_SIG") {
+        let subs: Vec<&str> = subs.split(',').collect();
+        let at: HashMap<RegId, usize> = classes.iter().enumerate().flat_map(|(i, c)| c.iter().map(move |r| (*r, i))).collect();
+        for (side, m) in [&gm, &rm].iter().enumerate() {
+            for (k, reg) in m.regs.iter().enumerate() {
+                if !subs.iter().any(|s| reg.name.contains(s)) {
+                    continue;
+                }
+                let w = &sigs[side][k];
+                let tail = w.get(1..).unwrap_or(&[]);
+                let c = if tail.iter().all(|x| *x == 0) { "const0" } else if tail.iter().all(|x| *x == !0) { "const1" } else { "moves" };
+                let bits: String = w.iter().take(24).map(|x| if x & 1 == 1 { '1' } else { '0' }).collect();
+                let ones: u32 = w.iter().map(|x| x.count_ones()).sum();
+                eprintln!("SIGDIAG {} {} {c} ones {ones} run0 {bits} class {:?} inv {}", if side == 0 { "g" } else { "r" }, reg.name, at.get(&(side, k)), inv[side][k]);
+            }
+        }
+        if std::env::var_os("LEC_DIAG_SIG_EXIT").is_some() {
+            return Err("LEC_DIAG_SIG_EXIT".into());
+        }
+    }
     let (mut classes, by_name) = split_constant_classes_by_name(&[&gm, &rm], &sigs, classes, &mut inv);
     let candidates = classes.clone();
     let mut effort = SatEffort::default();
