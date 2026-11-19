@@ -94,8 +94,12 @@ fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], 
                     at = position(classes);
                 }
             }
-            Outcome::GaveUp => {
+            Outcome::GaveUp(sz) => {
                 st.gave_up += 1;
+                if std::env::var_os("LEC_SAT_STATS").is_some() {
+                    let n = |r: RegId| models[r.0].regs[r.1].name.as_str();
+                    eprintln!("SATREF undecided {} / {} gates {}/{} xor {}/{}", n(h), n(m), sz[0].gates, sz[1].gates, sz[0].xors, sz[1].xors);
+                }
                 let c = at[&m];
                 split.extend(classes[c].iter().copied());
                 classes[c].retain(|r| *r != m);
@@ -122,7 +126,15 @@ enum Outcome {
     Structural,
     Unsat,
     Sat(FxHashMap<String, bool>),
-    GaveUp,
+    /// Over the limit: each side's cone size and its XOR-type gates (an arithmetic hint).
+    GaveUp([Cone2; 2]),
+}
+
+/// A cone's size: gates, and the XOR/XNOR gates among them.
+#[derive(Debug, Clone, Copy)]
+struct Cone2 {
+    gates: usize,
+    xors: usize,
 }
 
 /// One obligation: `h` and `m` load different values (each complemented when inverted in its
@@ -130,8 +142,8 @@ enum Outcome {
 fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf]) -> Result<Outcome, String> {
     let mut cnf = Cnf::new();
     let mut vars: FxHashMap<String, i32> = FxHashMap::default();
-    let a = next_lit(&mut cnf, &mut vars, models[h.0], h, &class_of[h.0])?;
-    let b = next_lit(&mut cnf, &mut vars, models[m.0], m, &class_of[m.0])?;
+    let (a, ca) = next_lit(&mut cnf, &mut vars, models[h.0], h, &class_of[h.0])?;
+    let (b, cb) = next_lit(&mut cnf, &mut vars, models[m.0], m, &class_of[m.0])?;
     let d = cnf.xor2(a, b);
     if d == -T {
         return Ok(Outcome::Structural);
@@ -149,7 +161,7 @@ fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf]) -> Re
         Ok(Certificate::UNSAT) | Err(SolverError::EmptyClause) | Err(SolverError::RootLevelConflict(_)) | Err(SolverError::Inconsistent) => {
             return Ok(Outcome::Unsat)
         }
-        Err(SolverError::TimeOut) | Err(SolverError::OutOfMemory) => return Ok(Outcome::GaveUp),
+        Err(SolverError::TimeOut) | Err(SolverError::OutOfMemory) => return Ok(Outcome::GaveUp([ca, cb])),
         Err(e) => return Err(format!("SAT refinement: {e}")),
     };
     let mut val = vec![false; n as usize + 1];
@@ -162,7 +174,7 @@ fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf]) -> Re
 }
 
 /// Register `r`'s next value as a literal, complemented when it is inverted in its class.
-fn next_lit(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, model: &Model, r: RegId, co: &ClassOf) -> Result<i32, String> {
+fn next_lit(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, model: &Model, r: RegId, co: &ClassOf) -> Result<(i32, Cone2), String> {
     let c = &model.cone;
     let inst = &model.regs[r.1].instance;
     let net = next_net(inst);
@@ -182,6 +194,14 @@ fn next_lit(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, model: &Model, r: 
     }
     let mut order: Vec<usize> = need.into_iter().collect();
     order.sort_unstable();
+    let xors = order
+        .iter()
+        .filter(|&&k| match &c.gates[k].logic {
+            Logic::Prim(op) => matches!(op, Op::Xor | Op::Xnor),
+            Logic::Func(f) => has_xor(f),
+        })
+        .count();
+    let size = Cone2 { gates: order.len(), xors };
     let mut lit: FxHashMap<&str, i32> = FxHashMap::default();
     let mut var = |cnf: &mut Cnf, name: String| -> i32 { *vars.entry(name).or_insert_with(|| cnf.fresh()) };
     for k in order {
@@ -217,7 +237,16 @@ fn next_lit(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, model: &Model, r: 
     }
     let y = lit.get(net.as_str()).copied().ok_or_else(|| format!("net `{net}` is not in the cone"))?;
     let neg = co.get(&state_net(inst)).is_some_and(|x| x.1);
-    Ok(if neg { -y } else { y })
+    Ok((if neg { -y } else { y }, size))
+}
+
+fn has_xor(f: &Func) -> bool {
+    match f {
+        Func::Xor(..) => true,
+        Func::Not(a) => has_xor(a),
+        Func::And(a, b) | Func::Or(a, b) => has_xor(a) || has_xor(b),
+        _ => false,
+    }
 }
 
 /// Every model evaluated under up to 64 counter-examples (one per bit; a name a counter-example
