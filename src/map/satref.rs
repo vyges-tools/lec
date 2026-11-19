@@ -18,21 +18,17 @@
 //! 5. The fixed point is a round in which nothing split: every remaining pair was proved under
 //!    that round's partition, which is the same inductive invariant as the BDD keys prove.
 //!
-//! ⛔ Differences from ABC, prototype only: splr has no incremental mode and no conflict limit,
-//! so each obligation is a fresh solver over the two cones with a CPU-time limit
-//! ([`PAIR_TIMEOUT_S`]); the partition is the same coarsest fixed point as the BDD path, except
-//! for members undecided within a limit.
+//! Solver: CaDiCaL (`cadical` crate, bundled source), one incremental instance per round with a
+//! deterministic conflict limit per obligation ([`PAIR_CONFLICTS`]). The partition is the same
+//! coarsest fixed point as the BDD path, except for members undecided within a limit.
 use std::collections::HashMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use splr::{Certificate, Config, SolveIF, Solver, SolverError};
 use vyges_loom::liberty_func::Func;
 
 use super::{active_classes, class_index, func_word, prim_word, readers_of, ClassOf, Key, Model, Polarity, RegId};
 use crate::lec::{next_net, state_net, Logic, Op, Src};
 
-/// CPU seconds one obligation may take before its member is undecided.
-pub const PAIR_TIMEOUT_S: f64 = 2.0;
 
 /// The fixed point by SAT ([`self`]); returns the rounds and the undecided registers, as
 /// [`super::refine_within`] does. Thin sequencer, one stage per line.
@@ -101,13 +97,14 @@ struct Stats {
 
 /// One round: every obligation of the active classes, counter-examples resimulated in batches of
 /// 64. Returns every member of a class that split (the next round's seeds).
-fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], class_of: &[ClassOf], undecided: &mut Vec<RegId>, st: &mut Stats) -> Result<Vec<RegId>, String> {
+fn sat_round<'m>(models: &[&'m Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], class_of: &[ClassOf], undecided: &mut Vec<RegId>, st: &mut Stats) -> Result<Vec<RegId>, String> {
     let pairs: Vec<(RegId, RegId)> = classes
         .iter()
         .zip(active)
         .filter(|(c, a)| **a && c.len() > 1)
         .flat_map(|(c, _)| c[1..].iter().map(move |&m| (c[0], m)))
         .collect();
+    let mut rs = RoundSolver::new(models.len());
     let mut at = position(classes);
     let mut split: FxHashSet<RegId> = FxHashSet::default();
     let mut cexs: Vec<FxHashMap<String, bool>> = Vec::new();
@@ -115,7 +112,7 @@ fn sat_round(models: &[&Model], classes: &mut Vec<Vec<RegId>>, active: &[bool], 
         if at[&h] != at[&m] {
             continue;
         }
-        match prove_pair(models, h, m, class_of, st)? {
+        match rs.prove(models, h, m, class_of, st)? {
             Outcome::Structural => st.structural += 1,
             Outcome::Unsat => st.unsat += 1,
             Outcome::Sat(cex) => {
@@ -163,7 +160,7 @@ enum Outcome {
     Structural,
     Unsat,
     Sat(FxHashMap<String, bool>),
-    /// Over the limit: each side's cone size and its XOR-type gates (an arithmetic hint).
+    /// Over the conflict limit: each side's cone size and its XOR-type gates (an arithmetic hint).
     GaveUp([Cone2; 2]),
 }
 
@@ -174,59 +171,68 @@ struct Cone2 {
     xors: usize,
 }
 
-/// One obligation: `h` and `m` load different values (each complemented when inverted in its
-/// class), every state read as its class's variable, every input free.
-fn prove_pair(models: &[&Model], h: RegId, m: RegId, class_of: &[ClassOf], st: &mut Stats) -> Result<Outcome, String> {
-    let t0 = std::time::Instant::now();
-    let mut cnf = Cnf::new();
-    let mut vars: FxHashMap<String, i32> = FxHashMap::default();
-    let (a, ca) = next_lit(&mut cnf, &mut vars, models[h.0], h, &class_of[h.0])?;
-    let (b, cb) = next_lit(&mut cnf, &mut vars, models[m.0], m, &class_of[m.0])?;
-    let d = cnf.xor2(a, b);
-    if d == -T {
-        return Ok(Outcome::Structural);
-    }
-    cnf.clauses.push(vec![d]);
-    st.t_encode += t0.elapsed().as_secs_f64();
-    st.vars += cnf.n as usize;
-    st.clauses += cnf.clauses.len();
-    let limit = std::env::var("LEC_SAT_TIMEOUT").ok().and_then(|s| s.parse().ok()).unwrap_or(PAIR_TIMEOUT_S);
-    let config = Config { quiet_mode: true, c_timeout: limit, ..Config::default() };
-    let n = cnf.n;
-    let t1 = std::time::Instant::now();
-    let built = Solver::try_from((config, cnf.clauses.as_slice()));
-    st.t_build += t1.elapsed().as_secs_f64();
-    let t2 = std::time::Instant::now();
-    let got = match built {
-        Ok(mut s) => s.solve(),
-        Err(Ok(c)) => Ok(c),
-        Err(Err(e)) => Err(e),
-    };
-    st.t_solve += t2.elapsed().as_secs_f64();
-    let model = match got {
-        Ok(Certificate::SAT(v)) => v,
-        Ok(Certificate::UNSAT) | Err(SolverError::EmptyClause) | Err(SolverError::RootLevelConflict(_)) | Err(SolverError::Inconsistent) => {
-            return Ok(Outcome::Unsat)
-        }
-        Err(SolverError::TimeOut) | Err(SolverError::OutOfMemory) => return Ok(Outcome::GaveUp([ca, cb])),
-        Err(e) => return Err(format!("SAT refinement: {e}")),
-    };
-    let mut val = vec![false; n as usize + 1];
-    for l in model {
-        if l > 0 && l <= n {
-            val[l as usize] = true;
-        }
-    }
-    Ok(Outcome::Sat(vars.into_iter().map(|(name, v)| (name, val[v as usize])).collect()))
+/// Conflicts one obligation may take before its member is undecided (ABC `&scorr`: `nBTLimit`,
+/// 100 by default); `LEC_SAT_CONFLICTS` overrides it in the prototype.
+pub const PAIR_CONFLICTS: i32 = 1000;
+
+/// One round's incremental solver (ABC: one `Cec_ManSat_t` for the whole speculatively reduced
+/// miter, `Cec_ManSatSolveMiter`). Every gate is encoded once per round, into one CNF shared by
+/// all obligations, and only the clauses added since the last call are sent to the solver; each
+/// obligation is solved under the assumption of its difference literal, so what the solver
+/// learned proving one pair helps the next.
+struct RoundSolver<'m> {
+    cnf: Cnf,
+    sent: usize,
+    sat: cadical::Solver,
+    vars: FxHashMap<String, i32>,
+    /// per model: each net's literal so far
+    lit: Vec<FxHashMap<&'m str, i32>>,
+    limit: i32,
 }
 
-/// Register `r`'s next value as a literal, complemented when it is inverted in its class.
-fn next_lit(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, model: &Model, r: RegId, co: &ClassOf) -> Result<(i32, Cone2), String> {
+impl<'m> RoundSolver<'m> {
+    fn new(models: usize) -> RoundSolver<'m> {
+        let limit = std::env::var("LEC_SAT_CONFLICTS").ok().and_then(|s| s.parse().ok()).unwrap_or(PAIR_CONFLICTS);
+        RoundSolver { cnf: Cnf::new(), sent: 0, sat: cadical::Solver::new(), vars: FxHashMap::default(), lit: vec![FxHashMap::default(); models], limit }
+    }
+
+    /// One obligation: `h` and `m` load different values (each complemented when inverted in its
+    /// class), every state read as its class's variable, every input free.
+    fn prove(&mut self, models: &[&'m Model], h: RegId, m: RegId, class_of: &[ClassOf], st: &mut Stats) -> Result<Outcome, String> {
+        let t0 = std::time::Instant::now();
+        let a = next_lit(&mut self.cnf, &mut self.vars, &mut self.lit[h.0], models[h.0], h, &class_of[h.0])?;
+        let b = next_lit(&mut self.cnf, &mut self.vars, &mut self.lit[m.0], models[m.0], m, &class_of[m.0])?;
+        let d = self.cnf.xor2(a, b);
+        st.t_encode += t0.elapsed().as_secs_f64();
+        if d == -T {
+            return Ok(Outcome::Structural);
+        }
+        let t1 = std::time::Instant::now();
+        for c in &self.cnf.clauses[self.sent..] {
+            self.sat.add_clause(c.iter().copied());
+        }
+        self.sent = self.cnf.clauses.len();
+        st.vars = self.cnf.n as usize;
+        st.clauses = self.sent;
+        st.t_build += t1.elapsed().as_secs_f64();
+        let t2 = std::time::Instant::now();
+        self.sat.set_limit("conflicts", self.limit).map_err(|e| format!("SAT refinement: {e:?}"))?;
+        let got = self.sat.solve_with([d]);
+        st.t_solve += t2.elapsed().as_secs_f64();
+        match got {
+            Some(false) => Ok(Outcome::Unsat),
+            Some(true) => Ok(Outcome::Sat(self.vars.iter().map(|(name, &v)| (name.clone(), self.sat.value(v).unwrap_or(false))).collect())),
+            None => Ok(Outcome::GaveUp([cone_size(models[h.0], h), cone_size(models[m.0], m)])),
+        }
+    }
+}
+
+/// The gates of register `r`'s next-state cone, by depth-first search, in cone order.
+fn cone_gates(model: &Model, r: RegId, done: &dyn Fn(&str) -> bool) -> Vec<usize> {
     let c = &model.cone;
-    let inst = &model.regs[r.1].instance;
-    let net = next_net(inst);
+    let net = next_net(&model.regs[r.1].instance);
     let mut need: FxHashSet<usize> = FxHashSet::default();
-    let mut stack: Vec<usize> = model.gate.get(&net).copied().into_iter().collect();
+    let mut stack: Vec<usize> = if done(&net) { Vec::new() } else { model.gate.get(&net).copied().into_iter().collect() };
     while let Some(k) = stack.pop() {
         if !need.insert(k) {
             continue;
@@ -234,22 +240,37 @@ fn next_lit(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, model: &Model, r: 
         for s in &c.gates[k].ins {
             if let Src::Net(n) = s {
                 if let Some(&j) = model.gate.get(n) {
-                    stack.push(j);
+                    if !done(n) {
+                        stack.push(j);
+                    }
                 }
             }
         }
     }
     let mut order: Vec<usize> = need.into_iter().collect();
     order.sort_unstable();
+    order
+}
+
+fn cone_size(model: &Model, r: RegId) -> Cone2 {
+    let order = cone_gates(model, r, &|_| false);
     let xors = order
         .iter()
-        .filter(|&&k| match &c.gates[k].logic {
+        .filter(|&&k| match &model.cone.gates[k].logic {
             Logic::Prim(op) => matches!(op, Op::Xor | Op::Xnor),
             Logic::Func(f) => has_xor(f),
         })
         .count();
-    let size = Cone2 { gates: order.len(), xors };
-    let mut lit: FxHashMap<&str, i32> = FxHashMap::default();
+    Cone2 { gates: order.len(), xors }
+}
+
+/// Register `r`'s next value as a literal, complemented when it is inverted in its class;
+/// gates already in `lit` (this round) are not encoded again.
+fn next_lit<'m>(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, lit: &mut FxHashMap<&'m str, i32>, model: &'m Model, r: RegId, co: &ClassOf) -> Result<i32, String> {
+    let c = &model.cone;
+    let inst = &model.regs[r.1].instance;
+    let net = next_net(inst);
+    let order = cone_gates(model, r, &|n| lit.contains_key(n));
     let mut var = |cnf: &mut Cnf, name: String| -> i32 { *vars.entry(name).or_insert_with(|| cnf.fresh()) };
     for k in order {
         let g = &c.gates[k];
@@ -284,7 +305,7 @@ fn next_lit(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, model: &Model, r: 
     }
     let y = lit.get(net.as_str()).copied().ok_or_else(|| format!("net `{net}` is not in the cone"))?;
     let neg = co.get(&state_net(inst)).is_some_and(|x| x.1);
-    Ok((if neg { -y } else { y }, size))
+    Ok(if neg { -y } else { y })
 }
 
 fn has_xor(f: &Func) -> bool {
