@@ -67,11 +67,6 @@ fn sat_round(models: &[&Model], sim: &[Compiled], classes: &mut Vec<Vec<RegId>>,
             next.push(cl.clone());
             continue;
         }
-        // counter-examples are resimulated before a class they can spare more than one call: a
-        // pass costs the whole model, a pair one obligation (ABC resimulates per batch only)
-        if cl.len() > 2 && !sims.pending.is_empty() {
-            resimulate_counter_examples(models, sim, class_of, &mut sims, effort)?;
-        }
         let parts = split_class(models, sim, cl, class_of, &mut rs, &mut sims, undecided, effort)?;
         if parts.len() > 1 {
             split.extend(cl.iter().copied());
@@ -89,8 +84,8 @@ fn sat_round(models: &[&Model], sim: &[Compiled], classes: &mut Vec<Vec<RegId>>,
 /// One class split into the parts of members that load the same next value under `class_of`, in
 /// order of their first member. A member is proved only against the head of a part whose
 /// counter-example signature it shares ([`Signatures`]); counter-examples are resimulated over
-/// every register every 64, before a class of three or more members ([`sat_round`]), and at the
-/// round's end, so a later class is not asked what they already tell apart.
+/// every register 64 at a time (one word) and at the round's end, as ABC resimulates per batch:
+/// a pass costs the whole model, which per class dominated a core's run.
 #[allow(clippy::too_many_arguments)]
 fn split_class<'m>(
     models: &[&'m Model],
@@ -171,7 +166,7 @@ fn split_class<'m>(
 /// was found for.
 struct Signatures {
     words: Vec<Vec<Vec<u64>>>,
-    pending: Vec<(FxHashMap<String, bool>, RegId, RegId)>,
+    pending: Vec<(Vec<Var>, RegId, RegId)>,
 }
 
 impl Signatures {
@@ -367,9 +362,16 @@ fn run(prog: &[Ins], x: &[u64], stack: &mut Vec<u64>) -> u64 {
 /// CNF and the simulation disagree on a gate), never a silent merge.
 fn resimulate_counter_examples(models: &[&Model], sim: &[Compiled], class_of: &[ClassOf], sims: &mut Signatures, effort: &mut SatEffort) -> Result<(), String> {
     let pending = std::mem::take(&mut sims.pending);
-    let word = |name: &str| -> u64 { pending.iter().enumerate().fold(0u64, |w, (i, c)| if c.0.get(name).copied().unwrap_or(false) { w | (1 << i) } else { w }) };
+    // each variable's word: bit i set when counter-example i sets it (a variable one does not
+    // name reads 0 there)
+    let mut words: FxHashMap<Var, u64> = FxHashMap::default();
+    for (i, (cex, _, _)) in pending.iter().enumerate() {
+        for v in cex {
+            *words.entry(v.clone()).or_default() |= 1 << i;
+        }
+    }
+    let word = |v: &Var| -> u64 { words.get(v).copied().unwrap_or(0) };
     let mask = if pending.len() == 64 { !0 } else { (1u64 << pending.len()) - 1 };
-    let mut class_words: FxHashMap<usize, u64> = FxHashMap::default();
     for (mi, model) in models.iter().enumerate() {
         let (c, cs) = (&model.cone, &sim[mi]);
         let co = &class_of[mi];
@@ -378,11 +380,11 @@ fn resimulate_counter_examples(models: &[&Model], sim: &[Compiled], class_of: &[
             .iter()
             .map(|n| {
                 let (ci, neg) = co.get(n.as_str()).copied().unwrap_or((usize::MAX, false));
-                let w = *class_words.entry(ci).or_insert_with(|| word(&format!("class {ci}")));
+                let w = word(&Var::Class(ci));
                 if neg { !w } else { w }
             })
             .collect();
-        let free: Vec<u64> = cs.frees.iter().map(|v| word(v)).collect();
+        let free: Vec<u64> = cs.frees.iter().map(|v| word(&Var::Input(v.clone()))).collect();
         let mut val: Vec<u64> = Vec::with_capacity(c.gates.len());
         let mut x: Vec<u64> = Vec::new();
         let mut stack: Vec<u64> = Vec::new();
@@ -416,10 +418,19 @@ fn resimulate_counter_examples(models: &[&Model], sim: &[Compiled], class_of: &[
     Ok(())
 }
 
+/// A CNF input variable: a class's value this round, or a free input by its variable name. Two
+/// kinds, so no input name can alias a class.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Var {
+    Class(usize),
+    Input(String),
+}
+
 enum Outcome {
     Structural,
     Unsat,
-    Sat(FxHashMap<String, bool>),
+    /// the variables the counter-example sets (every other one is 0)
+    Sat(Vec<Var>),
     GaveUp,
 }
 
@@ -429,7 +440,7 @@ pub(crate) struct RoundSolver<'m> {
     cnf: Cnf,
     sent: usize,
     sat: cadical::Solver,
-    vars: FxHashMap<String, i32>,
+    vars: FxHashMap<Var, i32>,
     /// per model: each net's literal this round
     lit: Vec<FxHashMap<&'m str, i32>>,
     limit: i32,
@@ -486,7 +497,7 @@ impl<'m> RoundSolver<'m> {
         self.sat.set_limit("conflicts", self.limit).map_err(|e| format!("SAT refinement: {e:?}"))?;
         Ok(match self.sat.solve_with([d]) {
             Some(false) => Outcome::Unsat,
-            Some(true) => Outcome::Sat(self.vars.iter().map(|(name, &v)| (name.clone(), self.sat.value(v).unwrap_or(false))).collect()),
+            Some(true) => Outcome::Sat(self.vars.iter().filter(|(_, &v)| self.sat.value(v).unwrap_or(false)).map(|(name, _)| name.clone()).collect()),
             None => Outcome::GaveUp,
         })
     }
@@ -546,12 +557,12 @@ fn cone_gates(model: &Model, r: RegId, done: &dyn Fn(&str) -> bool) -> Vec<usize
 /// Register `r`'s next value as a literal, complemented when it is inverted in its class; the
 /// gates already in `lit` (this round) are not encoded again. A state reads its class's variable
 /// before a free input of the same net, as the BDD builder does.
-fn next_lit<'m>(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, lit: &mut FxHashMap<&'m str, i32>, model: &'m Model, r: RegId, co: &ClassOf) -> Result<i32, String> {
+fn next_lit<'m>(cnf: &mut Cnf, vars: &mut FxHashMap<Var, i32>, lit: &mut FxHashMap<&'m str, i32>, model: &'m Model, r: RegId, co: &ClassOf) -> Result<i32, String> {
     let c = &model.cone;
     let inst = &model.regs[r.1].instance;
     let net = next_net(inst);
     let order = cone_gates(model, r, &|n| lit.contains_key(n));
-    let mut var = |cnf: &mut Cnf, name: String| -> i32 { *vars.entry(name).or_insert_with(|| cnf.fresh()) };
+    let mut var = |cnf: &mut Cnf, name: Var| -> i32 { *vars.entry(name).or_insert_with(|| cnf.fresh()) };
     for k in order {
         let g = &c.gates[k];
         let mut ins = Vec::with_capacity(g.ins.len());
@@ -563,10 +574,10 @@ fn next_lit<'m>(cnf: &mut Cnf, vars: &mut FxHashMap<String, i32>, lit: &mut FxHa
                     None => {
                         let x = if model.state.contains(n.as_str()) {
                             let (ci, neg) = co.get(n.as_str()).copied().unwrap_or((usize::MAX, false));
-                            let x = var(cnf, format!("class {ci}"));
+                            let x = var(cnf, Var::Class(ci));
                             if neg { -x } else { x }
                         } else if let Some(v) = c.free.get(n) {
-                            var(cnf, v.clone())
+                            var(cnf, Var::Input(v.clone()))
                         } else {
                             return Err(format!("cone gate `{}` reads `{n}` before it is computed (gate {k})", g.out));
                         };
