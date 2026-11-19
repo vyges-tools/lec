@@ -20,6 +20,8 @@ vyges-abc-lib = { git = "https://github.com/vyges-tools/abc-lib", branch = "main
 # FxHash for the BDD tables and the register map's lookup tables: deterministic (no random seed), and
 # those tables are only looked up, never iterated. Pinned exactly; no dependencies of its own.
 rustc-hash = { version = "=2.1.1", default-features = false, features = ["std"] }
+# PROTOTYPE (branch sat-refine-prototype): splr for SAT-based register-correspondence refinement.
+splr = "=0.19.0"
 
 # The binary's global allocator. The reference build links tcmalloc for all of its code
 # (BUILD.bazel `malloc = @tcmalloc`), not the system allocator; mimalloc measured fastest and

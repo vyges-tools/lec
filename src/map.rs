@@ -73,6 +73,8 @@ pub(crate) const FREE_ENABLE: &str = "<clock-gate enable>";
 /// fresh manager ([`chunked_keys`]).
 pub const BDD_LIMIT: usize = 1 << 20;
 
+mod satref;
+
 /// Unmatched golden x revised register pairs [`attribute`] compares by simulation at most.
 pub const ATTRIBUTION_CAP: usize = 1 << 22;
 
@@ -813,6 +815,10 @@ fn class_index(models: &[&Model], classes: &[Vec<RegId>], inv: &dyn Fn(RegId) ->
 /// Stage 4: split every class whose members load different next values when every class holds
 /// one value, until nothing splits. Returns the rounds taken and the registers left undecided.
 pub(crate) fn refine(models: &[&Model], classes: &mut Vec<Vec<RegId>>, inv: &Polarity) -> Result<(usize, Vec<RegId>), String> {
+    // PROTOTYPE (branch): `LEC_REFINE=sat` proves the classes by SAT, as ABC's `&scorr`
+    if std::env::var("LEC_REFINE").as_deref() == Ok("sat") {
+        return satref::refine_sat(models, classes, inv);
+    }
     refine_within(models, classes, inv, BDD_LIMIT)
 }
 
