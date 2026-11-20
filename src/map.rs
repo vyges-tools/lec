@@ -558,52 +558,121 @@ pub(crate) fn simulate(models: &[&Model], stim: &Stimulus, free: &[BTreeSet<Stri
     for (mi, m) in models.iter().enumerate() {
         let mut asserted: BTreeSet<&str> = BTreeSet::new();
         let c = &m.cone;
+        // every register starts UNDEFINED (`known` 0): see [`defined_signature`]
         let mut state = vec![0u64; m.regs.len()];
+        let mut known = vec![0u64; m.regs.len()];
         let mut sig = vec![Vec::with_capacity(CYCLES); m.regs.len()];
+        let mut sig_known = vec![Vec::with_capacity(CYCLES); m.regs.len()];
         let states: Vec<String> = c.regs.iter().map(|r| state_net(r)).collect();
         let nexts: Vec<String> = c.regs.iter().map(|r| next_net(r)).collect();
-        let mut val: HashMap<&str, u64> = HashMap::new();
+        let mut val: HashMap<&str, (u64, u64)> = HashMap::new();
         for cycle in 0..CYCLES {
             val.clear();
             // free inputs first, then the states over them (see `next_state_bdds`)
             for (net, var) in &c.free {
-                val.insert(net.as_str(), stim.word(var, cycle));
+                val.insert(net.as_str(), (stim.word(var, cycle), !0));
             }
             for (k, s) in states.iter().enumerate() {
-                val.insert(s.as_str(), state[k]);
+                val.insert(s.as_str(), (state[k], known[k]));
                 sig[k].push(state[k]);
+                sig_known[k].push(known[k]);
             }
             for g in &c.gates {
-                let x: Vec<u64> = g
+                let (x, kx): (Vec<u64>, Vec<u64>) = g
                     .ins
                     .iter()
                     .map(|s| match s {
                         Src::Net(n) => val.get(n.as_str()).copied().ok_or_else(|| format!("cone gate `{}` reads `{n}` before it is computed", g.out)),
-                        Src::Const(v) => Ok(if *v { !0 } else { 0 }),
+                        Src::Const(v) => Ok((if *v { !0 } else { 0 }, !0)),
                     })
-                    .collect::<Result<_, _>>()?;
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .unzip();
                 // a freed clock-gate enable ([`simulate_freeing_stuck_enables`]): the shared random stream
-                let y = if free[mi].contains(&g.out) {
-                    stim.word(FREE_ENABLE, cycle)
+                let (y, ky) = if free[mi].contains(&g.out) {
+                    (stim.word(FREE_ENABLE, cycle), !0)
                 } else {
-                    match &g.logic {
-                        Logic::Prim(op) => prim_word(*op, &g.pins, &x)?,
-                        Logic::Func(f) => func_word(f, &g.pins, &x),
-                    }
+                    ternary_word(&x, &kx, |x| match &g.logic {
+                        Logic::Prim(op) => prim_word(*op, &g.pins, x),
+                        Logic::Func(f) => Ok(func_word(f, &g.pins, x)),
+                    })?
                 };
-                if y != 0 && cycle >= RESET_CYCLES && gate_of(&g.out).is_some() {
+                if y & ky != 0 && cycle >= RESET_CYCLES && gate_of(&g.out).is_some() {
                     asserted.insert(g.out.as_str());
                 }
-                val.insert(g.out.as_str(), y);
+                val.insert(g.out.as_str(), (y, ky));
             }
             for (k, r) in c.regs.iter().enumerate() {
-                state[k] = val.get(nexts[k].as_str()).copied().ok_or_else(|| format!("register `{r}` has no next-state gate"))?;
+                (state[k], known[k]) = val.get(nexts[k].as_str()).copied().ok_or_else(|| format!("register `{r}` has no next-state gate"))?;
             }
         }
-        out.push(sig);
+        out.push(sig.iter().zip(&sig_known).map(|(v, k)| defined_signature(v, k)).collect());
         stuck_all.push(c.gates.iter().filter(|g| gate_of(&g.out).is_some() && !asserted.contains(g.out.as_str())).map(|g| g.out.clone()).collect());
     }
     Ok((out, stuck_all))
+}
+
+/// Inputs with more undefined words than this are not enumerated: the output is then defined only
+/// where every input is (pessimistic, never wrong).
+const TERNARY_MAX: usize = 6;
+
+/// One gate in three-valued simulation over 64 runs: `x` the input values, `k` where each is
+/// defined. A bit of the output is defined iff it is the same for EVERY value of the undefined
+/// inputs at that bit, found by evaluating every assignment of the inputs that have an undefined
+/// bit (exact per gate; a 1 on one input of an AND defines nothing, a 0 defines the output).
+fn ternary_word(x: &[u64], k: &[u64], eval: impl Fn(&[u64]) -> Result<u64, String>) -> Result<(u64, u64), String> {
+    let unk: Vec<usize> = (0..x.len()).filter(|&i| k[i] != !0).collect();
+    if unk.is_empty() {
+        return Ok((eval(x)?, !0));
+    }
+    let base: Vec<u64> = x.iter().zip(k).map(|(v, k)| v & k).collect();
+    if unk.len() > TERNARY_MAX {
+        return Ok((eval(&base)?, k.iter().fold(!0, |a, b| a & b)));
+    }
+    let y0 = eval(&base)?;
+    let mut diff = 0u64;
+    let mut xs = base.clone();
+    for a in 1u32..(1 << unk.len()) {
+        for (j, &i) in unk.iter().enumerate() {
+            xs[i] = if a >> j & 1 == 1 { base[i] | !k[i] } else { base[i] };
+        }
+        diff |= eval(&xs)? ^ y0;
+    }
+    Ok((y0, !diff))
+}
+
+/// A register's candidate signature from its simulated values `v` and where they are defined `k`
+/// (per cycle, one bit per run).
+///
+/// 🔑 Every register starts UNDEFINED, as in silicon: a register with an asynchronous clear or
+/// preset is defined from the first edge of reset; one WITHOUT reset only once it loads a defined
+/// value. The old all-zero start gave such a register an arbitrary first value that depended on
+/// how each synthesis stored it: CoralNPU's AXI and debug request queues (RTL `ram` without reset)
+/// are stored one way by the reference flow and the complement by ours, so before the first write
+/// the two started at DIFFERENT values, matched neither equal nor complemented, and fell into no
+/// shared class.
+///
+/// Undefined bits are filled canonically so that two registers equal (or complementary) wherever
+/// defined, with the same defined pattern, get equal (or complementary) signatures: in each run
+/// the last defined value is carried forward and the first defined value backward; a run never
+/// defined takes the register's first defined bit (lowest run, earliest cycle) or 0.
+///
+/// ⛔ Soundness is unchanged: the signature only PROPOSES candidate classes; every pair is still
+/// proved by refinement (`refine` / the SAT rounds) before it is mapped.
+pub(crate) fn defined_signature(v: &[u64], k: &[u64]) -> Vec<u64> {
+    let (mut seen, mut first, mut last) = (0u64, 0u64, 0u64);
+    let mut fwd = Vec::with_capacity(v.len());
+    let mut seen_at = Vec::with_capacity(v.len());
+    for (&v, &k) in v.iter().zip(k) {
+        first |= v & k & !seen;
+        seen |= k;
+        last = (v & k) | (last & !k);
+        fwd.push(last);
+        seen_at.push(seen);
+    }
+    let flip = if seen == 0 { 0 } else { (first >> seen.trailing_zeros()) & 1 };
+    let never = if flip == 1 { !seen } else { 0 };
+    fwd.iter().zip(&seen_at).map(|(f, s)| (f & s) | (first & !s & seen) | never).collect()
 }
 
 /// Each register's polarity in its class, per model: `true` when the register holds the
@@ -1643,6 +1712,52 @@ mod tests {
         assert!(rep.inverted.is_empty() && rep.mapped.is_empty(), "{rep:?}");
     }
 
+    /// 🔑 A register WITHOUT reset is undefined until it loads ([`defined_signature`]). Golden `r`
+    /// holds `d` under `en`; revised `u` holds the complement (`!d` in, read through an inverter),
+    /// as two syntheses may store one RTL register. Neither has a reset, so from an all-zero
+    /// start `r` read 0 and `u` read 1 until the first load: the signatures were neither equal
+    /// nor complementary and the pair was never proposed. Undefined until loaded, they share a
+    /// class (inverted) and the proof maps them.
+    #[test]
+    fn a_register_without_reset_stored_complemented_maps_inverted() {
+        let g = nl("module t(clk,en,d,q);\ninput clk,en,d; output q;\nwire n,s;\n\
+             MUX2 m(.A0(s),.A1(d),.S(en),.Y(n));\nDFF r(.CK(clk),.D(n),.Q(s));\nBUF b(.A(s),.Y(q));\nendmodule\n");
+        let m = nl("module t(clk,en,d,q);\ninput clk,en,d; output q;\nwire nd,n,s;\n\
+             INV i(.A(d),.Y(nd));\nMUX2 m(.A0(s),.A1(nd),.S(en),.Y(n));\nDFF u(.CK(clk),.D(n),.Q(s));\nINV o(.A(s),.Y(q));\nendmodule\n");
+        let rep = map(&g, &m);
+        assert_eq!(rep.inverted, [("r".to_string(), "u".to_string())].into_iter().collect(), "{rep:?}");
+        assert!(rep.one_to_one(), "{rep:?}");
+    }
+
+    /// Three-valued gate evaluation is exact per gate: AND with a 0 is defined, with a 1 is not;
+    /// an XOR of an undefined input is never defined; a MUX whose select is defined passes the
+    /// selected input's definedness.
+    #[test]
+    fn a_gate_output_is_defined_only_where_every_undefined_input_agrees() {
+        let and = |x: &[u64]| -> Result<u64, String> { Ok(x[0] & x[1]) };
+        // bit 0: a=0 defined, b undefined -> defined 0; bit 1: a=1, b undefined -> undefined
+        assert_eq!(ternary_word(&[0b10, 0], &[!0, !0b11], and).unwrap().1 & 0b11, 0b01);
+        let xor = |x: &[u64]| -> Result<u64, String> { Ok(x[0] ^ x[1]) };
+        assert_eq!(ternary_word(&[0, 0], &[!0, !1], xor).unwrap().1 & 1, 0);
+        let mux = |x: &[u64]| -> Result<u64, String> { Ok((x[2] & x[1]) | (!x[2] & x[0])) };
+        // select 1 picks the defined input 1; the undefined input 0 does not matter
+        let (y, k) = ternary_word(&[0, 1, 1], &[!1, !0, !0], mux).unwrap();
+        assert_eq!((y & 1, k & 1), (1, 1));
+    }
+
+    /// The canonical fill: two registers complementary wherever defined, with the same defined
+    /// pattern, get complementary signatures, including a run never defined.
+    #[test]
+    fn complementary_registers_get_complementary_signatures_whatever_their_undefined_start() {
+        // run 0 defined from cycle 2, run 1 never defined; storage starts 0 in both (undefined)
+        let k = [0b00, 0b00, 0b01, 0b01];
+        let a = defined_signature(&[0, 0, 1, 0], &k);
+        let b = defined_signature(&[0, 0, 0, 1], &k);
+        assert!(a.iter().zip(&b).all(|(x, y)| x ^ y == !0), "{a:?} {b:?}");
+        // never defined at all: constant 0
+        assert!(defined_signature(&[5, 7], &[0, 0]).iter().all(|w| *w == 0));
+    }
+
     /// The proof, not the signature, decides an inverted member: a class holding `r0` and an
     /// inverted `u0` stays one class only when u0's next value is the complement of r0's with u0
     /// READ complemented; a u0 that is cleared, not preset, splits off.
@@ -1956,7 +2071,9 @@ mod tests {
     /// the solver finds the state that tells them apart, and that counter-example is resimulated
     /// over every register before the class is split (`Cec_ManResimulateCounterExamples`). The
     /// revised design adds `h`, which loads `d0 ^ c6`: it toggles with `r0` until the 8-bit
-    /// counter's carry out first rises (cycle 255, past the [`CYCLES`] simulated).
+    /// counter's carry out first rises (cycle 255, past the [`CYCLES`] simulated). The counter has
+    /// a reset: without one it is undefined forever ([`defined_signature`]), so simulation would
+    /// propose nothing for the solver to disprove.
     #[cfg(feature = "sat")]
     #[test]
     fn a_pair_the_solver_disproves_is_split_and_its_counter_example_resimulated() {
@@ -1967,13 +2084,13 @@ mod tests {
         for i in 0..8 {
             wires.extend([format!("q{i}"), format!("d{i}"), format!("c{}", i + 1)]);
             body.push_str(&format!(
-                "XOR2 x{i}(.A(c{i}),.B(q{i}),.Y(d{i}));\nDFF r{i}(.CK(clk),.D(d{i}),.Q(q{i}));\nAND2 a{i}(.A(c{i}),.B(q{i}),.Y(c{}));\n",
+                "XOR2 x{i}(.A(c{i}),.B(q{i}),.Y(d{i}));\nDFR r{i}(.CK(clk),.D(d{i}),.RESET_B(rst_n),.Q(q{i}));\nAND2 a{i}(.A(c{i}),.B(q{i}),.Y(c{}));\n",
                 i + 1
             ));
         }
-        let top = |extra: &str| nl(&format!("module t(clk,y);\ninput clk; output y;\nwire {};\n{body}{extra}endmodule\n", wires.join(",")));
+        let top = |extra: &str| nl(&format!("module t(clk,rst_n,y);\ninput clk,rst_n; output y;\nwire {};\n{body}{extra}endmodule\n", wires.join(",")));
         let a = top("BUF o(.A(q5),.Y(y));\n");
-        let b = top("wire h, hd;\nXOR2 hx(.A(d0),.B(c8),.Y(hd));\nDFF h(.CK(clk),.D(hd),.Q(h));\nAND2 o(.A(q5),.B(h),.Y(y));\n");
+        let b = top("wire h, hd;\nXOR2 hx(.A(d0),.B(c8),.Y(hd));\nDFR h(.CK(clk),.D(hd),.RESET_B(rst_n),.Q(h));\nAND2 o(.A(q5),.B(h),.Y(y));\n");
         let names = (Naming::Instance, Naming::Instance);
         let rep = register_map_with(&a, &b, &lib(), names, &SimHolds::default(), Refine::Sat).unwrap();
         assert!(rep.sat.disproved > 0 && rep.sat.resimulated > 0, "{:?}", rep.sat);
