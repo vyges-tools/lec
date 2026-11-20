@@ -526,60 +526,143 @@ pub(crate) fn simulate(models: &[&Model], stim: &Stimulus, free: &[BTreeSet<Stri
     let mut out = Vec::new();
     let mut stuck_all = Vec::new();
     for (mi, m) in models.iter().enumerate() {
-        let mut asserted: BTreeSet<&str> = BTreeSet::new();
-        let c = &m.cone;
-        // every register starts UNDEFINED (`known` 0): see [`defined_signature`]
-        let mut state = vec![0u64; m.regs.len()];
-        let mut known = vec![0u64; m.regs.len()];
-        let mut sig = vec![Vec::with_capacity(CYCLES); m.regs.len()];
-        let mut sig_known = vec![Vec::with_capacity(CYCLES); m.regs.len()];
-        let states: Vec<String> = c.regs.iter().map(|r| state_net(r)).collect();
-        let nexts: Vec<String> = c.regs.iter().map(|r| next_net(r)).collect();
-        let mut val: HashMap<&str, (u64, u64)> = HashMap::new();
-        for cycle in 0..CYCLES {
-            val.clear();
-            // free inputs first, then the states over them (see `next_state_bdds`)
-            for (net, var) in &c.free {
-                val.insert(net.as_str(), (stim.word(var, cycle), !0));
-            }
-            for (k, s) in states.iter().enumerate() {
-                val.insert(s.as_str(), (state[k], known[k]));
-                sig[k].push(state[k]);
-                sig_known[k].push(known[k]);
-            }
-            for g in &c.gates {
-                let (x, kx): (Vec<u64>, Vec<u64>) = g
-                    .ins
-                    .iter()
-                    .map(|s| match s {
-                        Src::Net(n) => val.get(n.as_str()).copied().ok_or_else(|| format!("cone gate `{}` reads `{n}` before it is computed", g.out)),
-                        Src::Const(v) => Ok((if *v { !0 } else { 0 }, !0)),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?
-                    .into_iter()
-                    .unzip();
-                // a freed clock-gate enable ([`simulate_freeing_stuck_enables`]): the shared random stream
-                let (y, ky) = if free[mi].contains(&g.out) {
-                    (stim.word(FREE_ENABLE, cycle), !0)
-                } else {
-                    ternary_word(&x, &kx, |x| match &g.logic {
-                        Logic::Prim(op) => prim_word(*op, &g.pins, x),
-                        Logic::Func(f) => Ok(func_word(f, &g.pins, x)),
-                    })?
-                };
-                if y & ky != 0 && cycle >= RESET_CYCLES && gate_of(&g.out).is_some() {
-                    asserted.insert(g.out.as_str());
-                }
-                val.insert(g.out.as_str(), (y, ky));
-            }
-            for (k, r) in c.regs.iter().enumerate() {
-                (state[k], known[k]) = val.get(nexts[k].as_str()).copied().ok_or_else(|| format!("register `{r}` has no next-state gate"))?;
-            }
-        }
-        out.push(sig.iter().zip(&sig_known).map(|(v, k)| defined_signature(v, k)).collect());
-        stuck_all.push(c.gates.iter().filter(|g| gate_of(&g.out).is_some() && !asserted.contains(g.out.as_str())).map(|g| g.out.clone()).collect());
+        let (sigs, stuck) = simulate_model(m, stim, &free[mi], &mut |_, _, _| {})?;
+        out.push(sigs);
+        stuck_all.push(stuck);
     }
     Ok((out, stuck_all))
+}
+
+/// [`simulate`] for one model: each register's signature and the clock-gate enables that never
+/// asserted after reset; `gate(g, value, defined)` sees every gate's word in every cycle, in
+/// cycle order then cone order.
+fn simulate_model(m: &Model, stim: &Stimulus, free: &BTreeSet<String>, gate: &mut dyn FnMut(usize, u64, u64)) -> Result<(Vec<Vec<u64>>, BTreeSet<String>), String> {
+    let mut asserted: BTreeSet<&str> = BTreeSet::new();
+    let c = &m.cone;
+    // every register starts UNDEFINED (`known` 0): see [`defined_signature`]
+    let mut state = vec![0u64; m.regs.len()];
+    let mut known = vec![0u64; m.regs.len()];
+    let mut sig = vec![Vec::with_capacity(CYCLES); m.regs.len()];
+    let mut sig_known = vec![Vec::with_capacity(CYCLES); m.regs.len()];
+    let states: Vec<String> = c.regs.iter().map(|r| state_net(r)).collect();
+    let nexts: Vec<String> = c.regs.iter().map(|r| next_net(r)).collect();
+    let mut val: HashMap<&str, (u64, u64)> = HashMap::new();
+    for cycle in 0..CYCLES {
+        val.clear();
+        // free inputs first, then the states over them (see `next_state_bdds`)
+        for (net, var) in &c.free {
+            val.insert(net.as_str(), (stim.word(var, cycle), !0));
+        }
+        for (k, s) in states.iter().enumerate() {
+            val.insert(s.as_str(), (state[k], known[k]));
+            sig[k].push(state[k]);
+            sig_known[k].push(known[k]);
+        }
+        for (gi, g) in c.gates.iter().enumerate() {
+            let (x, kx): (Vec<u64>, Vec<u64>) = g
+                .ins
+                .iter()
+                .map(|s| match s {
+                    Src::Net(n) => val.get(n.as_str()).copied().ok_or_else(|| format!("cone gate `{}` reads `{n}` before it is computed", g.out)),
+                    Src::Const(v) => Ok((if *v { !0 } else { 0 }, !0)),
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .unzip();
+            // a freed clock-gate enable ([`simulate_freeing_stuck_enables`]): the shared random stream
+            let (y, ky) = if free.contains(&g.out) {
+                (stim.word(FREE_ENABLE, cycle), !0)
+            } else {
+                ternary_word(&x, &kx, |x| match &g.logic {
+                    Logic::Prim(op) => prim_word(*op, &g.pins, x),
+                    Logic::Func(f) => Ok(func_word(f, &g.pins, x)),
+                })?
+            };
+            if y & ky != 0 && cycle >= RESET_CYCLES && gate_of(&g.out).is_some() {
+                asserted.insert(g.out.as_str());
+            }
+            gate(gi, y, ky);
+            val.insert(g.out.as_str(), (y, ky));
+        }
+        for (k, r) in c.regs.iter().enumerate() {
+            (state[k], known[k]) = val.get(nexts[k].as_str()).copied().ok_or_else(|| format!("register `{r}` has no next-state gate"))?;
+        }
+    }
+    let sigs = sig.iter().zip(&sig_known).map(|(v, k)| defined_signature(v, k)).collect();
+    let stuck = c.gates.iter().filter(|g| gate_of(&g.out).is_some() && !asserted.contains(g.out.as_str())).map(|g| g.out.clone()).collect();
+    Ok((sigs, stuck))
+}
+
+/// A gate in the signal-correspondence model: (model, gate index in its cone); gate [`CONST`] is
+/// the constant 0, the head of the constant class.
+pub(crate) type NodeId = (usize, usize);
+pub(crate) const CONST: usize = usize::MAX;
+
+/// Signal-correspondence candidates ([`gate_candidates`]): classes of gates, each in (model,
+/// gate) order so a head comes before every member in cone order; `inv[m][g]` a gate holding the
+/// complement of its class's value (for a constant-class member: constantly 1).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Nodes {
+    pub classes: Vec<Vec<NodeId>>,
+    pub inv: Vec<Vec<bool>>,
+}
+
+impl Nodes {
+    /// Gates in a class, the constant's virtual head not counted.
+    pub(crate) fn members(&self) -> usize {
+        self.classes.iter().flatten().filter(|n| n.1 != CONST).count()
+    }
+}
+
+/// Stage 2b (signal correspondence): every gate output's signature, simulated exactly as the
+/// registers' ([`simulate_model`], [`defined_signature`]), grouped up to complement from cycle 1
+/// as [`candidate_classes`] groups registers; a gate whose signature is constant joins the
+/// constant class (ABC `Cec_ManSimClassesPrepare`: every AND node starts in the constant class
+/// and simulation refines it). A class of one gate proposes nothing and is dropped.
+///
+/// 🔑 A signature is kept as a 128-bit hash, not its 127 words: a core's million gates would
+/// hold a gigabyte. Two different signatures hashing alike only PROPOSE a wrong pair, which the
+/// proof splits; no proof reads the hash.
+pub(crate) fn gate_candidates(models: &[&Model], stim: &Stimulus, free: &[BTreeSet<String>]) -> Result<Nodes, String> {
+    use std::hash::{Hash, Hasher};
+    let mut by_key: HashMap<u128, usize> = HashMap::new();
+    let mut classes: Vec<Vec<NodeId>> = vec![vec![(0, CONST)]];
+    let mut inv: Vec<Vec<bool>> = Vec::new();
+    for (mi, m) in models.iter().enumerate() {
+        let n = m.cone.gates.len();
+        let (mut v, mut k) = (vec![Vec::with_capacity(CYCLES); n], vec![Vec::with_capacity(CYCLES); n]);
+        simulate_model(m, stim, &free[mi], &mut |g, y, ky| {
+            v[g].push(y);
+            k[g].push(ky);
+        })?;
+        let mut pol = vec![false; n];
+        for g in 0..n {
+            let sig = defined_signature(&std::mem::take(&mut v[g]), &std::mem::take(&mut k[g]));
+            let tail = sig.get(1..).unwrap_or(&[]);
+            let flip = tail.first().is_some_and(|w| w & 1 == 1);
+            pol[g] = flip;
+            let norm = |w: &u64| if flip { !w } else { *w };
+            if tail.iter().all(|w| norm(w) == 0) {
+                classes[0].push((mi, g));
+                continue;
+            }
+            let mut h = [std::collections::hash_map::DefaultHasher::new(), std::collections::hash_map::DefaultHasher::new()];
+            0x5c0u16.hash(&mut h[1]);
+            for w in tail {
+                norm(w).hash(&mut h[0]);
+                norm(w).hash(&mut h[1]);
+            }
+            let key = (u128::from(h[0].finish()) << 64) | u128::from(h[1].finish());
+            let c = *by_key.entry(key).or_insert_with(|| {
+                classes.push(Vec::new());
+                classes.len() - 1
+            });
+            classes[c].push((mi, g));
+        }
+        inv.push(pol);
+    }
+    classes.retain(|c| c.len() >= 2);
+    Ok(Nodes { classes, inv })
 }
 
 /// Inputs with more undefined words than this are not enumerated: the output is then defined only
@@ -1696,6 +1779,42 @@ mod tests {
              INV i(.A(d),.Y(nd));\nMUX2 m(.A0(s),.A1(nd),.S(en),.Y(n));\nDFF u(.CK(clk),.D(n),.Q(s));\nINV o(.A(s),.Y(q));\nendmodule\n");
         let rep = map(&g, &m);
         assert_eq!(rep.inverted, [("r".to_string(), "u".to_string())].into_iter().collect(), "{rep:?}");
+        assert!(rep.one_to_one(), "{rep:?}");
+    }
+
+    /// A 3-entry queue read at a pointer that resets to 0 and wraps at 2; `rd` is the read mux,
+    /// `q` the register capturing it. Pointer and storage share names across the two syntheses.
+    fn wrap_queue(rd: &str, q: &str) -> Netlist {
+        nl(&format!(
+            "module t(clk,rst_n,d0,d1,d2,y);\ninput clk,rst_n,d0,d1,d2; output y;\n\
+             wire p0,p1,n0,n1,np0,np1,m0,m1,m2,lo,hi,rd,s;\n\
+             INV i0(.A(p0),.Y(np0));\nINV i1(.A(p1),.Y(np1));\n\
+             AND2 a0(.A(np0),.B(np1),.Y(n0));\nAND2 a1(.A(p0),.B(np1),.Y(n1));\n\
+             DFR p0r(.CK(clk),.D(n0),.RESET_B(rst_n),.Q(p0));\nDFR p1r(.CK(clk),.D(n1),.RESET_B(rst_n),.Q(p1));\n\
+             DFF m0r(.CK(clk),.D(d0),.Q(m0));\nDFF m1r(.CK(clk),.D(d1),.Q(m1));\nDFF m2r(.CK(clk),.D(d2),.Q(m2));\n\
+             {rd}\nDFF {q}(.CK(clk),.D(rd),.Q(s));\nBUF b(.A(s),.Y(y));\nendmodule\n"
+        ))
+    }
+
+    /// 🔑 WITNESS for signal correspondence (ABC `&scorr`): two syntheses of a 3-entry queue
+    /// whose pointer resets to 0 and wraps at 2 (`ptr <= ptr == 2 ? 0 : ptr + 1`), so `ptr == 3`
+    /// is unreachable and the RTL read there is X. The golden reads entry 2 at `ptr == 3`, the
+    /// revised entry 0. Register correspondence alone cannot exclude `ptr == 3` (the pointer
+    /// classes are free in the one-frame model), so `r` and `u` split. With the two read muxes a
+    /// candidate pair, the hypothesis frame sees one read value, and the read nodes are checked
+    /// at the NEXT state, where the pointer is never 3: `r` maps to `u`. CoralNPU's 54 round-1
+    /// rejections are this queue (`axiSlave.writeData_q`, `Queue3_AxiWriteData`).
+    #[test]
+    fn a_read_that_differs_only_at_an_unreachable_pointer_maps_by_signal_correspondence() {
+        // golden: p1 ? m2 : (p0 ? m1 : m0)  -> ptr 3 reads m2
+        let g = wrap_queue("MUX2 lo_m(.A0(m0),.A1(m1),.S(p0),.Y(lo));\nMUX2 rd_m(.A0(lo),.A1(m2),.S(p1),.Y(rd));", "r");
+        // revised: p0 ? (p1 ? m0 : m1) : (p1 ? m2 : m0)  -> ptr 3 reads m0
+        let m = wrap_queue(
+            "MUX2 lo_m(.A0(m0),.A1(m2),.S(p1),.Y(lo));\nMUX2 hi_m(.A0(m1),.A1(m0),.S(p1),.Y(hi));\nMUX2 rd_m(.A0(lo),.A1(hi),.S(p0),.Y(rd));",
+            "u",
+        );
+        let rep = map(&g, &m);
+        assert_eq!(rep.mapped.get("r").map(String::as_str), Some("u"), "{rep:?}");
         assert!(rep.one_to_one(), "{rep:?}");
     }
 

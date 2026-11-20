@@ -182,22 +182,22 @@ impl Signatures {
 
 /// One model's cone by index, compiled once per refinement so a resimulation is one pass over
 /// words (resolving every input by name per pass cost a core minutes per class).
-struct Compiled {
-    ins: Vec<Vec<In>>,
+pub(super) struct Compiled {
+    pub(super) ins: Vec<Vec<In>>,
     /// each gate's function over its inputs by position ([`program`])
-    prog: Vec<Vec<Ins>>,
+    pub(super) prog: Vec<Vec<Ins>>,
     /// state nets read (by [`In::State`]), looked up in the round's classes per resimulation
-    states: Vec<String>,
+    pub(super) states: Vec<String>,
     /// free-input variable names read (by [`In::Free`])
-    frees: Vec<String>,
+    pub(super) frees: Vec<String>,
     /// each register's next value
-    next: Vec<In>,
+    pub(super) next: Vec<In>,
     /// each register's state net
-    reg_state: Vec<String>,
+    pub(super) reg_state: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
-enum In {
+pub(super) enum In {
     Const(bool),
     Gate(usize),
     State(usize),
@@ -207,7 +207,7 @@ enum In {
 impl Compiled {
     /// Each gate input resolved as the BDD and CNF builders resolve it: a gate already computed,
     /// then a state, then a free input; anything else is an error.
-    fn of(model: &Model) -> Result<Compiled, String> {
+    pub(super) fn of(model: &Model) -> Result<Compiled, String> {
         let c = &model.cone;
         let mut out = Compiled { ins: Vec::with_capacity(c.gates.len()), prog: Vec::with_capacity(c.gates.len()), states: Vec::new(), frees: Vec::new(), next: Vec::new(), reg_state: Vec::new() };
         let mut st: FxHashMap<&str, usize> = FxHashMap::default();
@@ -256,7 +256,7 @@ impl Compiled {
 
 /// One step of a gate program, a stack machine over words: `Arg(k)` pushes input `k`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Ins {
+pub(super) enum Ins {
     Arg(u32),
     One,
     Zero,
@@ -329,7 +329,7 @@ fn program(logic: &Logic, pins: &[String], n: usize) -> Result<Vec<Ins>, String>
 }
 
 /// A gate program run over the input words `x`.
-fn run(prog: &[Ins], x: &[u64], stack: &mut Vec<u64>) -> u64 {
+pub(super) fn run(prog: &[Ins], x: &[u64], stack: &mut Vec<u64>) -> u64 {
     stack.clear();
     for &i in prog {
         match i {
@@ -426,7 +426,7 @@ enum Var {
     Input(String),
 }
 
-enum Outcome {
+pub(super) enum Outcome {
     Structural,
     Unsat,
     /// the variables the counter-example sets (every other one is 0)
@@ -462,7 +462,7 @@ const SAT_VAR_MAX: i32 = 1 << 17;
 const CALLS_RECYCLE: usize = 200;
 
 /// ABC's recycle condition (`cecSolve.c`): BOTH over the variable cap and past the call count.
-fn needs_recycle(vars: i32, calls: usize) -> bool {
+pub(super) fn needs_recycle(vars: i32, calls: usize) -> bool {
     vars > SAT_VAR_MAX && calls > CALLS_RECYCLE
 }
 
@@ -601,21 +601,21 @@ fn next_lit<'m>(cnf: &mut Cnf, vars: &mut FxHashMap<Var, i32>, lit: &mut FxHashM
 /// A CNF under construction: clauses over variables 1..=n, literal -v is NOT v; variable 1 is the
 /// constant true. AND and XOR nodes are hashed, so a node built twice is one variable (as the
 /// parked splr engine's encoder).
-struct Cnf {
-    n: i32,
-    clauses: Vec<Vec<i32>>,
+pub(super) struct Cnf {
+    pub(super) n: i32,
+    pub(super) clauses: Vec<Vec<i32>>,
     and: FxHashMap<(i32, i32), i32>,
     xor: FxHashMap<(i32, i32), i32>,
 }
 
-const T: i32 = 1;
+pub(super) const T: i32 = 1;
 
 impl Cnf {
-    fn new() -> Cnf {
+    pub(super) fn new() -> Cnf {
         Cnf { n: 1, clauses: vec![vec![T]], and: FxHashMap::default(), xor: FxHashMap::default() }
     }
 
-    fn fresh(&mut self) -> i32 {
+    pub(super) fn fresh(&mut self) -> i32 {
         self.n += 1;
         self.n
     }
@@ -644,7 +644,7 @@ impl Cnf {
         -self.and2(-a, -b)
     }
 
-    fn xor2(&mut self, a: i32, b: i32) -> i32 {
+    pub(super) fn xor2(&mut self, a: i32, b: i32) -> i32 {
         if a == -T {
             return b;
         }
@@ -690,7 +690,7 @@ impl Cnf {
     }
 }
 
-fn func_lit(cnf: &mut Cnf, f: &Func, pins: &[String], ins: &[i32]) -> i32 {
+pub(super) fn func_lit(cnf: &mut Cnf, f: &Func, pins: &[String], ins: &[i32]) -> i32 {
     match f {
         Func::Port(p) => ins[pins.iter().position(|x| x == p).expect("logic_of keeps every named pin")],
         Func::Not(a) => -func_lit(cnf, a, pins, ins),
@@ -707,7 +707,7 @@ fn func_lit(cnf: &mut Cnf, f: &Func, pins: &[String], ins: &[i32]) -> i32 {
     }
 }
 
-fn prim_lit(cnf: &mut Cnf, op: Op, ins: &[i32], pins: &[String]) -> Result<i32, String> {
+pub(super) fn prim_lit(cnf: &mut Cnf, op: Op, ins: &[i32], pins: &[String]) -> Result<i32, String> {
     let need = |n: usize| if ins.len() == n { Ok(()) } else { Err(format!("primitive expected {n} input(s), got {}", ins.len())) };
     let fold = |cnf: &mut Cnf, f: fn(&mut Cnf, i32, i32) -> i32, what: &str| -> Result<i32, String> {
         let mut acc = *ins.first().ok_or_else(|| format!("{what} needs inputs"))?;
