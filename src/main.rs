@@ -818,6 +818,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         };
         let dup: Vec<String> = rep.duplicated.iter().map(|(k, v)| format!("{}: {}", json_str(k), list(v))).collect();
         let amb: Vec<String> = rep.ambiguous.iter().map(|(a, b)| format!("{{\"golden\": {}, \"revised\": {}}}", list(a), list(b))).collect();
+        let tied: Vec<String> = rep.tied_by_name.iter().map(|(a, b)| format!("{{\"golden\": {}, \"revised\": {}}}", list(a), list(b))).collect();
         let mapped = map_json(&rep.mapped).trim_end().replace('\n', "\n  ");
         let inverted = map_json(&rep.inverted).trim_end().replace('\n', "\n  ");
         let pairs = |v: &[(String, String)]| {
@@ -825,12 +826,13 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"name_pairs\": {},\n  \"name_pairs_rejected\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {},\n  \"refine\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"tied_by_name\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"name_pairs\": {},\n  \"name_pairs_rejected\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {},\n  \"refine\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
             dup.join(", "),
             amb.join(", "),
+            tied.join(", "),
             flags(&rep.unmatched_golden),
             flags(&rep.unmatched_revised),
             regs(&rep.undecided),
@@ -910,6 +912,9 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for (a, b) in &rep.ambiguous {
             s += &format!("  ambiguous   {} -> {}\n", a.join(" "), b.join(" "));
+        }
+        for (a, b) in &rep.tied_by_name {
+            s += &format!("  tied by name {} -> {}  (proved class, same names on both sides; paired by name)\n", a.join(" "), b.join(" "));
         }
         let why = |d: bool| if d { "candidate disproved" } else { "no candidate" };
         for (k, d) in &rep.unmatched_golden {

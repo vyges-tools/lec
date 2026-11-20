@@ -177,6 +177,12 @@ pub struct MapReport {
     /// A class with several golden registers (they hold one value; which one a revised register
     /// stands for is not decided): golden names, revised names.
     pub ambiguous: Vec<(Vec<String>, Vec<String>)>,
+    /// Classes that would be `ambiguous` but whose golden and revised names are the SAME set,
+    /// one-to-one ([`tie_by_name`]): each register is put in `mapped` (or `inverted`) with the
+    /// one of its own name, and the class is listed here (golden names, revised names) so the
+    /// choice is never silent. Sound: every member of the class is proved to hold one value, so
+    /// any one-to-one choice is a proved pair; the name only picks which.
+    pub tied_by_name: Vec<(Vec<String>, Vec<String>)>,
     /// Golden registers with no counterpart (`true`: a candidate shared their simulation
     /// signature and was disproved).
     pub unmatched_golden: BTreeMap<String, bool>,
@@ -1241,12 +1247,19 @@ pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Ve
             (1, 1) => {
                 rep.mapped.insert(gn[0].clone(), rn[0].clone());
             }
-            // an inverted class that is not one-to-one is not decided
-            _ if *inverted => rep.ambiguous.push((gn, rn)),
-            (1, _) => {
+            (1, _) if !*inverted => {
                 rep.duplicated.insert(gn[0].clone(), rn);
             }
-            _ => rep.ambiguous.push((gn, rn)),
+            // several golden registers (or an inverted class that is not one-to-one): decided only
+            // when the names are the same set on both sides, one-to-one
+            _ => match tie_by_name(&gn, &rn) {
+                Some(pairs) => {
+                    let to = if *inverted { &mut rep.inverted } else { &mut rep.mapped };
+                    to.extend(pairs);
+                    rep.tied_by_name.push((gn, rn));
+                }
+                None => rep.ambiguous.push((gn, rn)),
+            },
         }
     }
     rep.undecided = undecided.iter().map(|r| models[r.0].regs[r.1].clone()).collect();
@@ -1255,6 +1268,20 @@ pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Ve
         rep.cut.extend(m.cut.iter().cloned());
     }
     rep
+}
+
+/// 🔑 A proved class with several registers of each design is broken ONLY when its golden and
+/// revised names are the same set, one-to-one: then each golden register pairs with the revised
+/// one of its own name. Every member is proved to hold the class's value, so each such pair is
+/// proved; the name only chooses among proved pairs, never proposes one. Any other class
+/// (different counts, one name missing or repeated) stays ambiguous.
+/// Witness: ibex keeps two copies of its instruction register (`instr_rdata_id`,
+/// `instr_rdata_alu_id`); each bit is a 2-and-2 class with the same two names on both sides
+/// (17 such classes against the reference `syn`, 2026-11-20).
+pub(crate) fn tie_by_name(golden: &[String], revised: &[String]) -> Option<Vec<(String, String)>> {
+    let g: BTreeSet<&String> = golden.iter().collect();
+    let r: BTreeSet<&String> = revised.iter().collect();
+    (g.len() == golden.len() && r.len() == revised.len() && g == r).then(|| golden.iter().map(|n| (n.clone(), n.clone())).collect())
 }
 
 /// How long two signatures agree: the cycles each run agrees from the start (summed over the 64
@@ -1532,6 +1559,60 @@ mod tests {
             let rep = map(&golden, &with(latch, ram, "n5", "n8", "u9", "n6", "n7"));
             assert!(rep.mapped.is_empty(), "{latch}/{ram}: a cell of another name is another input: {rep:?}");
             assert!(rep.unmatched_golden.contains_key("r0") && rep.unmatched_revised.contains_key("u9"), "{rep:?}");
+        }
+    }
+
+    /// 🔑 A class of identical duplicates (two copies of one register in each design, as ibex's
+    /// `instr_rdata_id` / `instr_rdata_alu_id`) is broken by exact name, one-to-one, and listed
+    /// in `tied_by_name`; with the revised copies under other names it stays ambiguous.
+    #[test]
+    fn a_class_of_same_named_duplicates_is_tied_by_name() {
+        let dup = |a: &str, b: &str| {
+            nl(&format!(
+                "module t(clk,d,y,z);\ninput clk,d; output y,z;\nwire qa,qb;\n\
+                 DFF {a}(.CK(clk),.D(d),.Q(qa));\nDFF {b}(.CK(clk),.D(d),.Q(qb));\n\
+                 BUF o1(.A(qa),.Y(y));\nBUF o2(.A(qb),.Y(z));\nendmodule\n"
+            ))
+        };
+        let rep = map(&dup("id", "alu"), &dup("id", "alu"));
+        assert_eq!(rep.mapped.get("id").map(String::as_str), Some("id"), "{rep:?}");
+        assert_eq!(rep.mapped.get("alu").map(String::as_str), Some("alu"), "{rep:?}");
+        assert!(rep.ambiguous.is_empty() && rep.one_to_one(), "{rep:?}");
+        assert_eq!(rep.tied_by_name.len(), 1, "{rep:?}");
+        let rep = map(&dup("id", "alu"), &dup("u1", "u2"));
+        assert!(rep.mapped.is_empty() && rep.tied_by_name.is_empty(), "{rep:?}");
+        assert_eq!(rep.ambiguous.len(), 1, "other names: still ambiguous: {rep:?}");
+        assert!(tie_by_name(&["a".into(), "b".into()], &["a".into(), "a".into()]).is_none(), "a repeated name is not one-to-one");
+        assert!(tie_by_name(&["a".into(), "b".into()], &["a".into(), "b".into(), "c".into()]).is_none());
+    }
+
+    /// WITNESS (L6, 2026-11-20, CoralNPU's reset shape): the port reset `rst_n` clears a
+    /// 4-flop synchronizer on the free-running clock; its stage 1 (`rstn_o`) is the asynchronous
+    /// reset of the core registers, and its last stage gates their clock (the enable latch reads
+    /// `en & s3`, as `RstSync`'s `clk_en_int`). Golden and revised are the same circuit under
+    /// other names; every register must map.
+    fn sync_reset(p: &str) -> Netlist {
+        nl(&format!(
+            "module t(clk,rst_n,en,d,y);\ninput clk,rst_n,en,d; output y;\n\
+             wire {p}s0,{p}s1,{p}s2,{p}s3,{p}e,{p}le,{p}g,{p}qa,{p}qb,{p}da,{p}db;\n\
+             DFR {p}k0(.CK(clk),.D(1'b1),.RESET_B(rst_n),.Q({p}s0));\n\
+             DFR {p}k1(.CK(clk),.D({p}s0),.RESET_B(rst_n),.Q({p}s1));\n\
+             DFR {p}k2(.CK(clk),.D({p}s1),.RESET_B(rst_n),.Q({p}s2));\n\
+             DFR {p}k3(.CK(clk),.D({p}s2),.RESET_B(rst_n),.Q({p}s3));\n\
+             AND2 {p}ae(.A(en),.B({p}s3),.Y({p}e));\n\
+             LATN {p}lt(.G(clk),.D({p}e),.Q({p}le));\nAND2 {p}ag(.A(clk),.B({p}le),.Y({p}g));\n\
+             XOR2 {p}xa(.A(d),.B({p}qb),.Y({p}da));\nDFR {p}ra(.CK({p}g),.D({p}da),.RESET_B({p}s1),.Q({p}qa));\n\
+             XOR2 {p}xb(.A({p}qa),.B({p}qb),.Y({p}db));\nDFR {p}rb(.CK({p}g),.D({p}db),.RESET_B({p}s1),.Q({p}qb));\n\
+             BUF {p}bo(.A({p}qb),.Y(y));\nendmodule\n"
+        ))
+    }
+
+    #[test]
+    fn registers_reset_through_a_synchronizer_behind_a_gated_clock_map() {
+        let rep = map(&sync_reset("g_"), &sync_reset("r_"));
+        eprintln!("{rep:?}");
+        for r in ["k0", "k1", "k2", "k3", "ra", "rb"] {
+            assert_eq!(rep.mapped.get(&format!("g_{r}")).map(String::as_str), Some(format!("r_{r}").as_str()), "{r}: {rep:?}");
         }
     }
 
