@@ -617,6 +617,18 @@ pub(crate) fn simulate(models: &[&Model], stim: &Stimulus, free: &[BTreeSet<Stri
                 (state[k], known[k]) = val.get(nexts[k].as_str()).copied().ok_or_else(|| format!("register `{r}` has no next-state gate"))?;
             }
         }
+        // DIAGNOSTIC (sat-diag only): `LEC_DIAG_RAW=sub1,sub2` prints each matching register's raw
+        // simulated value and defined mask per cycle (hex words, one bit per run), before the fill
+        if let Ok(subs) = std::env::var("LEC_DIAG_RAW") {
+            let subs: Vec<&str> = subs.split(',').collect();
+            for (k, r) in m.regs.iter().enumerate() {
+                if subs.iter().any(|x| r.name.contains(x)) {
+                    let hv: Vec<String> = sig[k].iter().map(|x| format!("{x:016x}")).collect();
+                    let hk: Vec<String> = sig_known[k].iter().map(|x| format!("{x:016x}")).collect();
+                    eprintln!("SIGRAW {mi} {} {} {}", r.name, hv.join(","), hk.join(","));
+                }
+            }
+        }
         out.push(sig.iter().zip(&sig_known).map(|(v, k)| defined_signature(v, k)).collect());
         stuck_all.push(c.gates.iter().filter(|g| gate_of(&g.out).is_some() && !asserted.contains(g.out.as_str())).map(|g| g.out.clone()).collect());
     }
