@@ -324,6 +324,11 @@ fn register_map_at(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Namin
                 let bits: String = w.iter().take(24).map(|x| if x & 1 == 1 { '1' } else { '0' }).collect();
                 let ones: u32 = w.iter().map(|x| x.count_ones()).sum();
                 eprintln!("SIGDIAG {} {} {c} ones {ones} run0 {bits} class {:?} inv {}", if side == 0 { "g" } else { "r" }, reg.name, at.get(&(side, k)), inv[side][k]);
+                // `LEC_DIAG_SIG_FULL`: every signature word (cycle order, one bit per run), hex
+                if std::env::var_os("LEC_DIAG_SIG_FULL").is_some() {
+                    let hex: Vec<String> = w.iter().map(|x| format!("{x:016x}")).collect();
+                    eprintln!("SIGFULL {} {} {}", if side == 0 { "g" } else { "r" }, reg.name, hex.join(","));
+                }
             }
         }
         if std::env::var_os("LEC_DIAG_SIG_EXIT").is_some() {
