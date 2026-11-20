@@ -798,6 +798,17 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
     );
     let (code, sev) = if one { ("LEC-MAPPED", Severity::Info) } else { ("LEC-UNMAPPED", Severity::Warn) };
     vyges_events::emit(&Event::new("vyges-lec", sev, format!("MAP {head}")).with_code(code));
+    if !rep.undriven.is_empty() {
+        let first: Vec<String> = rep.undriven.iter().take(5).map(|x| format!("{} {}", if x.side == Side::Golden { "golden" } else { "revised" }, x.name)).collect();
+        vyges_events::emit(
+            &Event::new(
+                "vyges-lec",
+                Severity::Warn,
+                format!("{} undriven net(s) read by register logic, each a free input of one design alone (first: {})", rep.undriven.len(), first.join(", ")),
+            )
+            .with_code("LEC-UNDRIVEN"),
+        );
+    }
     if let Some(p) = opt(args, "--write-map") {
         if let Err(e) = std::fs::write(&p, map_json(&rep.mapped)) {
             die(&format!("{p}: {e}"));
@@ -826,7 +837,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             format!("[{}]", rows.join(", "))
         };
         let s = format!(
-            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"tied_by_name\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"name_pairs\": {},\n  \"name_pairs_rejected\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {},\n  \"refine\": {}\n}}\n",
+            "{{\n  \"one_to_one\": {one},\n  \"golden_registers\": {},\n  \"revised_registers\": {},\n  \"rounds\": {},\n  \"mapped\": {mapped},\n  \"inverted\": {inverted},\n  \"duplicated\": {{{}}},\n  \"ambiguous\": [{}],\n  \"tied_by_name\": [{}],\n  \"unmatched_golden\": {},\n  \"unmatched_revised\": {},\n  \"undecided\": {},\n  \"unobserved\": {},\n  \"cut\": {},\n  \"undriven\": {},\n  \"reset_inputs\": {},\n  \"holds\": {},\n  \"resets_given\": {},\n  \"name_pairs\": {},\n  \"name_pairs_rejected\": {},\n  \"free_enables\": {},\n  \"causes\": {},\n  \"follows\": {},\n  \"unexplained\": {},\n  \"unattributed\": {},\n  \"attribution_skipped\": {},\n  \"ports_renumbered\": {},\n  \"refine\": {}\n}}\n",
             rep.golden_registers,
             rep.revised_registers,
             rep.rounds,
@@ -838,6 +849,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             regs(&rep.undecided),
             regs(&rep.unobserved),
             regs(&rep.cut),
+            format!("[{}]", rep.undriven.iter().map(|x| format!("{{\"design\": \"{}\", \"net\": {}}}", side(x.side), json_str(&x.name))).collect::<Vec<_>>().join(", ")),
             {
                 let rows: Vec<String> = rep.reset_inputs.iter().map(|(n, v)| format!("{{\"input\": {}, \"inactive\": {}}}", json_str(n), u8::from(*v))).collect();
                 format!("[{}]", rows.join(", "))
@@ -928,6 +940,9 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         }
         for x in &rep.unobserved {
             s += &format!("  unobserved  {} {}  (no connected output)\n", side(x.side), x.instance);
+        }
+        for x in &rep.undriven {
+            s += &format!("  undriven    {} {}  (read by register logic, driven by nothing: a free input of this design alone)\n", side(x.side), x.name);
         }
         for (n, v) in &rep.reset_inputs {
             s += &format!("  reset input {n}  (simulation holds it active {RESET} cycle(s), then at {})\n", u8::from(*v), RESET = map::RESET_CYCLES);

@@ -195,6 +195,10 @@ pub struct MapReport {
     /// Latches and memories cut as `check` cuts them (an output is a free input shared by instance
     /// name), not mapped: the map holds under the assumption that same-named cells hold one value.
     pub cut: Vec<RegName>,
+    /// Nets a register's logic reads that nothing drives ([`undriven_nets`]), per design (the
+    /// net in `instance` and `name`): each is a free input of that design alone, so whatever
+    /// reads it cannot be paired. A netlist defect in the input; `lec map` warns (LEC-UNDRIVEN).
+    pub undriven: Vec<RegName>,
     /// The asynchronous-reset inputs the simulation held, each with its inactive value
     /// ([`Stimulus`]).
     pub reset_inputs: Vec<(String, bool)>,
@@ -327,6 +331,9 @@ pub(crate) struct Model {
     unobserved: Vec<RegName>,
     /// Latches and memories the model cut ([`Design::register_model`]), in netlist order.
     cut: Vec<RegName>,
+    /// Nets read by a register's cone that nothing drives (no cell, no port, no tie): each is a
+    /// free input of this design ALONE ([`undriven_nets`]).
+    undriven: Vec<String>,
 }
 
 /// Stage 1: the cone of every register's outputs, with each register's next-state gate.
@@ -371,7 +378,20 @@ pub(crate) fn model(d: &Design, side: Side, naming: Naming) -> Result<Model, Str
         .collect();
     let gate = cone.gates.iter().enumerate().map(|(k, g)| (g.out.clone(), k)).collect();
     let state = cone.regs.iter().map(|r| state_net(r)).collect();
-    Ok(Model { side, cone, regs, gate, state, unobserved, cut })
+    let undriven = undriven_nets(d, &cone);
+    Ok(Model { side, cone, regs, gate, state, unobserved, cut, undriven })
+}
+
+/// L8: the nets a cone reads as free inputs that are neither a primary input nor a cut cell's or
+/// register's output, i.e. nets NOTHING drives. Each is a free input of its design alone: the
+/// other design has no variable of that name, so every register reading it can never be paired,
+/// and the map says nothing of why. They are listed so it does.
+/// Witness: the reference `syn`'s CoralNPU netlist (2026-11-20) has five flops whose D is an
+/// undriven net (its defect D4); one is the reset synchronizer's first stage, and `map` paired
+/// 0 of 71,474 registers with no other sign of the cause.
+pub(crate) fn undriven_nets(d: &Design, cone: &Cone) -> Vec<String> {
+    let inputs: HashSet<&str> = d.netlist().inputs.iter().map(String::as_str).collect();
+    cone.free.iter().filter(|(net, var)| net == var && !inputs.contains(net.as_str())).map(|(net, _)| net.clone()).collect()
 }
 
 /// A register across both models: (model index, register index).
@@ -1266,6 +1286,7 @@ pub(crate) fn report(models: &[&Model], candidates: &[Vec<RegId>], classes: &[Ve
     for m in models {
         rep.unobserved.extend(m.unobserved.iter().cloned());
         rep.cut.extend(m.cut.iter().cloned());
+        rep.undriven.extend(m.undriven.iter().map(|n| RegName { side: m.side, instance: n.clone(), name: n.clone() }));
     }
     rep
 }
@@ -1560,6 +1581,24 @@ mod tests {
             assert!(rep.mapped.is_empty(), "{latch}/{ram}: a cell of another name is another input: {rep:?}");
             assert!(rep.unmatched_golden.contains_key("r0") && rep.unmatched_revised.contains_key("u9"), "{rep:?}");
         }
+    }
+
+    /// 🔑 L8: a register reading an undriven net is listed with that net, per design. Golden `r`
+    /// loads `x`, which nothing drives (the reference `syn` defect D4 writes a QN-only flop's
+    /// constant D this way); the revised one loads a tie. `r` cannot pair, and the report says
+    /// why: `undriven` names `x` in the golden, nothing in the revised.
+    #[test]
+    fn an_undriven_net_read_by_a_register_is_listed() {
+        // `s` reads a primary input `d` and a latch output `m` (cut): both free, neither undriven
+        let body = "LAT l(.G(clk),.D(d),.Q(m));\nXOR2 xs(.A(d),.B(m),.Y(ds));\nDFF s(.CK(clk),.D(ds),.Q(qs));\nBUF bs(.A(qs),.Y(z));\n";
+        let g = nl(&format!("module t(clk,d,y,z);\ninput clk,d; output y,z;\nwire x,q,m,ds,qs;\nDFF r(.CK(clk),.D(x),.Q(q));\nBUF b(.A(q),.Y(y));\n{body}endmodule\n"));
+        let r = nl(&format!("module t(clk,d,y,z);\ninput clk,d; output y,z;\nwire x,q,m,ds,qs;\nTIE0 t0(.LO(x));\nDFF r(.CK(clk),.D(x),.Q(q));\nBUF b(.A(q),.Y(y));\n{body}endmodule\n"));
+        let rep = map(&g, &r);
+        let und: Vec<(Side, &str)> = rep.undriven.iter().map(|x| (x.side, x.name.as_str())).collect();
+        assert_eq!(und, [(Side::Golden, "x")], "{rep:?}");
+        let rep = map(&r, &r);
+        assert!(rep.undriven.is_empty(), "a tie, an input port and a cut latch are not undriven: {rep:?}");
+        assert_eq!(rep.mapped.get("s").map(String::as_str), Some("s"), "{rep:?}");
     }
 
     /// 🔑 A class of identical duplicates (two copies of one register in each design, as ibex's
