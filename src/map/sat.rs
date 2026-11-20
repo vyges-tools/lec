@@ -793,7 +793,9 @@ impl<'m> RoundSolver<'m> {
         // conflicts, to measure what a larger budget for the hard pairs costs
         if r.is_none() {
             static ESC: std::sync::OnceLock<Option<i32>> = std::sync::OnceLock::new();
-            if let Some(n) = *ESC.get_or_init(|| std::env::var("LEC_DIAG_ESCALATE").ok().and_then(|s| s.parse().ok())) {
+            let only = std::env::var("LEC_DIAG_ESCALATE_ONLY").ok();
+            let wanted = only.as_deref().is_none_or(|s| models[h.0].regs[h.1].name.contains(s));
+            if let (true, Some(n)) = (wanted, *ESC.get_or_init(|| std::env::var("LEC_DIAG_ESCALATE").ok().and_then(|s| s.parse().ok()))) {
                 let t0 = std::time::Instant::now();
                 self.sat.set_limit("conflicts", n).map_err(|e| format!("SAT refinement: {e:?}"))?;
                 r = self.sat.solve_with([d]);
