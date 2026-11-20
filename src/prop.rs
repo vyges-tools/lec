@@ -10,6 +10,11 @@
 //!   the inputs of every cycle up to it; or
 //! - with a bound of N cycles, `bmc3 -F N+1`, which only looks at cycles 0 to N (`-F` counts
 //!   frames 0 to F-1): no failure there is not a proof.
+//!
+//! Before ABC, a one-cycle BDD of the property nets (while it stays under [`BDD_LIMIT`] nodes)
+//! decides the nets that are 0 in every state, and every net of a register-free design. Each net's
+//! result names the engine that decided it ([`Engine`]) and, where that engine has one, a depth
+//! ([`Depth`]), so a proof is never ambiguous between the pre-pass and ABC.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -33,6 +38,76 @@ pub enum PropVerdict {
     Undecided,
 }
 
+/// The engine that decided a property net.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Engine {
+    /// The one-cycle BDD before ABC: 0 in every state, or (no register) 1 under some input.
+    BddPrepass,
+    /// ABC's `pdr` (unbounded).
+    Pdr,
+    /// ABC's `bmc3` (bounded; it proves outright only when it has visited every reachable state).
+    Bmc,
+}
+
+impl Engine {
+    /// The name in the JSON report.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Engine::BddPrepass => "bdd-prepass",
+            Engine::Pdr => "pdr",
+            Engine::Bmc => "bmc",
+        }
+    }
+}
+
+/// How deep the deciding engine went, where it has a depth.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Depth {
+    /// A clock cycle (0: before any edge): where a net fails, or the last cycle a bounded check
+    /// covered.
+    Cycle(usize),
+    /// The frame `k` of `pdr`'s inductive invariant (`Invariant F[k]` in ABC's output).
+    PdrFrame(usize),
+}
+
+/// What one property net came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Never 1.
+    Holds,
+    /// Not 1 in the cycles a bounded check covered (not a proof).
+    HoldsWithin,
+    /// 1 in some cycle.
+    Fails,
+    /// The engine gave up within its limits.
+    Undecided,
+    /// Not decided: the engine stopped at another net's failure first.
+    NotReached,
+}
+
+impl Outcome {
+    /// The name in the JSON report.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Outcome::Holds => "holds",
+            Outcome::HoldsWithin => "holds_within",
+            Outcome::Fails => "fails",
+            Outcome::Undecided => "undecided",
+            Outcome::NotReached => "not_reached",
+        }
+    }
+}
+
+/// One property net's result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Property {
+    pub net: String,
+    pub outcome: Outcome,
+    /// `None` when nothing decided it ([`Outcome::Undecided`], [`Outcome::NotReached`]).
+    pub decided_by: Option<Engine>,
+    pub depth: Option<Depth>,
+}
+
 #[derive(Debug, Clone)]
 pub struct PropReport {
     pub verdict: PropVerdict,
@@ -41,6 +116,8 @@ pub struct PropReport {
     /// Registers the nets depend on.
     pub registers: usize,
     pub clock: Option<String>,
+    /// Each net of `nets`, in that order: its outcome, the engine that decided it, its depth.
+    pub properties: Vec<Property>,
 }
 
 /// Nodes the one-cycle BDD of the property nets may grow to before the question is left to ABC.
@@ -67,7 +144,9 @@ pub fn never(design: &Netlist, lib: &Lib, nets: &[String], bound: Option<usize>)
     }
     let c = lec::seq_cone(&d, nets)?;
     let clock = crate::sec::one_clock("design", &c)?;
-    let report = |verdict| PropReport { verdict, nets: nets.to_vec(), registers: c.regs.len(), clock: clock.clone() };
+    let report = |verdict, properties| PropReport { verdict, nets: nets.to_vec(), registers: c.regs.len(), clock: clock.clone(), properties };
+    let all_nets = nets;
+    let property = |net: &String, outcome, decided_by, depth| Property { net: net.clone(), outcome, decided_by, depth };
     let pis: BTreeMap<String, usize> =
         c.free.values().collect::<BTreeSet<_>>().into_iter().enumerate().map(|(k, v)| (v.clone(), k)).collect();
 
@@ -81,7 +160,8 @@ pub fn never(design: &Netlist, lib: &Lib, nets: &[String], bound: Option<usize>)
     if let Some((bdd, outs, names)) = lec::cone_bdds(&c, nets, BDD_LIMIT)? {
         if c.regs.is_empty() {
             let Some((k, &f)) = outs.iter().enumerate().find(|(_, &f)| f != bdd.zero()) else {
-                return Ok(report(PropVerdict::Holds));
+                let props = nets.iter().map(|n| property(n, Outcome::Holds, Some(Engine::BddPrepass), None)).collect();
+                return Ok(report(PropVerdict::Holds, props));
             };
             let set: BTreeMap<u32, bool> = bdd.sat_one(f).expect("a non-zero BDD is satisfiable").into_iter().collect();
             let inputs: Vec<(String, bool)> = pis
@@ -97,11 +177,22 @@ pub fn never(design: &Netlist, lib: &Lib, nets: &[String], bound: Option<usize>)
             if seen.last().map(|o| o[0]) != Some(true) {
                 return Err(format!("the cycle-0 assignment for `{net}` does not replay: the net is 0 there"));
             }
-            return Ok(report(PropVerdict::Fails { net, cycle: 0, trace }));
+            let props = nets
+                .iter()
+                .zip(&outs)
+                .enumerate()
+                .map(|(i, (n, &g))| match (i == k, g == bdd.zero()) {
+                    (true, _) => property(n, Outcome::Fails, Some(Engine::BddPrepass), Some(Depth::Cycle(0))),
+                    (false, true) => property(n, Outcome::Holds, Some(Engine::BddPrepass), None),
+                    (false, false) => property(n, Outcome::NotReached, None, None),
+                })
+                .collect();
+            return Ok(report(PropVerdict::Fails { net, cycle: 0, trace }, props));
         }
         live = nets.iter().zip(&outs).filter(|(_, &f)| f != bdd.zero()).map(|(n, _)| n.clone()).collect();
         if live.is_empty() {
-            return Ok(report(PropVerdict::Holds));
+            let props = nets.iter().map(|n| property(n, Outcome::Holds, Some(Engine::BddPrepass), None)).collect();
+            return Ok(report(PropVerdict::Holds, props));
         }
     }
     let nets = live.as_slice();
@@ -114,7 +205,13 @@ pub fn never(design: &Netlist, lib: &Lib, nets: &[String], bound: Option<usize>)
         None => "strash; pdr".to_string(),
         Some(n) => format!("strash; bmc3 -F {}", n + 1),
     };
-    crate::sec::in_dir(&dir, || abc.execute_captured(&cmd))?.map_err(|e| e.to_string())?;
+    let said = crate::sec::in_dir(&dir, || abc.execute_captured(&cmd))?.map_err(|e| e.to_string())?;
+    let engine = if bound.is_some() { Engine::Bmc } else { Engine::Pdr };
+    // ABC's depth for a proof or a bounded run, from what it printed.
+    let proof_depth = match engine {
+        Engine::Pdr => pdr_frame(&said).map(Depth::PdrFrame),
+        _ => bmc_frames(&said).map(|f| Depth::Cycle(f.saturating_sub(1))),
+    };
     let verdict = match abc.prob_status() {
         ProbStatus::Unsat => PropVerdict::Holds,
         ProbStatus::Sat => {
@@ -134,7 +231,48 @@ pub fn never(design: &Netlist, lib: &Lib, nets: &[String], bound: Option<usize>)
             None => PropVerdict::Undecided,
         },
     };
-    Ok(report(verdict))
+    // A net the BDD found 0 in every state was decided before ABC; ABC decided the live ones.
+    let props = all_nets
+        .iter()
+        .map(|n| {
+            if !nets.contains(n) {
+                return property(n, Outcome::Holds, Some(Engine::BddPrepass), None);
+            }
+            match &verdict {
+                PropVerdict::Holds => property(n, Outcome::Holds, Some(engine), proof_depth),
+                PropVerdict::HoldsWithin { cycles } => {
+                    property(n, Outcome::HoldsWithin, Some(engine), Some(proof_depth.unwrap_or(Depth::Cycle(*cycles))))
+                }
+                PropVerdict::Fails { net, cycle, .. } if net == n => {
+                    property(n, Outcome::Fails, Some(engine), Some(Depth::Cycle(*cycle)))
+                }
+                PropVerdict::Fails { .. } => property(n, Outcome::NotReached, None, None),
+                PropVerdict::Undecided => property(n, Outcome::Undecided, None, None),
+            }
+        })
+        .collect();
+    Ok(report(verdict, props))
+}
+
+/// `k` of `pdr`'s `Invariant F[k] : ...` line, printed when it proves the property.
+fn pdr_frame(said: &str) -> Option<usize> {
+    let rest = &said[said.find("Invariant F[")? + "Invariant F[".len()..];
+    rest[..rest.find(']')?].parse().ok()
+}
+
+/// The frames `bmc3` covered: `No output asserted in N frames.` (the bound reached) or `after
+/// completing N frames` (every reachable state visited, a proof).
+fn bmc_frames(said: &str) -> Option<usize> {
+    for key in ["No output asserted in ", "after completing "] {
+        if let Some(i) = said.find(key) {
+            let rest = &said[i + key.len()..];
+            let end = rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len());
+            if let Ok(n) = rest[..end].parse() {
+                return Some(n);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -258,6 +396,57 @@ mod tests {
         let rep = never(&src("BUF t0(.A(a),.Y(z));"), &lib(), &s(&["p2"]), None).unwrap();
         let PropVerdict::Fails { net, trace, .. } = &rep.verdict else { panic!("{:?}", rep.verdict) };
         assert_eq!((net.as_str(), trace[0].as_slice()), ("p2", [("a".to_string(), true)].as_slice()));
+    }
+
+    fn decided(rep: &PropReport) -> Vec<(&str, Outcome, Option<Engine>, Option<Depth>)> {
+        rep.properties.iter().map(|p| (p.net.as_str(), p.outcome, p.decided_by, p.depth)).collect()
+    }
+
+    /// Each net names the engine that decided it, so a proof is never ambiguous between the BDD
+    /// pre-pass and ABC. In `q AND NOT q` beside `q`: `p` is 0 in every state (the pre-pass), `q`
+    /// rises in cycle 1 (`pdr`). In the wrapping counter, `c3` is proved by `pdr` with its
+    /// invariant frame; beside `c2`, which fails first, it is not reached. A bound is `bmc`'s, its
+    /// depth the last cycle covered; a register-free net fails in the pre-pass, in cycle 0.
+    #[test]
+    fn each_property_names_its_engine_and_depth() {
+        use Depth::*;
+        use Engine::*;
+        use Outcome::*;
+        let qq = crate::netlist::parse(
+            "module t(clk,en,p);\ninput clk,en; output p;\nwire q,d,nq;\n\
+             XOR2 x(.A(en),.B(q),.Y(d));\nDFF r(.CK(clk),.D(d),.Q(q));\nINV i(.A(q),.Y(nq));\nAND2 a(.A(q),.B(nq),.Y(p));\nendmodule\n",
+        )
+        .unwrap();
+        let rep = never(&qq, &lib(), &s(&["p", "q"]), None).unwrap();
+        assert_eq!(decided(&rep), [("p", Holds, Some(BddPrepass), None), ("q", Fails, Some(Pdr), Some(Cycle(1)))]);
+
+        let rep = never(&counter(true), &lib(), &s(&["c3"]), None).unwrap();
+        let [(_, Holds, Some(Pdr), Some(PdrFrame(k)))] = decided(&rep)[..] else { panic!("{:?}", rep.properties) };
+        assert!(k >= 1, "pdr's invariant frame is at least 1, got {k}");
+        let rep = never(&counter(true), &lib(), &s(&["c3", "c2"]), None).unwrap();
+        assert_eq!(decided(&rep), [("c3", NotReached, None, None), ("c2", Fails, Some(Pdr), Some(Cycle(2)))]);
+
+        let rep = never(&counter(false), &lib(), &s(&["c3"]), Some(2)).unwrap();
+        assert_eq!(decided(&rep), [("c3", HoldsWithin, Some(Bmc), Some(Cycle(2)))]);
+        let rep = never(&counter(false), &lib(), &s(&["c3"]), Some(3)).unwrap();
+        assert_eq!(decided(&rep), [("c3", Fails, Some(Bmc), Some(Cycle(3)))]);
+
+        let and = crate::netlist::parse(
+            "module t(clk,a,b,p,z);\ninput clk,a,b; output p,z;\nwire t;\nAND2 g(.A(a),.B(b),.Y(p));\nTIE0 t0(.LO(t));\nBUF u(.A(t),.Y(z));\nendmodule\n",
+        )
+        .unwrap();
+        let rep = never(&and, &lib(), &s(&["z", "p"]), None).unwrap();
+        assert_eq!(decided(&rep), [("z", Holds, Some(BddPrepass), None), ("p", Fails, Some(BddPrepass), Some(Cycle(0)))]);
+    }
+
+    /// The depths as ABC prints them (lines from `pdr` and `bmc3` runs).
+    #[test]
+    fn abc_depths_are_read_from_its_output() {
+        assert_eq!(pdr_frame("Invariant F[3] : 1 clauses with 0 flops (out of 4) (cex = 0, ave = 4.00)\nProperty proved."), Some(3));
+        assert_eq!(pdr_frame("Property proved."), None);
+        assert_eq!(bmc_frames("No output asserted in 3 frames. Resource limit reached (conf limit 0)."), Some(3));
+        assert_eq!(bmc_frames("Explored all reachable states after completing 4 frames.  Time = 0.02 sec"), Some(4));
+        assert_eq!(bmc_frames("Output 0 of miter \"t\" was asserted in frame 2."), None);
     }
 
     #[test]

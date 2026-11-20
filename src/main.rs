@@ -122,7 +122,8 @@ const DESCRIBE: &str = r#"{
     "sec and prove share one sequential model: registers are their Liberty ff groups, all starting at 0, on ONE rising-edge clock traced back through buffers to a primary input. Asynchronous clear and preset are modelled synchronously. Latches, register banks, inverted or gated clocks and a second clock are refused with an error rather than approximated.",
     "Every counter-example sec or prove reports is replayed on the model before it is reported; one that does not replay is an error, never a verdict.",
     "Any command can be UNDECIDED when ABC gives up within its limits; it is reported as undecided (exit 4 with --fail-on-diff), never as a pass.",
-    "prove --bound N checks cycles 0 to N only: no failure there is `holds_within`, which is not a proof."
+    "prove --bound N checks cycles 0 to N only: no failure there is `holds_within`, which is not a proof.",
+    "prove --json lists each net under `properties` with its `result` (holds, holds_within, fails, undecided, not_reached: the engine stopped at another net's failure), the engine that `decided_by` it (bdd-prepass, the one-cycle BDD before ABC; pdr; bmc; null when nothing decided it) and its `depth` with `depth_unit`: `cycle` (where it fails, or the last cycle a bounded run covered) or `pdr_frame` (the frame of pdr's inductive invariant); null where the engine has none."
   ],
   "invocation": {
     "args_template": ["check", "{golden}", "{revised}", "--lib", "{lib}"],
@@ -660,6 +661,25 @@ fn prove(args: &[String], d: &netlist::Netlist, lib: &Lib, nets: &[String], boun
                 format!("  \"verdict\": \"fails\",\n  \"fails\": {{\"net\": {net:?}, \"cycle\": {cycle}, \"inputs_per_cycle\": [{}]}}\n", cycles.join(", "))
             }
         };
+        // Per net: its result, the engine that decided it and its depth (null where none).
+        let props: Vec<String> = rep
+            .properties
+            .iter()
+            .map(|p| {
+                let (depth, unit) = match p.depth {
+                    Some(prop::Depth::Cycle(c)) => (c.to_string(), "\"cycle\""),
+                    Some(prop::Depth::PdrFrame(k)) => (k.to_string(), "\"pdr_frame\""),
+                    None => ("null".to_string(), "null"),
+                };
+                let by = p.decided_by.map_or("null".to_string(), |e| json_str(e.as_str()));
+                format!(
+                    "    {{\"net\": {}, \"result\": \"{}\", \"decided_by\": {by}, \"depth\": {depth}, \"depth_unit\": {unit}}}",
+                    json_str(&p.net),
+                    p.outcome.as_str()
+                )
+            })
+            .collect();
+        let s = format!("{},\n  \"properties\": [\n{}\n  ]\n", s.trim_end_matches('\n'), props.join(",\n"));
         with_report_path(&(s + "}\n"), opt(args, "-o").as_deref())
     } else {
         let regs = format!("{} register(s)", rep.registers);
