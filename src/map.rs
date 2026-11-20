@@ -300,6 +300,12 @@ fn register_map_at(golden: &Netlist, revised: &Netlist, lib: &Lib, names: (Namin
             }
         }
     }
+    // DIAGNOSTIC (sat-diag only): `LEC_DIAG_NODES` sizes the signal-correspondence candidate set
+    // (every gate output plus every register, grouped by signature up to complement) and stops.
+    if std::env::var_os("LEC_DIAG_NODES").is_some() {
+        diag_node_candidates(&[&gm, &rm], &stim, &freed, &sigs)?;
+        return Err("LEC_DIAG_NODES".into());
+    }
     let (classes, mut inv) = candidate_classes(&[&gm, &rm], &sigs);
     // DIAGNOSTIC (sat-diag only): `LEC_DIAG_SIG=sub1,sub2` prints each matching register's
     // simulation signature (cycle words 0..8 of run bit 0, and whether its tail is constant) and its
@@ -610,6 +616,116 @@ pub(crate) fn simulate(models: &[&Model], stim: &Stimulus, free: &[BTreeSet<Stri
         stuck_all.push(c.gates.iter().filter(|g| gate_of(&g.out).is_some() && !asserted.contains(g.out.as_str())).map(|g| g.out.clone()).collect());
     }
     Ok((out, stuck_all))
+}
+
+/// DIAGNOSTIC (sat-diag only): the size of a signal-correspondence candidate set on these models.
+fn diag_node_candidates(models: &[&Model], stim: &Stimulus, free: &[BTreeSet<String>], regsigs: &[Vec<Vec<u64>>]) -> Result<(), String> {
+    let t0 = std::time::Instant::now();
+    // (side, gate index or usize::MAX-k for register k) -> signature tail, complement-normalised
+    let mut by_sig: HashMap<Vec<u64>, Vec<(usize, usize, bool)>> = HashMap::new();
+    let mut per_side = Vec::new();
+    for (mi, m) in models.iter().enumerate() {
+        let c = &m.cone;
+        let states: Vec<String> = c.regs.iter().map(|r| state_net(r)).collect();
+        let nexts: Vec<String> = c.regs.iter().map(|r| next_net(r)).collect();
+        let mut state = vec![0u64; m.regs.len()];
+        let mut known = vec![0u64; m.regs.len()];
+        let mut gv: Vec<Vec<u64>> = vec![Vec::with_capacity(CYCLES); c.gates.len()];
+        let mut gk: Vec<Vec<u64>> = vec![Vec::with_capacity(CYCLES); c.gates.len()];
+        let mut val: HashMap<&str, (u64, u64)> = HashMap::new();
+        for cycle in 0..CYCLES {
+            val.clear();
+            for (net, var) in &c.free {
+                val.insert(net.as_str(), (stim.word(var, cycle), !0));
+            }
+            for (k, s) in states.iter().enumerate() {
+                val.insert(s.as_str(), (state[k], known[k]));
+            }
+            for (gi, g) in c.gates.iter().enumerate() {
+                let (x, kx): (Vec<u64>, Vec<u64>) = g
+                    .ins
+                    .iter()
+                    .map(|s| match s {
+                        Src::Net(n) => val.get(n.as_str()).copied().ok_or_else(|| format!("cone gate `{}` reads `{n}` before it is computed", g.out)),
+                        Src::Const(v) => Ok((if *v { !0 } else { 0 }, !0)),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .unzip();
+                let (y, ky) = if free[mi].contains(&g.out) {
+                    (stim.word(FREE_ENABLE, cycle), !0)
+                } else {
+                    ternary_word(&x, &kx, |x| match &g.logic {
+                        Logic::Prim(op) => prim_word(*op, &g.pins, x),
+                        Logic::Func(f) => Ok(func_word(f, &g.pins, x)),
+                    })?
+                };
+                gv[gi].push(y);
+                gk[gi].push(ky);
+                val.insert(g.out.as_str(), (y, ky));
+            }
+            for (k, r) in c.regs.iter().enumerate() {
+                (state[k], known[k]) = val.get(nexts[k].as_str()).copied().ok_or_else(|| format!("register `{r}` has no next-state gate"))?;
+            }
+        }
+        let mut consts = 0usize;
+        let mut push = |sig: Vec<u64>, id: usize, by_sig: &mut HashMap<Vec<u64>, Vec<(usize, usize, bool)>>| {
+            let tail = sig.get(1..).unwrap_or(&[]);
+            let flip = tail.first().is_some_and(|w| w & 1 == 1);
+            let key: Vec<u64> = if flip { tail.iter().map(|w| !w).collect() } else { tail.to_vec() };
+            if key.iter().all(|w| *w == 0) {
+                consts += 1;
+            }
+            by_sig.entry(key).or_default().push((mi, id, flip));
+        };
+        for gi in 0..c.gates.len() {
+            let sig = defined_signature(&gv[gi], &gk[gi]);
+            gv[gi] = Vec::new();
+            gk[gi] = Vec::new();
+            push(sig, gi, &mut by_sig);
+        }
+        for (k, sig) in regsigs[mi].iter().enumerate() {
+            push(sig.clone(), usize::MAX - k, &mut by_sig);
+        }
+        per_side.push((c.gates.len(), m.regs.len(), consts));
+    }
+    let zero = vec![0u64; CYCLES - 1];
+    let (mut classes, mut cross, mut members, mut oblig, mut largest) = (0usize, 0usize, 0usize, 0usize, 0usize);
+    let mut hist = [0usize; 8];
+    for (key, v) in &by_sig {
+        if key == &zero {
+            continue;
+        }
+        if v.len() >= 2 {
+            classes += 1;
+            members += v.len();
+            oblig += v.len() - 1;
+            largest = largest.max(v.len());
+            hist[(usize::BITS - v.len().leading_zeros()).min(7) as usize] += 1;
+            if v.iter().any(|x| x.0 == 0) && v.iter().any(|x| x.0 == 1) {
+                cross += 1;
+            }
+        }
+    }
+    let cst = by_sig.get(&zero).map_or(0, Vec::len);
+    for (i, (g, r, c)) in per_side.iter().enumerate() {
+        eprintln!("NODEDIAG side {i} gates {g} regs {r} constant {c}");
+    }
+    eprintln!("NODEDIAG distinct {} classes>=2 {classes} cross-side {cross} members {members} obligations {} (classes {oblig} + constants {cst}) largest {largest} size-hist(log2) {hist:?} ms {}", by_sig.len(), oblig + cst, t0.elapsed().as_millis());
+    // the constant class split by kind: which gates (by out net) mention the probe substring
+    if let Ok(sub) = std::env::var("LEC_DIAG_NODES_SHOW") {
+        let at: HashMap<(usize, usize), usize> = by_sig.values().enumerate().flat_map(|(i, v)| v.iter().map(move |x| ((x.0, x.1), i))).collect();
+        let sizes: Vec<usize> = by_sig.values().map(Vec::len).collect();
+        for (mi, m) in models.iter().enumerate() {
+            for (gi, g) in m.cone.gates.iter().enumerate() {
+                if g.ins.iter().any(|s| matches!(s, Src::Net(n) if n.contains(&sub))) {
+                    let ci = at[&(mi, gi)];
+                    eprintln!("NODEDIAG show side {mi} {} class {ci} size {}", g.out, sizes[ci]);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Inputs with more undefined words than this are not enumerated: the output is then defined only
