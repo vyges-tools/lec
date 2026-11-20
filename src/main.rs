@@ -829,6 +829,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
         };
         let dup: Vec<String> = rep.duplicated.iter().map(|(k, v)| format!("{}: {}", json_str(k), list(v))).collect();
         let amb: Vec<String> = rep.ambiguous.iter().map(|(a, b)| format!("{{\"golden\": {}, \"revised\": {}}}", list(a), list(b))).collect();
+        let undriven = format!("[{}]", rep.undriven.iter().map(|x| format!("{{\"design\": \"{}\", \"net\": {}}}", side(x.side), json_str(&x.name))).collect::<Vec<_>>().join(", "));
         let tied: Vec<String> = rep.tied_by_name.iter().map(|(a, b)| format!("{{\"golden\": {}, \"revised\": {}}}", list(a), list(b))).collect();
         let mapped = map_json(&rep.mapped).trim_end().replace('\n', "\n  ");
         let inverted = map_json(&rep.inverted).trim_end().replace('\n', "\n  ");
@@ -849,7 +850,7 @@ fn register_map(args: &[String], g: &netlist::Netlist, r: &netlist::Netlist, lib
             regs(&rep.undecided),
             regs(&rep.unobserved),
             regs(&rep.cut),
-            format!("[{}]", rep.undriven.iter().map(|x| format!("{{\"design\": \"{}\", \"net\": {}}}", side(x.side), json_str(&x.name))).collect::<Vec<_>>().join(", ")),
+            undriven,
             {
                 let rows: Vec<String> = rep.reset_inputs.iter().map(|(n, v)| format!("{{\"input\": {}, \"inactive\": {}}}", json_str(n), u8::from(*v))).collect();
                 format!("[{}]", rows.join(", "))

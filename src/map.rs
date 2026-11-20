@@ -391,7 +391,9 @@ pub(crate) fn model(d: &Design, side: Side, naming: Naming) -> Result<Model, Str
 /// 0 of 71,474 registers with no other sign of the cause.
 pub(crate) fn undriven_nets(d: &Design, cone: &Cone) -> Vec<String> {
     let inputs: HashSet<&str> = d.netlist().inputs.iter().map(String::as_str).collect();
-    cone.free.iter().filter(|(net, var)| net == var && !inputs.contains(net.as_str())).map(|(net, _)| net.clone()).collect()
+    // a name with a space is the model's own signal (a register's `<state>`, a `<cut>` value),
+    // never a netlist net
+    cone.free.iter().filter(|(net, var)| net == var && !net.contains(' ') && !inputs.contains(net.as_str())).map(|(net, _)| net.clone()).collect()
 }
 
 /// A register across both models: (model index, register index).
@@ -1590,9 +1592,11 @@ mod tests {
     #[test]
     fn an_undriven_net_read_by_a_register_is_listed() {
         // `s` reads a primary input `d` and a latch output `m` (cut): both free, neither undriven
-        let body = "LAT l(.G(clk),.D(d),.Q(m));\nXOR2 xs(.A(d),.B(m),.Y(ds));\nDFF s(.CK(clk),.D(ds),.Q(qs));\nBUF bs(.A(qs),.Y(z));\n";
-        let g = nl(&format!("module t(clk,d,y,z);\ninput clk,d; output y,z;\nwire x,q,m,ds,qs;\nDFF r(.CK(clk),.D(x),.Q(q));\nBUF b(.A(q),.Y(y));\n{body}endmodule\n"));
-        let r = nl(&format!("module t(clk,d,y,z);\ninput clk,d; output y,z;\nwire x,q,m,ds,qs;\nTIE0 t0(.LO(x));\nDFF r(.CK(clk),.D(x),.Q(q));\nBUF b(.A(q),.Y(y));\n{body}endmodule\n"));
+        // and `u` (an enable flop: its next state reads its own stored value) reads register `s`:
+        // a register's stored value is not undriven either
+        let body = "LAT l(.G(clk),.D(d),.Q(m));\nXOR2 xs(.A(d),.B(m),.Y(ds));\nDFF s(.CK(clk),.D(ds),.Q(qs));\nEDF u(.CK(clk),.D(qs),.DE(d),.Q(qu));\nBUF bs(.A(qu),.Y(z));\n";
+        let g = nl(&format!("module t(clk,d,y,z);\ninput clk,d; output y,z;\nwire x,q,m,ds,qs,qu;\nDFF r(.CK(clk),.D(x),.Q(q));\nBUF b(.A(q),.Y(y));\n{body}endmodule\n"));
+        let r = nl(&format!("module t(clk,d,y,z);\ninput clk,d; output y,z;\nwire x,q,m,ds,qs,qu;\nTIE0 t0(.LO(x));\nDFF r(.CK(clk),.D(x),.Q(q));\nBUF b(.A(q),.Y(y));\n{body}endmodule\n"));
         let rep = map(&g, &r);
         let und: Vec<(Side, &str)> = rep.undriven.iter().map(|x| (x.side, x.name.as_str())).collect();
         assert_eq!(und, [(Side::Golden, "x")], "{rep:?}");
