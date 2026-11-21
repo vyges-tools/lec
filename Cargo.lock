@@ -244,21 +244,22 @@ checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
 name = "vyges-abc-lib"
-version = "0.1.55"
-source = "git+https://github.com/vyges-tools/abc-lib?branch=main#55481d6c36e33d85f0d0613c1f0e3581003b06b3"
+version = "0.1.56"
+source = "git+https://github.com/vyges-tools/abc-lib?branch=main#b33eb4bb8730e3bbde3a4d1cd15ddd22fc9e525a"
 
 [[package]]
 name = "vyges-events"
-version = "0.1.55"
-source = "git+https://github.com/vyges-tools/events?branch=main#87cca49dfd0e7030b890a084472a00930bcfb45e"
+version = "0.1.56"
+source = "git+https://github.com/vyges-tools/events?branch=main#fbeaba52516c5a210cf37648edd1327f28596420"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
 ]
 
 [[package]]
 name = "vyges-lec"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "cadical",
  "libmimalloc-sys",
@@ -272,8 +273,8 @@ dependencies = [
 
 [[package]]
 name = "vyges-loom"
-version = "0.1.55"
-source = "git+https://github.com/vyges-tools/loom?branch=main#5a5b8993a293df2bc14c2c372edf71a5a8e136ca"
+version = "0.1.56"
+source = "git+https://github.com/vyges-tools/loom?branch=main#743d6adf0af62b080b897587be286e28bcc7de6a"
 dependencies = [
  "miniz_oxide",
  "regex",
